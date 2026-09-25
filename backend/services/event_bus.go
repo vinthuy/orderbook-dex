@@ -29,6 +29,26 @@ func NewEventBus() *EventBus {
 	}
 }
 
+// Name returns the service name
+func (eb *EventBus) Name() string {
+	return "EventBus"
+}
+
+// Initialize initializes the EventBus
+func (eb *EventBus) Initialize(config Config) error {
+	return nil
+}
+
+// Start starts the EventBus
+func (eb *EventBus) Start() error {
+	return nil
+}
+
+// Stop stops the EventBus
+func (eb *EventBus) Stop() error {
+	return nil
+}
+
 // Subscribe registers a handler for a specific topic
 func (eb *EventBus) Subscribe(topic string, handler EventHandler) {
 	eb.mu.Lock()
