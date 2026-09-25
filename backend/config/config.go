@@ -1,5 +1,7 @@
 package config
 
+import "os"
+
 // Config holds the application configuration
 type Config struct {
     RPCURL      string
