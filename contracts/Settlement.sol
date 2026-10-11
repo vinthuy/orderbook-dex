@@ -173,6 +173,9 @@ contract Settlement is ISettlement {
         exited[msg.sender][assetId] = true;
         totalWithdrawn[assetId] += balance;
         require(IERC20(assets[assetId]).transfer(msg.sender, balance), "transfer failed");
+        // Close off the frozen root so it cannot be replayed after `deposit` clears `exited`.
+        lastWithdrawRoot[msg.sender][assetId] = req.rootIndex;
+        withdrawnAtRoot[msg.sender][assetId][req.rootIndex] += balance;
         emit ExitFinalized(msg.sender, assetId, balance, rootIndex);
     }
 

@@ -78,4 +78,41 @@ describe("Settlement forced exit", function () {
     await expect(settlement.connect(alice).finalizeExit(1, 2, B, [])).to.be.revertedWith("wrong root");
     await expect(settlement.connect(alice).finalizeExit(1, 1, B + 1n, [])).to.be.revertedWith("bad proof");
   });
+
+  it("rejects a replayed withdraw against the frozen exit root after a re-deposit", async function () {
+    // finalizeExit pays out the balance frozen at root 1 and sets exited = true
+    await settlement.connect(alice).requestExit(1);
+    await time.increase(EXIT_DELAY + 1);
+    await settlement.connect(alice).finalizeExit(1, 1, B, []);
+
+    // deposit clears `exited`, so alice is active again with a fresh deposit
+    await token.connect(alice).approve(await settlement.getAddress(), B);
+    await settlement.connect(alice).deposit(1, B);
+
+    // Replaying the frozen root's leaf (same balance, same valid proof) must not pay twice.
+    // NOTE: `withdraw` allows `rootIndex >= lastWithdrawRoot`, so replaying the *same* frozen
+    // root is caught by the cumulative `withdrawnAtRoot` tally stamped by `finalizeExit`
+    // (not by the `stale root` check, which only rejects strictly older roots).
+    await expect(settlement.connect(operator).withdraw(alice.address, 1, B, B, 1, []))
+      .to.be.revertedWith("exceeds balance");
+  });
+
+  it("allows the fresh deposit to be withdrawn against a newer root", async function () {
+    await settlement.connect(alice).requestExit(1);
+    await time.increase(EXIT_DELAY + 1);
+    await settlement.connect(alice).finalizeExit(1, 1, B, []);
+
+    await token.connect(alice).approve(await settlement.getAddress(), B);
+    await settlement.connect(alice).deposit(1, B);
+
+    // anchor a newer root that contains the fresh deposit, then withdraw against it
+    const freshLeaf = await settlement.balanceLeaf(alice.address, 1, B);
+    await settlement.connect(operator).commitStateRoot(freshLeaf);
+    expect(await settlement.latestRootIndex()).to.equal(2n);
+
+    await expect(settlement.connect(operator).withdraw(alice.address, 1, B, B, 2, []))
+      .to.emit(settlement, "Withdrawal")
+      .withArgs(alice.address, 1, B, 2n);
+    expect(await token.balanceOf(alice.address)).to.equal(B);
+  });
 });
