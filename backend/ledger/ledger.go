@@ -299,17 +299,3 @@ func (l *Ledger) Snap() error {
 	}
 	return l.store.SaveSnapshot(data)
 }
-
-// 临时占位：Task 7 会在 store.go 中以完整版本替换。
-type WALEntry struct {
-	Seq uint64   `json:"seq"`
-	Op  OpRecord `json:"op"`
-}
-
-type Store interface {
-	AppendBatch(entries []WALEntry) error
-	SaveSnapshot(state []byte) error
-	LoadSnapshot() ([]byte, error)
-	Replay(fromSeq uint64) ([]WALEntry, error)
-	Close() error
-}
