@@ -117,7 +117,17 @@ func (s *SettlementService) RootAt(rootIndex uint64) ([32]byte, uint64, error) {
 }
 
 // Withdraw submits a fast withdrawal using the ledger's Merkle proof.
-func (s *SettlementService) Withdraw(account ledger.AccountID, asset ledger.AssetID, balance, amount *uint256.Int, rootIndex uint64) (string, error) {
+//
+// The ledger debit happens BEFORE the on-chain submit, and the debit is
+// idempotent by the caller-supplied ref. A failed submit is therefore retried
+// by reusing the SAME ref rather than being rolled back and re-submitted (which
+// could double-spend).
+func (s *SettlementService) Withdraw(account ledger.AccountID, asset ledger.AssetID, balance, amount *uint256.Int, rootIndex uint64, ref string) (string, error) {
+	// (a) Capture the proof BEFORE debiting. Debiting advances the ledger
+	// version, so a proof taken after the debit would commit to a different
+	// root than the rootIndex the contract verifies against. The mock adapter
+	// does not check Merkle proofs, so this ordering is load-bearing and is
+	// asserted by TestSettlementServiceWithdrawProofTakenBeforeDebit.
 	proof, proven, err := s.ledger.Proof(account, asset)
 	if err != nil {
 		return "", err
@@ -126,6 +136,22 @@ func (s *SettlementService) Withdraw(account ledger.AccountID, asset ledger.Asse
 	if proven.Cmp(balance) != 0 {
 		return "", fmt.Errorf("withdraw: balance mismatch (ledger=%s arg=%s)", proven, balance)
 	}
+	// Guard: the amount must be positive and must not exceed the proven
+	// (published) balance. A short amount is rejected before any debit or tx.
+	if amount.Sign() <= 0 {
+		return "", fmt.Errorf("withdraw: amount must be positive (got %s)", amount)
+	}
+	if amount.Cmp(balance) > 0 {
+		return "", ledger.ErrInsufficientBalance
+	}
+
+	// (b) Debit the ledger before submitting on-chain. WithdrawOp is idempotent
+	// by ref: replaying the same ref is a no-op, so a retry after a failed
+	// submit never debits twice.
+	if err := s.ledger.Apply(ledger.WithdrawOp{Account: account, Asset: asset, Amount: amount, Ref: ref}); err != nil {
+		return "", err
+	}
+
 	proofHashes := make([][32]byte, len(proof))
 	copy(proofHashes, proof)
 
@@ -141,6 +167,7 @@ func (s *SettlementService) Withdraw(account ledger.AccountID, asset ledger.Asse
 	if err != nil {
 		return "", err
 	}
+	// (c) Submit using the proof captured in (a) and the caller's rootIndex.
 	return s.adapter.SendTransaction(&Transaction{
 		To:       s.contract.Hex(),
 		Data:     data,
