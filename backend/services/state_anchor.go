@@ -27,8 +27,7 @@ type StateAnchorService struct {
 	byVer   map[uint64]uint64 // version -> rootIndex
 
 	interval time.Duration
-	stop     chan struct{}
-	started  bool
+	run      runner
 }
 
 func NewStateAnchorService(settlement *SettlementService, l *ledger.Ledger) *StateAnchorService {
@@ -37,7 +36,6 @@ func NewStateAnchorService(settlement *SettlementService, l *ledger.Ledger) *Sta
 		ledger:     l,
 		byVer:      make(map[uint64]uint64),
 		interval:   30 * time.Second,
-		stop:       make(chan struct{}),
 	}
 }
 
@@ -52,51 +50,33 @@ func (s *StateAnchorService) Initialize(cfg Config) error {
 
 func (s *StateAnchorService) Start() error {
 	s.mu.Lock()
-	if s.started {
-		s.mu.Unlock()
-		return nil
-	}
-	s.started = true
+	interval := s.interval
 	s.mu.Unlock()
 
-	go func() {
-		ticker := time.NewTicker(s.interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-s.stop:
-				return
-			case <-ticker.C:
-				if _, err := s.AnchorOnce(); err != nil {
-					log.Printf("state anchor: %v", err)
-				}
-			}
+	s.run.start(interval, func() {
+		if _, err := s.AnchorOnce(); err != nil {
+			log.Printf("state anchor: %v", err)
 		}
-	}()
+	})
 	return nil
 }
 
 func (s *StateAnchorService) Stop() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.started {
-		close(s.stop)
-		s.started = false
-	}
+	s.run.stop()
 	return nil
 }
 
-// AnchorOnce commits the current ledger root and records the mapping. It relies
-// on the on-chain latestRootIndex (read after commit) so a restart never assumes
-// local state.
+// AnchorOnce commits the current ledger root and records the mapping. The
+// rootIndex comes back from CommitRoot (decoded from the mined
+// StateRootCommitted event), so a commit whose view still lags — or that
+// reverted — can never be recorded as if it had landed.
 func (s *StateAnchorService) AnchorOnce() (*RootRecord, error) {
-	root := s.ledger.Root()
-	version := s.ledger.Version()
+	// Root and version are read under ONE lock: separate Root()/Version()
+	// calls could interleave with a concurrent Apply and record a
+	// (root, version) pair that never existed together.
+	root, version := s.ledger.RootAndVersion()
 
-	if _, err := s.settlement.CommitRoot(root); err != nil {
-		return nil, err
-	}
-	rootIndex, err := s.settlement.LatestRootIndex()
+	_, rootIndex, err := s.settlement.CommitRoot(root)
 	if err != nil {
 		return nil, err
 	}

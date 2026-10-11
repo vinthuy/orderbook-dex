@@ -1,9 +1,10 @@
 package ledger
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sync"
@@ -84,33 +85,69 @@ func (s *FileStore) LoadSnapshot() ([]byte, error) {
 	return data, nil
 }
 
+// Replay reads the WAL and returns the entries with Seq > fromSeq.
+//
+// A torn/incomplete *trailing* record is tolerated and ignored (with a log
+// line): AppendBatch writes a whole batch — records plus their '\n'
+// terminators — in a single Write and only Syncs once, so a crash or short
+// write can leave a partial final record. There are two such signals: the
+// final non-empty line does not parse as JSON, or the file's last byte is not
+// '\n' (a half-written record). Either way the trailing record was never
+// committed and dropping it lets Recover rebuild the ledger.
+//
+// Corruption with more data after it is real data loss and is returned as an
+// error — it is never silently swallowed.
 func (s *FileStore) Replay(fromSeq uint64) ([]WALEntry, error) {
-	f, err := os.Open(filepath.Join(s.dir, "wal.log"))
+	path := filepath.Join(s.dir, "wal.log")
+	data, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	if len(data) == 0 {
+		return nil, nil
+	}
+
+	hasTrailingNewline := data[len(data)-1] == '\n'
+	lines := bytes.Split(data, []byte{'\n'})
+
+	// Index of the last non-empty line: corruption there is a torn tail, while
+	// corruption anywhere earlier means the log lost committed records.
+	lastDataLine := -1
+	for i, raw := range lines {
+		if len(bytes.TrimSpace(raw)) > 0 {
+			lastDataLine = i
+		}
+	}
 
 	var out []WALEntry
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
+	for i, raw := range lines {
+		line := bytes.TrimSpace(raw)
 		if len(line) == 0 {
 			continue
 		}
+		if i == lastDataLine && !hasTrailingNewline {
+			// The final record was never terminated, so it was never
+			// committed; ignore it and stop.
+			log.Printf("ledger: wal %s: ignoring torn trailing record (missing newline)", path)
+			break
+		}
 		var e WALEntry
 		if err := json.Unmarshal(line, &e); err != nil {
-			return nil, err
+			if i == lastDataLine {
+				// Half-written final record: tolerate it.
+				log.Printf("ledger: wal %s: ignoring torn trailing record: %v", path, err)
+				break
+			}
+			return nil, fmt.Errorf("ledger: corrupt wal record at line %d: %w", i+1, err)
 		}
 		if e.Seq > fromSeq {
 			out = append(out, e)
 		}
 	}
-	return out, sc.Err()
+	return out, nil
 }
 
 func (s *FileStore) Close() error {

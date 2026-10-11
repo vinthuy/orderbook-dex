@@ -217,8 +217,14 @@ interface ISettlement {
   `require(now >= 请求.timestamp + exitDelay)`；`require(balance > 0)`；以
   `leaf = balanceLeaf(account, assetId, balance)` 校验 proof 属于 `roots[rootIndex].root`；
   `exited[account][assetId] = true`；清除请求；`totalWithdrawn += balance`；
-  `token.transfer(account, balance)`；emit `ExitFinalized`。**不受 `paused` 影响。**
+  `token.transfer(account, balance)`；**补打防重放标记** `lastWithdrawRoot[account][assetId] = 请求.rootIndex`
+  与 `withdrawnAtRoot[account][assetId][请求.rootIndex] += balance`；emit `ExitFinalized`。**不受 `paused` 影响。**
   v1 为**全额退出**（提取该冻结根中该资产的完整余额），不支持部分退出；部分退出留待后续子项目。
+- **为什么必须补打（资金安全，子项目 2 修复）**：`withdraw` 的判据是 `rootIndex >= lastWithdrawRoot`
+  （**非严格大于**），且 `deposit` 会把 `exited` 清回 `false`。若无补打，"finalizeExit → 重新充值 →
+  以同一冻结 `rootIndex` 提现"可对同一片叶子二次领取。补打后，同根重放被
+  `require(already + amount <= balance)` 以 **`exceeds balance`** 拒绝（注意：**不是** `stale root`，
+  相等根不被视为 stale）；`lastWithdrawRoot` 的写入则关闭**更旧**的根。两处缺一不可。
 - `pause/unpause`：仅 owner；emit 事件。只影响 `deposit` 与 `withdraw`。
 
 ### 4.7 安全要点
@@ -286,9 +292,13 @@ type TransferOp struct{ From, To AccountID; Asset AssetID; Amount *uint256.Int; 
 
 ### 5.5 持久化 `LedgerStore`
 
-- **WAL**：追加型操作日志，每条含 `seq`、幂等键、操作内容（JSON 行）。
+- **WAL**：追加型操作日志，每条含 `seq`、幂等键、操作内容（JSON 行），整批以一次 `Write` 追加后一次 `Sync`。
 - **快照**：周期性全量状态快照（含 `version`、`lastAppliedSeq`、去重集）。
 - **恢复**：加载最新快照 → 从 `lastAppliedSeq` 之后重放 WAL。
+- **尾部容错（必须，子项目 2 修复）**：一次中断写入会在 WAL 末尾留下**半条** JSON 记录。
+  `Replay` 必须容忍"最后一条非空行解析失败"或"文件末字节不是换行"，忽略该条并正常返回已解析条目；
+  但**中间记录**损坏（其后仍有数据）必须继续报错，绝不静默吞掉已提交记录。否则一次崩溃即让
+  `Recover` 永久失败，而 WAL 从不截断、每次从 seq 0 重放，账本将永久无法重建。
 - 抽象为接口，v1 实现为本地文件；后续可替换为 bbolt / Postgres 而不改账本核心。
 
 ```go
@@ -309,9 +319,27 @@ type Store interface {
 
 ### 6.1 `SettlementService`
 
-- 封装合约交互：解析 ABI（来自 Hardhat artifacts）、构造/发送交易、
-  `CommitRoot(root)`、`Withdraw(...)`、读取 `latestRootIndex` 等视图。
+- 封装合约交互：解析 ABI（来自 Hardhat artifacts）、构造/发送交易、读取视图。
 - 依赖现有 `BlockchainAdapter`。
+- `CommitRoot(root) (txHash string, rootIndex uint64, err error)`：发送后**等待交易回执**
+  （`GetTransactionReceipt` 返回 `(nil, nil)` 表示尚未打包，须视为 pending 继续轮询，**不是错误**）；
+  要求 `receipt.status == 1`；从回执日志**解码 `StateRootCommitted`** 取得 `rootIndex`（indexed，位于
+  `topics[1]`）与 `root`，并校验事件中的 `root` 与提交的 `root` 一致；回执中无该事件即报错。
+  超时与轮询间隔由 `Config.ReceiptTimeoutSeconds`（默认 60）与 `Config.ReceiptPollMillis`（默认 1000）控制。
+- `Withdraw(account, asset, balance, amount, rootIndex, ref) (txHash string, err error)`：
+  **顺序不可交换** —— (1) 先取 Merkle 证明并校验 `proven == balance`、`0 < amount <= balance`；
+  (2) 再向账本应用幂等 `WithdrawOp{Ref: ref}` 完成**扣账**；(3) 最后提交上链。
+  扣账先于上链是本子项目裁定：合约的偿付校验与 `withdrawnAtRoot` 记账**不能**替代账本扣账，
+  否则提现后锚定的新根仍含该余额，可被二次领取。
+- 提交失败**不回滚扣账**：首次尝试按 `ref` **钉住**（见下），同一 `ref` 重试不二次扣账，也不重发
+  新的交易。
+- **提现重试按 `ref` 钉住（子项目 2 修复）**：首次调用校验参数、**先取证明再扣账**、ABI 编码后，
+  把 `{account, asset, balance, amount, rootIndex, proof}` **钉入内存记录**再提交。同一 `ref` 的重试
+  一律收敛到该记录——**已广播过**则等待回执并返回同一 `txHash`，**绝不重建、重发第二笔**；此前**提交
+  失败**则重发**钉住的原始 calldata**（同一 `rootIndex`、同一 proof），而非调用方传入的新参数。
+- **重复 `ref` 且钉住记录不可得**（如进程重启丢失内存记录、而账本仍持久记住已应用的 `ref`）：无可信
+  方式重建原始交易，此时**拒绝提交**并返回 `ErrWithdrawRecoveryRequired`，交由人工对账。**绝不**以
+  调用方的新参数重新广播——尤其更新的 `rootIndex`，其根仍发布扣账前余额，链上可对同一余额二次支付。
 
 ### 6.2 `DepositIndexer`
 
@@ -326,7 +354,27 @@ type Store interface {
 - 按 `anchorInterval` 定时（或按累计成交数触发）读取 `ledger.Root()`，调用
   `SettlementService.CommitRoot(root)` 上链。
 - 维护 `rootIndex ↔ 账本 version` 的映射，供退出流程与索引器对齐。
-- 提交失败重试；不做本地状态假设，重启后以链上 `latestRootIndex` 为准。
+- 提交与确认：`CommitRoot` 必须**等待回执并校验 `receipt.status == 1`**，再从回执日志解码
+  `StateRootCommitted` 取得真实 `rootIndex`。**不再事后读取 `latestRootIndex()`** —— 该读法既滞后
+  （提交刚发出、尚未打包时读到的是上一个索引）又有竞态，且会把被 `insolvent` 拒绝的提交记为成功。
+- 取根与版本必须**原子**：使用 `ledger.RootAndVersion()`，避免分别调用 `Root()` 与 `Version()`
+  之间被并发修改插入，导致记录的 `(root, version)` 并非同一时刻的状态。
+- 提交失败**不记录任何映射**（不产生 `RootRecord`），交由下一轮重试。
+
+### 6.4 装配与运行入口
+
+- `BuildSettlementStack(cfg Config, adapter BlockchainAdapter) (*SettlementStack, error)` 负责装配：
+  未注入 adapter 时用 `NewEVMAdapter(cfg.RPCURL, cfg.OperatorKey, cfg.ChainID)` 构造；打开
+  `ledger.NewFileStore(cfg.DataDir)` 并**一律走 `ledger.Recover`**（快照 + WAL 回放，恢复幂等键集合）；
+  构造三个服务并注册进同一个 `ServiceRegistry`。
+- `SettlementStack.Close()` 停止全部服务并关闭 `FileStore`，**幂等**。
+- `ConfigFromSettlement(config.SettlementConfig) Config` 做配置桥接。`RPCURL` 不在
+  `SettlementConfig` 中，由 `main` 从应用配置（`RPC_URL`）补入；`services.Config` 需带
+  `OperatorKey` 供构造真实 adapter。
+- `backend/main.go` 在保持既有 AMM API **完全不变**的前提下可选启动结算栈：仅当
+  `SETTLEMENT_ADDRESS` 非空时启动；为空则明确记录"结算停用"并继续只服务 AMM（不是错误）。
+  启动顺序 `Build → InitializeAll → StartAll`，任一步失败即关闭已建资源；进程退出前 `Close()`
+  （`Close` 出错只记日志）。启动日志**绝不打印 `OPERATOR_KEY`**（值、前缀、长度都不打）。
 
 ---
 
@@ -343,9 +391,21 @@ type Store interface {
 ### 7.2 快速提现
 
 1. 用户链下签名提现请求（EIP-712，含 nonce 防重放）。
-2. 运营方校验请求并组批，构造 Merkle 证明。
-3. 调用 `Settlement.withdraw(account, asset, amount, rootIndex, proof)`。
-4. 出金 → 账本扣减（`WithdrawOp`）→ 生成新根。
+2. 运营方校验请求并组批，**先取 Merkle 证明**（必须对应已锚定的 `rootIndex`）。
+3. 账本扣减：`ledger.Apply(WithdrawOp{..., Ref: ref})`（幂等；`ref` 由请求/运营方确定）。
+4. 调用 `Settlement.withdraw(account, asset, balance, amount, rootIndex, proof)` 上链。
+5. 出金后，该余额不再出现在后续锚定的根中。
+   - **顺序说明**：扣账（3）必须先于上链（4）。若先上链后扣账，则两次锚定之间存在窗口，
+     含有全额的**更新的根**仍可被用来二次领取。
+   - **失败重试（子项目 2 修复：按 `ref` 钉住）**：提交失败时扣账保留。首次尝试的
+     `{account, asset, balance, amount, rootIndex, proof}` 被钉入内存记录；同一 `ref` 的重试
+     一律收敛到该记录——已广播则等待回执返回同一 `txHash`（不重发），此前提交失败则重发**钉住的
+     原始 calldata**（不采用调用方的新 `rootIndex`）。因此无需再"等待新根、以新 `rootIndex` 提交"。
+   - **重复 `ref` 而钉住记录不可得**（进程重启丢失内存记录、但账本已持久应用该 `ref`）：拒绝提交，
+     返回 `ErrWithdrawRecoveryRequired`，人工对账。**绝不**用调用方新参数重新广播——更新的 `rootIndex`
+     其根可能仍发布扣账前余额，构成链上二次支付。
+   - **证明必须在扣账之前取**：扣账会推进账本版本，扣账后取的证明对应的是另一个根，
+     与合约校验的 `rootIndex` 根不匹配。该坑只在**全额提现**（叶子被移除）时可被观测到。
 
 ### 7.3 强制退出（兜底，无需运营方配合）
 
@@ -422,10 +482,19 @@ contracts/
 test/
   Settlement.test.js
 backend/
-  ledger/{ledger.go, merkle.go, store.go, wal.go, ledger_test.go, merkle_test.go, wal_test.go}
+  main.go                               # AMM API + 可选启动结算栈
+  main_test.go
+  README.md                             # 运行方式、结算环境变量、提现重试语义
+  ledger/{ledger.go, op.go, merkle.go, store.go,
+          ledger_test.go, merkle_test.go, store_test.go}
   services/{settlement.go, state_anchor.go, deposit_indexer.go,
             settlement_test.go, state_anchor_test.go, deposit_indexer_test.go}
-  services/blockchain_adapter.go        # 扩展 GetLogs
+  services/blockchain_adapter.go        # 扩展 GetLogs；mock 支持 CallHandler 与 pending→mined 回执
+  services/evm_adapter.go
+  services/stack.go                     # BuildSettlementStack / SettlementStack.Close / ConfigFromSettlement
+  services/stack_test.go
+  services/registry.go
+  config/{config.go, defaults.go, config_test.go, README.md}
   models/settlement.go
 ```
 
@@ -443,4 +512,12 @@ backend/
 | 状态根机制 | OpenZeppelin 兼容 Merkle，叶子 = `keccak256(bytes20(account)‖bytes32(assetId)‖bytes32(balance))` |
 | 账本持久化 | 内存账本 + WAL + 快照，抽象 `Store` 接口（v1 本地文件） |
 | 冻结点 | 快速提现与强制退出互斥；退出一次性；`paused` 不阻断退出 |
+| 提现扣账时机（子项目 2） | **先扣账、后上链**；扣账幂等（`ref`）；提交失败保留扣账，同一 `ref` 重试 |
+| 提现重试钉住（子项目 2 修复） | 首次尝试按 `ref` 钉入内存记录（`account/asset/balance/amount/rootIndex/proof`）；重试收敛到首次广播：已广播则等回执返回同一 `txHash`、不重发；此前提交失败则重发**钉住的原始 calldata**而非调用方新参数。重复 `ref` 而钉住记录不可得（重启丢失、账本已应用）时**拒绝**并返回 `ErrWithdrawRecoveryRequired`，人工对账——以更新 `rootIndex` 重新广播即链上二次支付 |
+| 锚定取索引（子项目 2） | 等待回执 + 解码 `StateRootCommitted` 事件；**不再事后读 `latestRootIndex()`** |
+| 强制退出防重放（子项目 2） | `finalizeExit` 同时写 `lastWithdrawRoot` 与 `withdrawnAtRoot`，关闭冻结根及更旧根的重放 |
+| WAL 尾损（子项目 2） | 尾部半条记录可容忍（忽略并告警）；中间损坏仍报错，不静默吞记录 |
+| 服务生命周期（子项目 2） | `Start` 重建通道、`Stop` 幂等；两个服务共用 `runner`，可重启且不 panic |
+| 装配与入口（子项目 2） | `BuildSettlementStack` + `ConfigFromSettlement`；`main.go` 在 AMM 不变的前提下可选启动结算栈 |
+| 本轮未做（子项目 2） | `ProofAt`/历史根树、§10.3 本地链端到端、重组回滚 —— 仍为显式延后 |
 ```

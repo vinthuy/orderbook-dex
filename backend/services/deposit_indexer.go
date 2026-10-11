@@ -15,6 +15,78 @@ import (
 
 var depositTopic = crypto.Keccak256Hash([]byte("Deposit(address,uint32,uint256,uint256)"))
 
+// runner owns the polling-goroutine lifecycle shared by DepositIndexer and
+// StateAnchorService so their restart semantics cannot drift.
+//
+// A runner may be started, stopped, and started again any number of times.
+// start creates a fresh stop channel under the mutex, so a restarted goroutine
+// never observes a channel that a previous Stop already closed. stop closes the
+// current channel exactly once and is safe to call before the first start or
+// twice in a row.
+type runner struct {
+	mu      sync.Mutex
+	stopCh  chan struct{}
+	started bool
+	loops   int
+}
+
+// start launches poll on a periodic ticker and returns true, or does nothing
+// and returns false when already running (a repeated Start is an idempotent
+// no-op that must not spawn a second goroutine).
+func (r *runner) start(interval time.Duration, poll func()) bool {
+	r.mu.Lock()
+	if r.started {
+		r.mu.Unlock()
+		return false
+	}
+	r.stopCh = make(chan struct{})
+	stop := r.stopCh
+	r.started = true
+	r.loops++
+	r.mu.Unlock()
+
+	go func() {
+		defer r.loopDone()
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				poll()
+			}
+		}
+	}()
+	return true
+}
+
+// stop signals the running loop to exit. It is idempotent and safe when the
+// runner was never started.
+func (r *runner) stop() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.started {
+		return
+	}
+	close(r.stopCh)
+	r.started = false
+}
+
+func (r *runner) loopDone() {
+	r.mu.Lock()
+	r.loops--
+	r.mu.Unlock()
+}
+
+// activeLoops reports how many loop goroutines are currently alive. Tests use
+// it to prove a repeated Start does not spawn a second goroutine.
+func (r *runner) activeLoops() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.loops
+}
+
 // DepositIndexer credits on-chain Deposit events into the off-chain ledger.
 type DepositIndexer struct {
 	adapter       BlockchainAdapter
@@ -25,8 +97,7 @@ type DepositIndexer struct {
 	mu        sync.Mutex
 	nextBlock uint64
 	interval  time.Duration
-	stop      chan struct{}
-	started   bool
+	run       runner
 }
 
 func NewDepositIndexer(adapter BlockchainAdapter, l *ledger.Ledger, contract string, confirmations uint64) *DepositIndexer {
@@ -40,7 +111,6 @@ func NewDepositIndexer(adapter BlockchainAdapter, l *ledger.Ledger, contract str
 		confirmations: confirmations,
 		nextBlock:     1,
 		interval:      5 * time.Second,
-		stop:          make(chan struct{}),
 	}
 }
 
@@ -61,37 +131,19 @@ func (d *DepositIndexer) Initialize(cfg Config) error {
 
 func (d *DepositIndexer) Start() error {
 	d.mu.Lock()
-	if d.started {
-		d.mu.Unlock()
-		return nil
-	}
-	d.started = true
+	interval := d.interval
 	d.mu.Unlock()
 
-	go func() {
-		ticker := time.NewTicker(d.interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-d.stop:
-				return
-			case <-ticker.C:
-				if err := d.PollOnce(); err != nil {
-					log.Printf("deposit indexer: poll: %v", err)
-				}
-			}
+	d.run.start(interval, func() {
+		if err := d.PollOnce(); err != nil {
+			log.Printf("deposit indexer: poll: %v", err)
 		}
-	}()
+	})
 	return nil
 }
 
 func (d *DepositIndexer) Stop() error {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.started {
-		close(d.stop)
-		d.started = false
-	}
+	d.run.stop()
 	return nil
 }
 

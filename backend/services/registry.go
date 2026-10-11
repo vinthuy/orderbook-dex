@@ -12,8 +12,9 @@ type Service interface {
 
 // Config holds configuration for services
 type Config struct {
-	RPCURL     string
-	Port       int
+	RPCURL      string
+	OperatorKey string // settlement operator private key; required only when building the real EVM adapter
+	Port        int
 	DatabaseURL string
 
 	SettlementAddress     string
@@ -21,6 +22,13 @@ type Config struct {
 	RequiredConfirmations uint64
 	AnchorInterval        int64 // seconds
 	ChainID               int64
+
+	// ReceiptTimeoutSeconds bounds how long CommitRoot waits for a mined
+	// receipt before failing; ReceiptPollMillis is the interval between
+	// GetTransactionReceipt polls. Zero leaves the service defaults
+	// (60s / 1000ms) in place.
+	ReceiptTimeoutSeconds int64
+	ReceiptPollMillis     int64
 }
 
 // ServiceRegistry manages the lifecycle of services
