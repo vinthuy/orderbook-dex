@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestGateway_MiddlewareChain(t *testing.T) {
+func TestGateway_MiddlewareChain2(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	// Create test router

@@ -71,3 +71,33 @@ func TestConfig_LoadConfig_Defaults(t *testing.T) {
     assert.Equal(t, "", config.JWTSecret)
     assert.Equal(t, "info", config.LogLevel)
 }
+
+func TestLoadSettlementConfigDefaults(t *testing.T) {
+    t.Setenv("SETTLEMENT_ADDRESS", "")
+    t.Setenv("DATA_DIR", "")
+    cfg := LoadSettlementConfig()
+    if cfg.ChainID != 13700 {
+        t.Fatalf("ChainID = %d, want 13700", cfg.ChainID)
+    }
+    if cfg.Confirmations != 1 {
+        t.Fatalf("Confirmations = %d, want 1", cfg.Confirmations)
+    }
+    if cfg.ExitDelay != 300 {
+        t.Fatalf("ExitDelay = %d, want 300", cfg.ExitDelay)
+    }
+}
+
+func TestLoadSettlementConfigFromEnv(t *testing.T) {
+    t.Setenv("SETTLEMENT_ADDRESS", "0xabc")
+    t.Setenv("OPERATOR_KEY", "0xdead")
+    t.Setenv("REQUIRED_CONFIRMATIONS", "12")
+    t.Setenv("ANCHOR_INTERVAL", "90")
+    t.Setenv("CHAIN_ID", "31337")
+    cfg := LoadSettlementConfig()
+    if cfg.ContractAddress != "0xabc" || cfg.OperatorKey != "0xdead" {
+        t.Fatalf("address/key not loaded: %+v", cfg)
+    }
+    if cfg.Confirmations != 12 || cfg.AnchorIntervalSeconds != 90 || cfg.ChainID != 31337 {
+        t.Fatalf("numeric fields not loaded: %+v", cfg)
+    }
+}

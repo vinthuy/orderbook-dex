@@ -1,0 +1,45 @@
+{
+  "root": "0x48d0ccb89b394ff623621cb9336742240f099ba85d1ee9d8e7e3c96cd892f572",
+  "leaves": [
+    {
+      "account": "0x1111111111111111111111111111111111111111",
+      "assetId": 1,
+      "balance": "100",
+      "leaf": "0xbb0d5d62498e8cff96411a0772fa1918db91dcc1645dd41af649908ffd8318a6"
+    },
+    {
+      "account": "0x2222222222222222222222222222222222222222",
+      "assetId": 1,
+      "balance": "200",
+      "leaf": "0x9b8588e3615b184d2ee9964bc0090ceb9246e1626937a09c2b5d41d132c29181"
+    },
+    {
+      "account": "0x3333333333333333333333333333333333333333",
+      "assetId": 2,
+      "balance": "300",
+      "leaf": "0x814fcb617fb0f98e85135dc7d736f1b4f4cc4546adf0a655f3cd66acc5b4ba7b"
+    }
+  ],
+  "proofs": [
+    {
+      "index": 0,
+      "proof": [
+        "0x9b8588e3615b184d2ee9964bc0090ceb9246e1626937a09c2b5d41d132c29181",
+        "0x814fcb617fb0f98e85135dc7d736f1b4f4cc4546adf0a655f3cd66acc5b4ba7b"
+      ]
+    },
+    {
+      "index": 1,
+      "proof": [
+        "0xbb0d5d62498e8cff96411a0772fa1918db91dcc1645dd41af649908ffd8318a6",
+        "0x814fcb617fb0f98e85135dc7d736f1b4f4cc4546adf0a655f3cd66acc5b4ba7b"
+      ]
+    },
+    {
+      "index": 2,
+      "proof": [
+        "0x966f9ef3e64410031c128eeb370626027671abe6e275684088895955563d93d6"
+      ]
+    }
+  ]
+}

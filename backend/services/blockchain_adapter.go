@@ -17,6 +17,9 @@ type BlockchainAdapter interface {
 
 	// SendTransaction sends a transaction to the blockchain
 	SendTransaction(tx *Transaction) (string, error)
+
+	// GetLogs returns logs matching an address/topics filter in [fromBlock, toBlock].
+	GetLogs(fromBlock, toBlock uint64, address string, topics [][]string) ([]Log, error)
 }
 
 // Receipt represents a transaction receipt from the blockchain
@@ -60,6 +63,8 @@ type MockBlockchainAdapter struct {
 	ContractResponses map[string][]byte
 	SendTxHash        string
 	Error             error
+	Logs              []Log
+	Sent              []*Transaction
 }
 
 // NewMockBlockchainAdapter creates a new MockBlockchainAdapter with default values
@@ -110,5 +115,24 @@ func (m *MockBlockchainAdapter) SendTransaction(tx *Transaction) (string, error)
 	if m.Error != nil {
 		return "", m.Error
 	}
+	m.Sent = append(m.Sent, tx)
 	return m.SendTxHash, nil
+}
+
+// GetLogs returns mock logs whose block number is inside [fromBlock, toBlock].
+func (m *MockBlockchainAdapter) GetLogs(fromBlock, toBlock uint64, address string, topics [][]string) ([]Log, error) {
+	if m.Error != nil {
+		return nil, m.Error
+	}
+	var out []Log
+	for _, l := range m.Logs {
+		if l.BlockNumber < fromBlock || l.BlockNumber > toBlock {
+			continue
+		}
+		if address != "" && l.Address != address {
+			continue
+		}
+		out = append(out, l)
+	}
+	return out, nil
 }
