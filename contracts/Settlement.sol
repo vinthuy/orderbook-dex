@@ -33,7 +33,7 @@ contract Settlement is ISettlement {
     mapping(address => uint256) public depositSeq;
 
     mapping(address => mapping(uint32 => uint256)) public lastWithdrawRoot;
-    mapping(address => mapping(uint32 => uint256)) public withdrawnAtRoot;
+    mapping(address => mapping(uint32 => mapping(uint256 => uint256))) public withdrawnAtRoot;
     mapping(address => mapping(uint32 => ExitRequest)) public exitRequests;
     mapping(address => mapping(uint32 => bool)) public exited;
 
@@ -110,6 +110,34 @@ contract Settlement is ISettlement {
         rootIndex = latestRootIndex;
         _roots[rootIndex] = RootInfo(root, uint64(block.timestamp));
         emit StateRootCommitted(rootIndex, root, uint64(block.timestamp));
+    }
+
+    function withdraw(
+        address account,
+        uint32 assetId,
+        uint256 balance,
+        uint256 amount,
+        uint256 rootIndex,
+        bytes32[] calldata proof
+    ) external override onlyOperator {
+        require(!paused, "paused");
+        require(!exited[account][assetId], "exited");
+        require(exitRequests[account][assetId].rootIndex == 0, "exit pending");
+        require(rootIndex >= 1 && rootIndex <= latestRootIndex, "bad root");
+        require(rootIndex >= lastWithdrawRoot[account][assetId], "stale root");
+        require(amount > 0 && amount <= balance, "bad amount");
+
+        bytes32 leaf = MerkleLib.balanceLeaf(account, assetId, balance);
+        require(MerkleLib.verify(proof, _roots[rootIndex].root, leaf), "bad proof");
+
+        uint256 already = withdrawnAtRoot[account][assetId][rootIndex];
+        require(already + amount <= balance, "exceeds balance");
+        withdrawnAtRoot[account][assetId][rootIndex] = already + amount;
+        lastWithdrawRoot[account][assetId] = rootIndex;
+
+        totalWithdrawn[assetId] += amount;
+        require(IERC20(assets[assetId]).transfer(account, amount), "transfer failed");
+        emit Withdrawal(account, assetId, amount, rootIndex);
     }
 
     function rootAt(uint256 rootIndex) external view override returns (bytes32 root, uint64 timestamp) {

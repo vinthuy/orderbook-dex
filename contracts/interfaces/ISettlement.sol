@@ -5,6 +5,7 @@ interface ISettlement {
     event AssetRegistered(uint32 indexed assetId, address indexed token, uint8 decimals);
     event Deposit(address indexed account, uint32 indexed assetId, uint256 amount, uint256 depositSeq);
     event StateRootCommitted(uint256 indexed rootIndex, bytes32 root, uint64 timestamp);
+    event Withdrawal(address indexed account, uint32 indexed assetId, uint256 amount, uint256 rootIndex);
     event OperatorChanged(address indexed oldOperator, address indexed newOperator);
     event Paused(address indexed by);
     event Unpaused(address indexed by);
@@ -16,6 +17,14 @@ interface ISettlement {
     function unpause() external;
     function deposit(uint32 assetId, uint256 amount) external;
     function commitStateRoot(bytes32 root) external returns (uint256 rootIndex);
+    function withdraw(
+        address account,
+        uint32 assetId,
+        uint256 balance,
+        uint256 amount,
+        uint256 rootIndex,
+        bytes32[] calldata proof
+    ) external;
 
     function latestRootIndex() external view returns (uint256);
     function rootAt(uint256 rootIndex) external view returns (bytes32 root, uint64 timestamp);
