@@ -155,13 +155,19 @@ interface ISettlement {
     function deposit(uint32 assetId, uint256 amount) external;
     function requestExit(uint32 assetId) external;
     function cancelExit(uint32 assetId) external;
-    function finalizeExit(uint32 assetId, uint256 rootIndex, bytes32[] calldata proof) external;
+    function finalizeExit(
+        uint32 assetId,
+        uint256 rootIndex,
+        uint256 balance,
+        bytes32[] calldata proof
+    ) external;
 
     // --- operator ---
     function commitStateRoot(bytes32 root) external returns (uint256 rootIndex);
     function withdraw(
         address account,
         uint32 assetId,
+        uint256 balance,
         uint256 amount,
         uint256 rootIndex,
         bytes32[] calldata proof
@@ -195,20 +201,23 @@ interface ISettlement {
   `totalDeposited[assetId] += amount`；`depositSeq` 为每账户递增计数，emit `Deposit`。
 - `commitStateRoot(root)`：仅 operator；`require(balanceOf(vault) >= totalDeposited - totalWithdrawn)`；
   `latestRootIndex++`；记录 `roots[latestRootIndex] = {root, now}`；emit `StateRootCommitted`。
-- `withdraw(...)`：仅 operator；`require(!paused)`；`require(!exited[account][assetId])`；
+- `withdraw(account, assetId, balance, amount, rootIndex, proof)`：仅 operator；`require(!paused)`；
+  `require(!exited[account][assetId])`；
   `require(exitRequests[account][assetId].rootIndex == 0)`（有未决退出时禁止快速提现，避免双付）；
-  校验 proof 属于 `roots[rootIndex].root`、`amount <= leaf.balance`；
+  以 `leaf = balanceLeaf(account, assetId, balance)` 校验 proof 属于 `roots[rootIndex].root`；
+  `require(amount > 0 && amount <= balance)`；
   `require(rootIndex >= lastWithdrawRoot[account][assetId])` 且更新之；
   `totalWithdrawn += amount`；`token.transfer(account, amount)`；emit `Withdrawal`。
+  （`balance` 由 operator 传入，由 Merkle 证明绑定到已锚定的根；合约无法自行得知链下余额。）
 - `requestExit(assetId)`：`require(exited == false)`；若已有未决请求则幂等返回；冻结
   `rootIndex = latestRootIndex`、`timestamp = now`；emit `ExitRequested`。**不受 `paused` 影响。**
 - `cancelExit(assetId)`：仅在该 `(account, asset)` 尚未 finalize 时允许，清除请求；
   emit `ExitCancelled`。
-- `finalizeExit(assetId, rootIndex, proof)`：`require(请求存在 && rootIndex == 请求.rootIndex)`；
-  `require(now >= 请求.timestamp + exitDelay)`；校验 proof 属于 `roots[rootIndex].root` 且
-  叶子为 `(account, assetId, balance)`；`exited[account][assetId] = true`；
-  清除请求；`totalWithdrawn += balance`；`token.transfer(account, balance)`；
-  emit `ExitFinalized`。**不受 `paused` 影响。**
+- `finalizeExit(assetId, rootIndex, balance, proof)`：`require(请求存在 && rootIndex == 请求.rootIndex)`；
+  `require(now >= 请求.timestamp + exitDelay)`；`require(balance > 0)`；以
+  `leaf = balanceLeaf(account, assetId, balance)` 校验 proof 属于 `roots[rootIndex].root`；
+  `exited[account][assetId] = true`；清除请求；`totalWithdrawn += balance`；
+  `token.transfer(account, balance)`；emit `ExitFinalized`。**不受 `paused` 影响。**
   v1 为**全额退出**（提取该冻结根中该资产的完整余额），不支持部分退出；部分退出留待后续子项目。
 - `pause/unpause`：仅 owner；emit 事件。只影响 `deposit` 与 `withdraw`。
 
