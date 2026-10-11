@@ -9,36 +9,37 @@ import (
 	"web3-amm-dex-backend/ledger"
 )
 
-func TestStateAnchorServiceAnchorOnce(t *testing.T) {
+func TestStateAnchorOnce(t *testing.T) {
 	adapter := NewMockBlockchainAdapter()
 	contract := "0x00000000000000000000000000000000000000aa"
-	// latestRootIndex() returns uint256 5
+	// latestRootIndex() -> 1
 	resp := make([]byte, 32)
-	resp[31] = 5
+	resp[31] = 1
 	adapter.ContractResponses[common.HexToAddress(contract).Hex()] = resp
 
 	l := ledger.New()
-	_ = l.Apply(ledger.DepositOp{Account: [20]byte{0x11}, Asset: 1, Amount: uint256.NewInt(100), Ref: "dep:1"})
-	version := l.Version()
+	var acc ledger.AccountID
+	acc[19] = 9
+	_ = l.Apply(ledger.DepositOp{Account: acc, Asset: 1, Amount: uint256.NewInt(42), Ref: "d1"})
 
 	svc, err := NewSettlementService(adapter, l, contract)
 	if err != nil {
-		t.Fatalf("NewSettlementService: %v", err)
+		t.Fatalf("settlement: %v", err)
 	}
-
-	anchor := NewStateAnchorService(l, svc, 30*time.Second)
-	idx, err := anchor.AnchorOnce()
+	anchor := NewStateAnchorService(svc, l)
+	rec, err := anchor.AnchorOnce()
 	if err != nil {
-		t.Fatalf("AnchorOnce: %v", err)
+		t.Fatalf("anchor: %v", err)
 	}
-	if idx != 5 {
-		t.Fatalf("rootIndex = %d, want 5", idx)
+	if rec.RootIndex != 1 || rec.Version != l.Version() {
+		t.Fatalf("record = %+v, want rootIndex 1 version %d", rec, l.Version())
 	}
-	if len(adapter.Sent) != 1 {
-		t.Fatalf("sent %d txs, want 1", len(adapter.Sent))
+	if rec.Root != l.Root() {
+		t.Fatal("anchored root != ledger root")
 	}
-	if got, ok := anchor.VersionForRoot(5); !ok || got != version {
-		t.Fatalf("version for root 5 = %d (ok=%v), want %d", got, ok, version)
+	got, ok := anchor.RootIndexForVersion(rec.Version)
+	if !ok || got != 1 {
+		t.Fatalf("RootIndexForVersion = %d, %v", got, ok)
 	}
 }
 
@@ -54,18 +55,46 @@ func TestStateAnchorServiceCommitError(t *testing.T) {
 		t.Fatalf("NewSettlementService: %v", err)
 	}
 
-	anchor := NewStateAnchorService(l, svc, time.Second)
-	if _, err := anchor.AnchorOnce(); err == nil {
+	anchor := NewStateAnchorService(svc, l)
+	rec, err := anchor.AnchorOnce()
+	if err == nil {
 		t.Fatal("AnchorOnce: expected error from adapter, got nil")
+	}
+	if rec != nil {
+		t.Fatalf("AnchorOnce: expected nil record on error, got %+v", rec)
+	}
+	if len(anchor.records) != 0 {
+		t.Fatalf("AnchorOnce: stored %d records on error, want 0", len(anchor.records))
 	}
 }
 
 func TestStateAnchorServiceDefaultInterval(t *testing.T) {
 	l := ledger.New()
 	svc, _ := NewSettlementService(NewMockBlockchainAdapter(), l, "0x00000000000000000000000000000000000000aa")
-	anchor := NewStateAnchorService(l, svc, 0)
+	anchor := NewStateAnchorService(svc, l)
 	if anchor.interval != 30*time.Second {
 		t.Fatalf("default interval = %v, want 30s", anchor.interval)
+	}
+}
+
+func TestStateAnchorServiceRootIndexForVersionNotFound(t *testing.T) {
+	adapter := NewMockBlockchainAdapter()
+	contract := "0x00000000000000000000000000000000000000aa"
+	resp := make([]byte, 32)
+	resp[31] = 1
+	adapter.ContractResponses[common.HexToAddress(contract).Hex()] = resp
+
+	l := ledger.New()
+	_ = l.Apply(ledger.DepositOp{Account: [20]byte{0x11}, Asset: 1, Amount: uint256.NewInt(1), Ref: "d"})
+
+	svc, _ := NewSettlementService(adapter, l, contract)
+	anchor := NewStateAnchorService(svc, l)
+	if _, err := anchor.AnchorOnce(); err != nil {
+		t.Fatalf("AnchorOnce: %v", err)
+	}
+	// A version that was never anchored must report ok == false.
+	if got, ok := anchor.RootIndexForVersion(l.Version() + 1); ok {
+		t.Fatalf("RootIndexForVersion(unanchored) = %d, true; want ok=false", got)
 	}
 }
 
