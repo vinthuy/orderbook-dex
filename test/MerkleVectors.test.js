@@ -1,37 +1,38 @@
-const fs = require("fs");
-const path = require("path");
 const { expect } = require("chai");
 const { ethers } = require("hardhat");
+const path = require("path");
+const fs = require("fs");
 
-const fixturePath = path.join(
-  __dirname,
-  "..",
-  "backend",
-  "ledger",
-  "testdata",
-  "merkle_vectors.json"
-);
-
-describe("MerkleVectors (cross-language golden)", function () {
+describe("Merkle cross-language parity", function () {
   let harness;
-  const fixture = JSON.parse(fs.readFileSync(fixturePath, "utf8"));
+  let fixture;
 
   before(async function () {
+    const file = path.join(__dirname, "..", "backend", "ledger", "testdata", "merkle_vectors.json");
+    if (!fs.existsSync(file)) {
+      throw new Error(`missing fixture ${file}; run UPDATE_GOLDEN=1 go test ./ledger/...`);
+    }
+    fixture = JSON.parse(fs.readFileSync(file, "utf8"));
     harness = await (await ethers.getContractFactory("MerkleLibHarness")).deploy();
-    await harness.waitForDeployment();
   });
 
-  it("每个 Go 叶子匹配链上 balanceLeaf", async function () {
+  it("on-chain balanceLeaf matches every Go leaf", async function () {
     for (const leaf of fixture.leaves) {
-      const got = await harness.balanceLeaf(leaf.account, leaf.assetId, leaf.balance);
-      expect(got).to.equal(leaf.leaf, `leaf mismatch for ${leaf.account}/${leaf.assetId}`);
+      const onChain = await harness.balanceLeaf(leaf.account, leaf.assetId, leaf.balance);
+      expect(onChain).to.equal(leaf.leaf);
     }
   });
 
-  it("每个 Go 证明在链上根上验证通过", async function () {
-    for (const p of fixture.proofs) {
+  it("on-chain verify accepts every Go proof against the Go root", async function () {
+    for (let i = 0; i < fixture.proofs.length; i++) {
+      const p = fixture.proofs[i];
       const leaf = fixture.leaves[p.index].leaf;
       expect(await harness.verify(p.proof, fixture.root, leaf)).to.equal(true);
     }
+  });
+
+  it("on-chain computeRoot of all Go leaves equals the Go root", async function () {
+    const leaves = fixture.leaves.map((l) => l.leaf);
+    expect(await harness.computeRoot(leaves)).to.equal(fixture.root);
   });
 });
