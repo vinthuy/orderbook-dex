@@ -59,6 +59,18 @@ func TestDepositIndexerCreditsOnce(t *testing.T) {
 	if got := l.Balance(a, 1).Uint64(); got != 100 {
 		t.Fatalf("balance = %d, want 100 after re-poll", got)
 	}
+
+	// A fresh indexer over the same ledger has a fresh cursor (nextBlock=1), so
+	// it re-observes the same log through GetLogs -> decodeDeposit -> Apply on
+	// the identical "txHash:logIndex" ref. The ledger's Ref-key dedupe (the layer
+	// that also protects a process restart) must prevent a second credit.
+	fresh := NewDepositIndexer(adapter, l, "0xvault", 1)
+	if err := fresh.PollOnce(); err != nil {
+		t.Fatalf("poll fresh: %v", err)
+	}
+	if got := l.Balance(a, 1).Uint64(); got != 100 {
+		t.Fatalf("balance = %d, want 100 after fresh indexer re-poll", got)
+	}
 }
 
 func TestDepositIndexerRespectsConfirmations(t *testing.T) {

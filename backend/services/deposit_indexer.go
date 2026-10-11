@@ -2,6 +2,7 @@ package services
 
 import (
 	"errors"
+	"log"
 	"math/big"
 	"sync"
 	"time"
@@ -75,7 +76,9 @@ func (d *DepositIndexer) Start() error {
 			case <-d.stop:
 				return
 			case <-ticker.C:
-				_ = d.PollOnce()
+				if err := d.PollOnce(); err != nil {
+					log.Printf("deposit indexer: poll: %v", err)
+				}
 			}
 		}
 	}()
