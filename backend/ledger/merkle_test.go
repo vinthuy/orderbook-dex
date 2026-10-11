@@ -132,6 +132,70 @@ func TestGoldenVectors(t *testing.T) {
 			t.Fatalf("leaf %d drifted: got %s want %s", i, fx.Leaves[i].Leaf, want.Leaves[i].Leaf)
 		}
 	}
+	if len(fx.Proofs) != len(want.Proofs) {
+		t.Fatalf("proof count drifted: got %d want %d", len(fx.Proofs), len(want.Proofs))
+	}
+	for i := range want.Proofs {
+		if fx.Proofs[i].Index != want.Proofs[i].Index {
+			t.Fatalf("proof %d index drifted: got %d want %d", i, fx.Proofs[i].Index, want.Proofs[i].Index)
+		}
+		if len(fx.Proofs[i].Proof) != len(want.Proofs[i].Proof) {
+			t.Fatalf("proof %d length drifted: got %d want %d", i, len(fx.Proofs[i].Proof), len(want.Proofs[i].Proof))
+		}
+		for j := range want.Proofs[i].Proof {
+			if fx.Proofs[i].Proof[j] != want.Proofs[i].Proof[j] {
+				t.Fatalf("proof %d sibling %d drifted: got %s want %s", i, j, fx.Proofs[i].Proof[j], want.Proofs[i].Proof[j])
+			}
+		}
+	}
+}
+
+func TestVerifyProofRejectsTampering(t *testing.T) {
+	l := New()
+	a, b := acct(1), acct(2)
+	_ = l.Apply(DepositOp{Account: a, Asset: 1, Amount: amt(10), Ref: "d1"})
+	_ = l.Apply(DepositOp{Account: b, Asset: 1, Amount: amt(20), Ref: "d2"})
+
+	root := l.Root()
+	proof, balance, err := l.Proof(a, 1)
+	if err != nil {
+		t.Fatalf("proof: %v", err)
+	}
+	leaf := leafHash(a, 1, balance)
+	if !verifyProof(proof, root, leaf) {
+		t.Fatal("honest proof must verify")
+	}
+	if len(proof) == 0 {
+		t.Fatal("expected a non-empty proof for a two-leaf tree")
+	}
+	if verifyProof(proof, root, leafHash(a, 1, amt(11))) {
+		t.Fatal("tampered leaf must not verify")
+	}
+
+	tampered := make([][32]byte, len(proof))
+	copy(tampered, proof)
+	tampered[0][0] ^= 0x01
+	if verifyProof(tampered, root, leaf) {
+		t.Fatal("tampered sibling must not verify")
+	}
+}
+
+func TestProofMissingLeafReturnsErrNoLeaf(t *testing.T) {
+	l := New()
+	_ = l.Apply(DepositOp{Account: acct(1), Asset: 1, Amount: amt(10), Ref: "d1"})
+
+	if _, _, err := l.Proof(acct(9), 1); err != ErrNoLeaf {
+		t.Fatalf("unknown account: got %v, want ErrNoLeaf", err)
+	}
+	if _, _, err := l.Proof(acct(1), 7); err != ErrNoLeaf {
+		t.Fatalf("unknown asset: got %v, want ErrNoLeaf", err)
+	}
+}
+
+func TestMerkleRootEmptyLedgerIsZero(t *testing.T) {
+	if got := New().Root(); got != ([32]byte{}) {
+		t.Fatalf("empty ledger root = %x, want all-zero", got)
+	}
 }
 
 func hexBytes(b [32]byte) []byte { return b[:] }

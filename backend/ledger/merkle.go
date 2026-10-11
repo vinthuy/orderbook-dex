@@ -46,21 +46,30 @@ func hashPair(a, b [32]byte) [32]byte {
 	return out
 }
 
+// reduceLevel performs exactly one Merkle level reduction: adjacent nodes are
+// combined with hashPair, and a trailing odd node is promoted unchanged (never
+// duplicated). This is the single definition of the tree rule shared by both
+// merkleRoot and merkleProof, and it must stay identical to
+// MerkleLib.computeRoot on-chain.
+func reduceLevel(level [][32]byte) [][32]byte {
+	next := make([][32]byte, 0, (len(level)+1)/2)
+	for i := 0; i < len(level); i += 2 {
+		if i+1 == len(level) {
+			next = append(next, level[i]) // promote odd node unchanged
+		} else {
+			next = append(next, hashPair(level[i], level[i+1]))
+		}
+	}
+	return next
+}
+
 func merkleRoot(leaves [][32]byte) [32]byte {
 	if len(leaves) == 0 {
 		return [32]byte{}
 	}
 	level := leaves
 	for len(level) > 1 {
-		next := make([][32]byte, 0, (len(level)+1)/2)
-		for i := 0; i < len(level); i += 2 {
-			if i+1 == len(level) {
-				next = append(next, level[i]) // promote odd node unchanged
-			} else {
-				next = append(next, hashPair(level[i], level[i+1]))
-			}
-		}
-		level = next
+		level = reduceLevel(level)
 	}
 	return level[0]
 }
@@ -77,15 +86,7 @@ func merkleProof(leaves [][32]byte, index int) [][32]byte {
 		} else {
 			proof = append(proof, level[idx-1])
 		}
-		next := make([][32]byte, 0, (len(level)+1)/2)
-		for i := 0; i < len(level); i += 2 {
-			if i+1 == len(level) {
-				next = append(next, level[i])
-			} else {
-				next = append(next, hashPair(level[i], level[i+1]))
-			}
-		}
-		level = next
+		level = reduceLevel(level)
 		idx /= 2
 	}
 	return proof
