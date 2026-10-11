@@ -4,10 +4,13 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math/big"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -527,5 +530,107 @@ func TestSettlementServiceWithdrawSendFailurePersistsDebit(t *testing.T) {
 	}
 	if got := recovered.Balance(acc, 1); got.Cmp(uint256.NewInt(60)) != 0 {
 		t.Fatalf("retry with same ref must not debit again, balance = %s, want 60", got)
+	}
+}
+
+// --- Bugbot finding #1: a not-found receipt must be treated as PENDING ---
+
+// notFoundReceiptAdapter mimics the REAL node: while a tx is in the mempool,
+// GetTransactionReceipt returns an error wrapping ethereum.NotFound (exactly
+// what ethclient.TransactionReceipt does), NOT (nil, nil). It is a test-local
+// adapter so the shared MockBlockchainAdapter keeps its (nil, nil) behaviour for
+// every existing test.
+type notFoundReceiptAdapter struct {
+	*MockBlockchainAdapter
+	notFoundPolls int
+	mined         *Receipt
+}
+
+func (a *notFoundReceiptAdapter) GetTransactionReceipt(string) (*Receipt, error) {
+	a.MockBlockchainAdapter.ReceiptCalls++
+	if a.notFoundPolls > 0 {
+		a.notFoundPolls--
+		return nil, fmt.Errorf("eth_getTransactionReceipt: %w", ethereum.NotFound)
+	}
+	return a.mined, nil
+}
+
+// failingReceiptAdapter returns a genuine, non-NotFound error (e.g. the node
+// refusing the connection) on every poll.
+type failingReceiptAdapter struct {
+	*MockBlockchainAdapter
+	err error
+}
+
+func (a *failingReceiptAdapter) GetTransactionReceipt(string) (*Receipt, error) {
+	return nil, a.err
+}
+
+// TestSettlementServiceCommitRootToleratesNotFoundReceiptError covers the HIGH
+// regression: a real adapter reports a still-pending tx as a NotFound error, so
+// CommitRoot must keep polling past those errors and only succeed on the mined
+// receipt. Before the fix it aborted on the first poll.
+func TestSettlementServiceCommitRootToleratesNotFoundReceiptError(t *testing.T) {
+	contract := "0x00000000000000000000000000000000000000aa"
+	var root [32]byte
+	root[31] = 5
+
+	base := NewMockBlockchainAdapter()
+	adapter := &notFoundReceiptAdapter{
+		MockBlockchainAdapter: base,
+		notFoundPolls:         3,
+		mined:                 minedCommitReceipt(contract, 7, root),
+	}
+
+	svc, err := NewSettlementService(adapter, ledger.New(), contract)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if err := svc.Initialize(Config{ReceiptTimeoutSeconds: 2, ReceiptPollMillis: 1}); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+
+	_, rootIndex, err := svc.CommitRoot(root)
+	if err != nil {
+		t.Fatalf("a NotFound receipt means PENDING and must not abort CommitRoot: %v", err)
+	}
+	if rootIndex != 7 {
+		t.Fatalf("rootIndex = %d, want 7 (from the StateRootCommitted event)", rootIndex)
+	}
+	if base.ReceiptCalls != 4 {
+		t.Fatalf("GetTransactionReceipt calls = %d, want 4 (3 pending + 1 mined)", base.ReceiptCalls)
+	}
+	if len(base.Sent) != 1 {
+		t.Fatalf("expected 1 sent tx, got %d", len(base.Sent))
+	}
+}
+
+// TestSettlementServiceCommitRootGenuineErrorFailsFast guards the other half:
+// only NotFound means pending. A genuine error (connection refused, bad RPC)
+// must abort immediately, not wait out the timeout.
+func TestSettlementServiceCommitRootGenuineErrorFailsFast(t *testing.T) {
+	contract := "0x00000000000000000000000000000000000000aa"
+	var root [32]byte
+	wantErr := errors.New("connection refused")
+
+	adapter := &failingReceiptAdapter{MockBlockchainAdapter: NewMockBlockchainAdapter(), err: wantErr}
+
+	svc, err := NewSettlementService(adapter, ledger.New(), contract)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	// Deliberately long: a correct fail-fast path returns at once, while one
+	// that (wrongly) treats any error as pending would block for the timeout.
+	if err := svc.Initialize(Config{ReceiptTimeoutSeconds: 30, ReceiptPollMillis: 1000}); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+
+	start := time.Now()
+	_, _, err = svc.CommitRoot(root)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("error = %v, want %v", err, wantErr)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("CommitRoot did not fail fast on a genuine error (took %s)", elapsed)
 	}
 }

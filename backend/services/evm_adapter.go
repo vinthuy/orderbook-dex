@@ -3,6 +3,7 @@ package services
 import (
 	"context"
 	"crypto/ecdsa"
+	"errors"
 	"fmt"
 	"math/big"
 
@@ -52,6 +53,16 @@ func (a *EVMAdapter) GetBlockNumber() (uint64, error) {
 func (a *EVMAdapter) GetTransactionReceipt(txHash string) (*Receipt, error) {
 	r, err := a.client.TransactionReceipt(context.Background(), common.HexToHash(txHash))
 	if err != nil {
+		// ethclient reports a tx it does not yet know about as
+		// ethereum.NotFound. That is the PENDING signal for a just-submitted
+		// tx still in the mempool, so normalise it to (nil, nil) — the
+		// BlockchainAdapter contract for "unknown/pending". Reporting it as an
+		// error would abort the caller's receipt poll on the first attempt.
+		// Every other failure (connection refused, bad RPC, ...) is a genuine
+		// error and is propagated unchanged.
+		if errors.Is(err, ethereum.NotFound) {
+			return nil, nil
+		}
 		return nil, err
 	}
 	out := &Receipt{

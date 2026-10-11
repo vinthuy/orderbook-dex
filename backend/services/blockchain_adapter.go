@@ -9,7 +9,14 @@ type BlockchainAdapter interface {
 	// GetBlockNumber returns the current block number
 	GetBlockNumber() (uint64, error)
 
-	// GetTransactionReceipt returns the receipt of a transaction
+	// GetTransactionReceipt returns the receipt of a transaction.
+	//
+	// Contract: it returns (nil, nil) when the transaction is unknown — most
+	// importantly while a just-submitted tx is still in the mempool (PENDING) —
+	// and a non-nil error ONLY for a genuine failure (e.g. the node is
+	// unreachable or the RPC call failed). Callers must treat (nil, nil) as
+	// pending and keep polling. Implementations must not surface a "not found"
+	// condition as an error.
 	GetTransactionReceipt(txHash string) (*Receipt, error)
 
 	// CallContract executes a read-only call against a contract

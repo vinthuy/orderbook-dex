@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/holiman/uint256"
@@ -118,9 +119,18 @@ func (s *SettlementService) CommitRoot(root [32]byte) (txHash string, rootIndex 
 }
 
 // waitForReceipt polls until the tx is mined or the configured timeout elapses.
-// GetTransactionReceipt returns (nil, nil) for a tx it does not know about,
-// which means PENDING (the hash came straight from the mempool) and never an
-// error, so that case must keep polling rather than fail.
+//
+// A still-pending transaction is signalled in two ways, and BOTH must keep
+// polling rather than fail:
+//   - (nil, nil): the BlockchainAdapter contract's pending signal (what
+//     MockBlockchainAdapter returns);
+//   - an error wrapping ethereum.NotFound: what ethclient.TransactionReceipt
+//     returns from a real node while the tx is still in the mempool.
+//
+// The second case is defence in depth: the EVMAdapter already normalises
+// NotFound to (nil, nil), but tolerating the raw error here means any future
+// adapter that returns it as-is still works. Any other error is a genuine
+// failure (connection refused, bad RPC, ...) and aborts the wait immediately.
 func (s *SettlementService) waitForReceipt(txHash string) (*Receipt, error) {
 	deadline := time.Now().Add(s.receiptTimeout)
 	poll := s.receiptPoll
@@ -130,7 +140,11 @@ func (s *SettlementService) waitForReceipt(txHash string) (*Receipt, error) {
 	for {
 		receipt, err := s.adapter.GetTransactionReceipt(txHash)
 		if err != nil {
-			return nil, err
+			if !errors.Is(err, ethereum.NotFound) {
+				return nil, err
+			}
+			// NotFound means still pending: fall through to the poll/backoff.
+			receipt = nil
 		}
 		if receipt != nil {
 			return receipt, nil
