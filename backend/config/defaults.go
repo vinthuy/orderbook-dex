@@ -39,3 +39,11 @@ func LoadConfig() *Config {
     
     return config
 }
+
+// defaultDataDir returns the default on-disk location for the ledger WAL/snapshots.
+func defaultDataDir() string {
+    if v := os.Getenv("DATA_DIR"); v != "" {
+        return v
+    }
+    return "./data/settlement"
+}
