@@ -9,10 +9,16 @@ interface ISettlement {
     event OperatorChanged(address indexed oldOperator, address indexed newOperator);
     event Paused(address indexed by);
     event Unpaused(address indexed by);
+    event ExitRequested(address indexed account, uint32 indexed assetId, uint256 rootIndex, uint64 timestamp);
+    event ExitCancelled(address indexed account, uint32 indexed assetId);
+    event ExitFinalized(address indexed account, uint32 indexed assetId, uint256 amount, uint256 rootIndex);
 
     function registerAsset(address token) external returns (uint32 assetId);
     function setOperator(address newOperator) external;
     function setExitDelay(uint64 newDelay) external;
+    function requestExit(uint32 assetId) external;
+    function cancelExit(uint32 assetId) external;
+    function finalizeExit(uint32 assetId, uint256 rootIndex, uint256 balance, bytes32[] calldata proof) external;
     function pause() external;
     function unpause() external;
     function deposit(uint32 assetId, uint256 amount) external;

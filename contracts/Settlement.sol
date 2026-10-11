@@ -140,6 +140,42 @@ contract Settlement is ISettlement {
         emit Withdrawal(account, assetId, amount, rootIndex);
     }
 
+    function requestExit(uint32 assetId) external override {
+        require(assets[assetId] != address(0), "unknown asset");
+        require(!exited[msg.sender][assetId], "exited");
+        require(latestRootIndex >= 1, "no root");
+        if (exitRequests[msg.sender][assetId].rootIndex == 0) {
+            exitRequests[msg.sender][assetId] = ExitRequest(latestRootIndex, uint64(block.timestamp));
+            emit ExitRequested(msg.sender, assetId, latestRootIndex, uint64(block.timestamp));
+        }
+    }
+
+    function cancelExit(uint32 assetId) external override {
+        require(exitRequests[msg.sender][assetId].rootIndex != 0, "no exit");
+        delete exitRequests[msg.sender][assetId];
+        emit ExitCancelled(msg.sender, assetId);
+    }
+
+    function finalizeExit(uint32 assetId, uint256 rootIndex, uint256 balance, bytes32[] calldata proof)
+        external
+        override
+    {
+        ExitRequest memory req = exitRequests[msg.sender][assetId];
+        require(req.rootIndex != 0, "no exit");
+        require(rootIndex == req.rootIndex, "wrong root");
+        require(block.timestamp >= uint256(req.timestamp) + uint256(exitDelay), "too early");
+        require(balance > 0, "zero balance");
+
+        bytes32 leaf = MerkleLib.balanceLeaf(msg.sender, assetId, balance);
+        require(MerkleLib.verify(proof, _roots[rootIndex].root, leaf), "bad proof");
+
+        delete exitRequests[msg.sender][assetId];
+        exited[msg.sender][assetId] = true;
+        totalWithdrawn[assetId] += balance;
+        require(IERC20(assets[assetId]).transfer(msg.sender, balance), "transfer failed");
+        emit ExitFinalized(msg.sender, assetId, balance, rootIndex);
+    }
+
     function rootAt(uint256 rootIndex) external view override returns (bytes32 root, uint64 timestamp) {
         RootInfo memory r = _roots[rootIndex];
         return (r.root, r.timestamp);
