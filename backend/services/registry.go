@@ -12,8 +12,9 @@ type Service interface {
 
 // Config holds configuration for services
 type Config struct {
-	RPCURL     string
-	Port       int
+	RPCURL      string
+	OperatorKey string // settlement operator private key; required only when building the real EVM adapter
+	Port        int
 	DatabaseURL string
 
 	SettlementAddress     string
