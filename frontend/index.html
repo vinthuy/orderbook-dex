@@ -1,0 +1,538 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web3 AMM DEX</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            min-height: 100vh;
+            color: #fff;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            text-align: center;
+            padding: 40px 0;
+        }
+
+        h1 {
+            font-size: 2.5em;
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            color: #888;
+            font-size: 1.1em;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(350px, 1fr));
+            gap: 30px;
+            margin-top: 40px;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 20px;
+            padding: 30px;
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            transition: transform 0.3s, box-shadow 0.3s;
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 20px 40px rgba(0, 210, 255, 0.2);
+        }
+
+        .card h2 {
+            font-size: 1.5em;
+            margin-bottom: 20px;
+            color: #00d2ff;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            color: #aaa;
+            font-size: 0.9em;
+        }
+
+        input, select {
+            width: 100%;
+            padding: 12px 15px;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 10px;
+            background: rgba(255, 255, 255, 0.05);
+            color: #fff;
+            font-size: 1em;
+            transition: border-color 0.3s;
+        }
+
+        input:focus, select:focus {
+            outline: none;
+            border-color: #00d2ff;
+        }
+
+        button {
+            width: 100%;
+            padding: 15px;
+            border: none;
+            border-radius: 10px;
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            color: #fff;
+            font-size: 1.1em;
+            font-weight: bold;
+            cursor: pointer;
+            transition: transform 0.2s, box-shadow 0.2s;
+        }
+
+        button:hover {
+            transform: scale(1.02);
+            box-shadow: 0 10px 20px rgba(0, 210, 255, 0.3);
+        }
+
+        button:active {
+            transform: scale(0.98);
+        }
+
+        .status {
+            margin-top: 15px;
+            padding: 10px;
+            border-radius: 8px;
+            font-size: 0.9em;
+        }
+
+        .status.success {
+            background: rgba(0, 255, 136, 0.2);
+            color: #00ff88;
+            border: 1px solid #00ff88;
+        }
+
+        .status.error {
+            background: rgba(255, 68, 68, 0.2);
+            color: #ff4444;
+            border: 1px solid #ff4444;
+        }
+
+        .status.info {
+            background: rgba(0, 210, 255, 0.2);
+            color: #00d2ff;
+            border: 1px solid #00d2ff;
+        }
+
+        .pool-list {
+            max-height: 300px;
+            overflow-y: auto;
+            margin-top: 15px;
+        }
+
+        .pool-item {
+            background: rgba(255, 255, 255, 0.05);
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+
+        .pool-item h3 {
+            color: #00d2ff;
+            margin-bottom: 5px;
+        }
+
+        .pool-item p {
+            color: #888;
+            font-size: 0.9em;
+            margin: 3px 0;
+        }
+
+        .architecture {
+            margin-top: 50px;
+            padding: 30px;
+            background: rgba(255, 255, 255, 0.03);
+            border-radius: 20px;
+        }
+
+        .architecture h2 {
+            text-align: center;
+            color: #00d2ff;
+            margin-bottom: 30px;
+        }
+
+        .arch-flow {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 20px;
+        }
+
+        .arch-box {
+            background: rgba(0, 210, 255, 0.1);
+            border: 2px solid #00d2ff;
+            border-radius: 15px;
+            padding: 20px 30px;
+            text-align: center;
+            min-width: 150px;
+        }
+
+        .arch-box h3 {
+            color: #00d2ff;
+            margin-bottom: 5px;
+            font-size: 1em;
+        }
+
+        .arch-box p {
+            color: #888;
+            font-size: 0.8em;
+        }
+
+        .arrow {
+            font-size: 2em;
+            color: #00d2ff;
+        }
+
+        .logs {
+            margin-top: 30px;
+            padding: 20px;
+            background: rgba(0, 0, 0, 0.3);
+            border-radius: 15px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+
+        .logs h3 {
+            color: #00d2ff;
+            margin-bottom: 15px;
+        }
+
+        .log-item {
+            font-family: 'Consolas', monospace;
+            font-size: 0.85em;
+            color: #888;
+            margin-bottom: 5px;
+            padding: 5px;
+            border-radius: 5px;
+        }
+
+        .log-item.info {
+            color: #00d2ff;
+        }
+
+        .log-item.success {
+            color: #00ff88;
+        }
+
+        .log-item.error {
+            color: #ff4444;
+        }
+
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            border-radius: 50%;
+            border-top-color: #00d2ff;
+            animation: spin 1s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🌊 Web3 AMM DEX</h1>
+            <p class="subtitle">基于 Ethermint (Cosmos SDK + EVM) 的自动做市商去中心化交易所</p>
+        </header>
+
+        <div class="grid">
+            <!-- Swap Card -->
+            <div class="card">
+                <h2>💱 代币交换</h2>
+                <div class="form-group">
+                    <label>选择交易对</label>
+                    <select id="swapPool">
+                        <option value="">加载中...</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>输入数量</label>
+                    <input type="number" id="swapAmountIn" placeholder="0.0" min="0" step="0.01">
+                </div>
+                <div class="form-group">
+                    <label>最小输出 (滑点保护)</label>
+                    <input type="number" id="swapAmountOutMin" placeholder="0.0" min="0" step="0.01">
+                </div>
+                <button onclick="executeSwap()">执行交换</button>
+                <div id="swapStatus"></div>
+            </div>
+
+            <!-- Liquidity Card -->
+            <div class="card">
+                <h2>💧 添加流动性</h2>
+                <div class="form-group">
+                    <label>选择交易对</label>
+                    <select id="liquidityPool">
+                        <option value="">加载中...</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>代币 A 数量</label>
+                    <input type="number" id="liquidityAmount0" placeholder="0.0" min="0" step="0.01">
+                </div>
+                <div class="form-group">
+                    <label>代币 B 数量</label>
+                    <input type="number" id="liquidityAmount1" placeholder="0.0" min="0" step="0.01">
+                </div>
+                <button onclick="addLiquidity()">添加流动性</button>
+                <div id="liquidityStatus"></div>
+            </div>
+
+            <!-- Pools Card -->
+            <div class="card">
+                <h2>🏊 流动性池</h2>
+                <button onclick="loadPools()">刷新池列表</button>
+                <div id="poolList" class="pool-list"></div>
+                <div id="poolsStatus"></div>
+            </div>
+
+            <!-- Health Card -->
+            <div class="card">
+                <h2>🏥 系统状态</h2>
+                <div id="healthStatus">
+                    <p>点击检查系统状态</p>
+                </div>
+                <button onclick="checkHealth()">检查状态</button>
+                <div id="systemStatus"></div>
+            </div>
+        </div>
+
+        <!-- Architecture -->
+        <div class="architecture">
+            <h2>🏗️ 系统架构</h2>
+            <div class="arch-flow">
+                <div class="arch-box">
+                    <h3>前端</h3>
+                    <p>HTML/CSS/JS</p>
+                </div>
+                <div class="arrow">→</div>
+                <div class="arch-box">
+                    <h3>API Gateway</h3>
+                    <p>Gin + Middleware</p>
+                </div>
+                <div class="arrow">→</div>
+                <div class="arch-box">
+                    <h3>业务逻辑</h3>
+                    <p>Service Layer</p>
+                </div>
+                <div class="arrow">→</div>
+                <div class="arch-box">
+                    <h3>区块链</h3>
+                    <p>Ethermint/EVM</p>
+                </div>
+            </div>
+        </div>
+
+        <!-- Logs -->
+        <div class="logs">
+            <h3>📋 操作日志</h3>
+            <div id="logContainer"></div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://localhost:8080';
+        let pools = [];
+
+        // Log function
+        function addLog(message, type = 'info') {
+            const logContainer = document.getElementById('logContainer');
+            const logItem = document.createElement('div');
+            logItem.className = `log-item ${type}`;
+            logItem.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            logContainer.insertBefore(logItem, logContainer.firstChild);
+        }
+
+        // Show status
+        function showStatus(elementId, message, type = 'info') {
+            const element = document.getElementById(elementId);
+            element.innerHTML = `<div class="status ${type}">${message}</div>`;
+        }
+
+        // Check health
+        async function checkHealth() {
+            addLog('检查系统状态...');
+            try {
+                const response = await fetch(`${API_BASE}/health`);
+                const data = await response.json();
+                showStatus('systemStatus', `✅ 系统正常运行 | 状态: ${data.status}`, 'success');
+                addLog('系统状态检查成功', 'success');
+            } catch (error) {
+                showStatus('systemStatus', `❌ 连接失败: ${error.message}`, 'error');
+                addLog(`系统状态检查失败: ${error.message}`, 'error');
+            }
+        }
+
+        // Load pools
+        async function loadPools() {
+            addLog('加载流动性池列表...');
+            showStatus('poolsStatus', '<span class="loading"></span> 加载中...', 'info');
+            
+            try {
+                const response = await fetch(`${API_BASE}/pools`);
+                pools = await response.json();
+                
+                const poolList = document.getElementById('poolList');
+                const swapSelect = document.getElementById('swapPool');
+                const liquiditySelect = document.getElementById('liquidityPool');
+                
+                if (pools.length === 0) {
+                    poolList.innerHTML = '<p style="color: #888;">暂无流动性池</p>';
+                    swapSelect.innerHTML = '<option value="">暂无可用池</option>';
+                    liquiditySelect.innerHTML = '<option value="">暂无可用池</option>';
+                    showStatus('poolsStatus', '暂无流动性池', 'info');
+                    addLog('暂无流动性池', 'info');
+                    return;
+                }
+                
+                // Update pool list
+                poolList.innerHTML = pools.map(pool => `
+                    <div class="pool-item">
+                        <h3>${pool.token0} / ${pool.token1}</h3>
+                        <p>地址: ${pool.address.substring(0, 10)}...</p>
+                        <p>储备量: ${pool.reserve0} / ${pool.reserve1}</p>
+                    </div>
+                `).join('');
+                
+                // Update selects
+                const options = pools.map(pool => 
+                    `<option value="${pool.address}">${pool.token0} / ${pool.token1}</option>`
+                ).join('');
+                swapSelect.innerHTML = options;
+                liquiditySelect.innerHTML = options;
+                
+                showStatus('poolsStatus', `✅ 已加载 ${pools.length} 个池`, 'success');
+                addLog(`成功加载 ${pools.length} 个流动性池`, 'success');
+            } catch (error) {
+                showStatus('poolsStatus', `❌ 加载失败: ${error.message}`, 'error');
+                addLog(`加载池列表失败: ${error.message}`, 'error');
+            }
+        }
+
+        // Execute swap
+        async function executeSwap() {
+            const pool = document.getElementById('swapPool').value;
+            const amountIn = document.getElementById('swapAmountIn').value;
+            const amountOutMin = document.getElementById('swapAmountOutMin').value;
+            
+            if (!pool || !amountIn) {
+                showStatus('swapStatus', '请填写完整信息', 'error');
+                addLog('交换失败: 请填写完整信息', 'error');
+                return;
+            }
+            
+            addLog(`执行交换: ${amountIn} → ${pool}`);
+            showStatus('swapStatus', '<span class="loading"></span> 执行中...', 'info');
+            
+            try {
+                const response = await fetch(`${API_BASE}/swap`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        pool: pool,
+                        tokenIn: pools[0]?.token0Address || '0x0000000000000000000000000000000000000000',
+                        amountIn: amountIn,
+                        amountOutMin: amountOutMin || '0'
+                    })
+                });
+                const data = await response.json();
+                
+                if (data.txHash) {
+                    showStatus('swapStatus', `✅ 交换成功! TX: ${data.txHash.substring(0, 10)}...`, 'success');
+                    addLog(`交换成功: ${data.amountOut} 代币`, 'success');
+                } else {
+                    showStatus('swapStatus', `❌ 交换失败: ${data.error || '未知错误'}`, 'error');
+                    addLog(`交换失败: ${data.error || '未知错误'}`, 'error');
+                }
+            } catch (error) {
+                showStatus('swapStatus', `❌ 交换失败: ${error.message}`, 'error');
+                addLog(`交换失败: ${error.message}`, 'error');
+            }
+        }
+
+        // Add liquidity
+        async function addLiquidity() {
+            const pool = document.getElementById('liquidityPool').value;
+            const amount0 = document.getElementById('liquidityAmount0').value;
+            const amount1 = document.getElementById('liquidityAmount1').value;
+            
+            if (!pool || !amount0 || !amount1) {
+                showStatus('liquidityStatus', '请填写完整信息', 'error');
+                addLog('添加流动性失败: 请填写完整信息', 'error');
+                return;
+            }
+            
+            addLog(`添加流动性: ${amount0} + ${amount1}`);
+            showStatus('liquidityStatus', '<span class="loading"></span> 执行中...', 'info');
+            
+            try {
+                const response = await fetch(`${API_BASE}/liquidity`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        pool: pool,
+                        amount0: amount0,
+                        amount1: amount1
+                    })
+                });
+                const data = await response.json();
+                
+                if (data.txHash) {
+                    showStatus('liquidityStatus', `✅ 添加成功! LP: ${data.liquidity}`, 'success');
+                    addLog(`流动性添加成功: ${data.liquidity} LP`, 'success');
+                    loadPools(); // Refresh pool list
+                } else {
+                    showStatus('liquidityStatus', `❌ 添加失败: ${data.error || '未知错误'}`, 'error');
+                    addLog(`添加流动性失败: ${data.error || '未知错误'}`, 'error');
+                }
+            } catch (error) {
+                showStatus('liquidityStatus', `❌ 添加失败: ${error.message}`, 'error');
+                addLog(`添加流动性失败: ${error.message}`, 'error');
+            }
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            addLog('系统初始化...', 'info');
+            checkHealth();
+            loadPools();
+        });
+    </script>
+</body>
+</html>
