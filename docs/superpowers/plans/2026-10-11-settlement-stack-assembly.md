@@ -107,11 +107,16 @@ type MockBlockchainAdapter struct {
   `withdrawnAtRoot[msg.sender][assetId][req.rootIndex] += balance;`（与 `withdraw` 的记账口径一致，作纵深防御）
 - [ ] 保持 `exited` / `deposit` 现有语义**不变**（重新充值后，比冻结根更新的根仍应可正常提现）。
 - [ ] 先写失败测试（TDD），再改合约：
-  - `finalizeExit 后重新充值、再以冻结 rootIndex 提现必须 revert`（用冻结根的合法 proof，断言 revert 原因为 `stale root`）。
+  - `finalizeExit 后重新充值、再以冻结 rootIndex 提现必须 revert`（用冻结根的合法 proof）。
   - `finalizeExit 后重新充值、以「新根」提现新入账金额应当成功`（证明修复没有把用户的新资金也锁死）。
   - 保留并复核既有 `cannot exit twice`、`exit is allowed while paused` 等用例仍通过。
+- [ ] **断言哪个 revert 原因（T1 执行后修正，勿再写成 `stale root`）：** `withdraw` 的判据是 `rootIndex >= lastWithdrawRoot`（`Settlement.sol:127`，**非严格大于**），所以对**同一个**冻结根，`lastWithdrawRoot = req.rootIndex` 并不会让它变 stale。真正拦住同根二次领取的是另一笔打点 `withdrawnAtRoot[...][req.rootIndex] += balance`，它触发 `require(already + amount <= balance, "exceeds balance")`（`Settlement.sol:133`）。因此：
+  - 同根二次领取的 revert 原因是 **`exceeds balance`**，断言该原因；
+  - 同时必须打上 `lastWithdrawRoot`，否则**更旧**的根（`< req.rootIndex`）仍可被领取；
+  - 不得为了凑出 `stale root` 而把 `>=` 改成 `>` —— 那会破坏既有用例 `rejects an oversized cumulative payout from the same root`（该用例期望 `exceeds balance`）。
+  - 两处打点都要有，任何一处缺失都必须有测试失败。
 
-**验收：** `npx hardhat test` 全绿，且新增两条用例覆盖「同根二次领取被拒」与「新资金仍可取」。
+**验收：** `npx hardhat test` 全绿，且新增两条用例覆盖「同根二次领取被拒（`exceeds balance`）」与「新资金仍可取」。
 
 ---
 
