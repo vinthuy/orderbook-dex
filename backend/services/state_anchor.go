@@ -27,8 +27,7 @@ type StateAnchorService struct {
 	byVer   map[uint64]uint64 // version -> rootIndex
 
 	interval time.Duration
-	stop     chan struct{}
-	started  bool
+	run      runner
 }
 
 func NewStateAnchorService(settlement *SettlementService, l *ledger.Ledger) *StateAnchorService {
@@ -37,7 +36,6 @@ func NewStateAnchorService(settlement *SettlementService, l *ledger.Ledger) *Sta
 		ledger:     l,
 		byVer:      make(map[uint64]uint64),
 		interval:   30 * time.Second,
-		stop:       make(chan struct{}),
 	}
 }
 
@@ -52,37 +50,19 @@ func (s *StateAnchorService) Initialize(cfg Config) error {
 
 func (s *StateAnchorService) Start() error {
 	s.mu.Lock()
-	if s.started {
-		s.mu.Unlock()
-		return nil
-	}
-	s.started = true
+	interval := s.interval
 	s.mu.Unlock()
 
-	go func() {
-		ticker := time.NewTicker(s.interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-s.stop:
-				return
-			case <-ticker.C:
-				if _, err := s.AnchorOnce(); err != nil {
-					log.Printf("state anchor: %v", err)
-				}
-			}
+	s.run.start(interval, func() {
+		if _, err := s.AnchorOnce(); err != nil {
+			log.Printf("state anchor: %v", err)
 		}
-	}()
+	})
 	return nil
 }
 
 func (s *StateAnchorService) Stop() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.started {
-		close(s.stop)
-		s.started = false
-	}
+	s.run.stop()
 	return nil
 }
 
