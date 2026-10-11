@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
@@ -22,8 +23,19 @@ const settlementABIJSON = `[
      {"name":"rootIndex","type":"uint256"},
      {"name":"proof","type":"bytes32[]"}],"outputs":[]},
   {"type":"function","name":"latestRootIndex","stateMutability":"view","inputs":[],"outputs":[{"name":"","type":"uint256"}]},
-  {"type":"function","name":"rootAt","stateMutability":"view","inputs":[{"name":"rootIndex","type":"uint256"}],"outputs":[{"name":"root","type":"bytes32"},{"name":"timestamp","type":"uint64"}]}
+  {"type":"function","name":"rootAt","stateMutability":"view","inputs":[{"name":"rootIndex","type":"uint256"}],"outputs":[{"name":"root","type":"bytes32"},{"name":"timestamp","type":"uint64"}]},
+  {"type":"event","name":"StateRootCommitted","inputs":[
+     {"name":"rootIndex","type":"uint256","indexed":true},
+     {"name":"root","type":"bytes32","indexed":false},
+     {"name":"timestamp","type":"uint64","indexed":false}]}
 ]`
+
+// defaultReceiptTimeout / defaultReceiptPoll bound how long CommitRoot waits
+// for a mined receipt. They are overridable via services.Config.
+const (
+	defaultReceiptTimeout = 60 * time.Second
+	defaultReceiptPoll    = time.Second
+)
 
 // SettlementService encodes and submits Settlement contract calls.
 type SettlementService struct {
@@ -31,6 +43,9 @@ type SettlementService struct {
 	abi      abi.ABI
 	contract common.Address
 	ledger   *ledger.Ledger
+
+	receiptTimeout time.Duration
+	receiptPoll    time.Duration
 }
 
 func NewSettlementService(adapter BlockchainAdapter, l *ledger.Ledger, contract string) (*SettlementService, error) {
@@ -39,29 +54,138 @@ func NewSettlementService(adapter BlockchainAdapter, l *ledger.Ledger, contract 
 		return nil, fmt.Errorf("parse settlement abi: %w", err)
 	}
 	return &SettlementService{
-		adapter:  adapter,
-		abi:      parsed,
-		contract: common.HexToAddress(contract),
-		ledger:   l,
+		adapter:        adapter,
+		abi:            parsed,
+		contract:       common.HexToAddress(contract),
+		ledger:         l,
+		receiptTimeout: defaultReceiptTimeout,
+		receiptPoll:    defaultReceiptPoll,
 	}, nil
 }
 
-func (s *SettlementService) Name() string                { return "SettlementService" }
-func (s *SettlementService) Initialize(cfg Config) error { return nil }
-func (s *SettlementService) Start() error                { return nil }
-func (s *SettlementService) Stop() error                 { return nil }
+func (s *SettlementService) Name() string { return "SettlementService" }
 
-// CommitRoot submits commitStateRoot(root) and returns the tx hash.
-func (s *SettlementService) CommitRoot(root [32]byte) (string, error) {
+func (s *SettlementService) Initialize(cfg Config) error {
+	if cfg.ReceiptTimeoutSeconds > 0 {
+		s.receiptTimeout = time.Duration(cfg.ReceiptTimeoutSeconds) * time.Second
+	}
+	if cfg.ReceiptPollMillis > 0 {
+		s.receiptPoll = time.Duration(cfg.ReceiptPollMillis) * time.Millisecond
+	}
+	return nil
+}
+
+func (s *SettlementService) Start() error { return nil }
+func (s *SettlementService) Stop() error  { return nil }
+
+// CommitRoot submits commitStateRoot(root), waits for the transaction to be
+// mined, and returns the on-chain rootIndex decoded from the StateRootCommitted
+// event emitted by commitStateRoot.
+//
+// It deliberately does NOT read latestRootIndex() after submitting. Against a
+// real node that view still reports the pre-commit index while the tx is only
+// in the mempool, so recording it produced a version -> rootIndex mapping that
+// was off by one; it also could not tell an `insolvent` revert from a success.
+// The mined event is the only unambiguous source of the index, and decoding it
+// proves the commit actually landed.
+func (s *SettlementService) CommitRoot(root [32]byte) (txHash string, rootIndex uint64, err error) {
 	data, err := s.abi.Pack("commitStateRoot", root)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
-	return s.adapter.SendTransaction(&Transaction{
+	txHash, err = s.adapter.SendTransaction(&Transaction{
 		To:       s.contract.Hex(),
 		Data:     data,
 		GasLimit: 500_000,
 	})
+	if err != nil {
+		return "", 0, err
+	}
+
+	receipt, err := s.waitForReceipt(txHash)
+	if err != nil {
+		return "", 0, err
+	}
+	if receipt.Status != 1 {
+		return "", 0, fmt.Errorf("commitStateRoot: tx %s reverted (status %d)", txHash, receipt.Status)
+	}
+
+	rootIndex, err = s.decodeStateRootCommitted(receipt, root)
+	if err != nil {
+		return "", 0, err
+	}
+	return txHash, rootIndex, nil
+}
+
+// waitForReceipt polls until the tx is mined or the configured timeout elapses.
+// GetTransactionReceipt returns (nil, nil) for a tx it does not know about,
+// which means PENDING (the hash came straight from the mempool) and never an
+// error, so that case must keep polling rather than fail.
+func (s *SettlementService) waitForReceipt(txHash string) (*Receipt, error) {
+	deadline := time.Now().Add(s.receiptTimeout)
+	poll := s.receiptPoll
+	if poll <= 0 {
+		poll = defaultReceiptPoll
+	}
+	for {
+		receipt, err := s.adapter.GetTransactionReceipt(txHash)
+		if err != nil {
+			return nil, err
+		}
+		if receipt != nil {
+			return receipt, nil
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, fmt.Errorf("commitStateRoot: timed out after %s waiting for receipt of %s", s.receiptTimeout, txHash)
+		}
+		if poll < remaining {
+			time.Sleep(poll)
+		} else {
+			time.Sleep(remaining)
+		}
+	}
+}
+
+// decodeStateRootCommitted finds the StateRootCommitted event the settlement
+// contract emitted for this commit, verifies the decoded root matches the root
+// we submitted, and returns its indexed rootIndex (Topics[1]).
+func (s *SettlementService) decodeStateRootCommitted(receipt *Receipt, want [32]byte) (uint64, error) {
+	event, ok := s.abi.Events["StateRootCommitted"]
+	if !ok {
+		return 0, errors.New("commitStateRoot: StateRootCommitted event missing from ABI")
+	}
+	for _, lg := range receipt.Logs {
+		if lg == nil {
+			continue
+		}
+		// Only accept the event emitted by our settlement contract.
+		if common.HexToAddress(lg.Address) != s.contract {
+			continue
+		}
+		if len(lg.Topics) < 2 || common.HexToHash(lg.Topics[0]) != event.ID {
+			continue
+		}
+		// rootIndex is the single indexed argument, so it arrives in Topics[1].
+		rootIndex := new(big.Int).SetBytes(common.HexToHash(lg.Topics[1]).Bytes()).Uint64()
+
+		vals, err := event.Inputs.NonIndexed().Unpack(lg.Data)
+		if err != nil {
+			return 0, fmt.Errorf("commitStateRoot: decode StateRootCommitted: %w", err)
+		}
+		if len(vals) != 2 {
+			return 0, fmt.Errorf("commitStateRoot: StateRootCommitted: got %d non-indexed args, want 2", len(vals))
+		}
+		gotRoot, ok := vals[0].([32]byte)
+		if !ok {
+			return 0, errors.New("commitStateRoot: StateRootCommitted: bad root type")
+		}
+		if gotRoot != want {
+			return 0, fmt.Errorf("commitStateRoot: event root %x != submitted root %x", gotRoot, want)
+		}
+		return rootIndex, nil
+	}
+	return 0, fmt.Errorf("commitStateRoot: receipt for tx %s has no StateRootCommitted event", receipt.TxHash)
 }
 
 // LatestRootIndex reads latestRootIndex() from the contract.

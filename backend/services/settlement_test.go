@@ -17,14 +17,24 @@ import (
 
 func TestSettlementServiceCommitRootEncodesCalldata(t *testing.T) {
 	adapter := NewMockBlockchainAdapter()
-	svc, err := NewSettlementService(adapter, ledger.New(), "0x00000000000000000000000000000000000000aa")
+	contract := "0x00000000000000000000000000000000000000aa"
+	svc, err := NewSettlementService(adapter, ledger.New(), contract)
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
 	var root [32]byte
 	root[31] = 7
-	if _, err := svc.CommitRoot(root); err != nil {
+	adapter.Receipts[adapter.SendTxHash] = minedCommitReceipt(contract, 11, root)
+
+	txHash, rootIndex, err := svc.CommitRoot(root)
+	if err != nil {
 		t.Fatalf("commit: %v", err)
+	}
+	if txHash != adapter.SendTxHash {
+		t.Fatalf("txHash = %q, want %q", txHash, adapter.SendTxHash)
+	}
+	if rootIndex != 11 {
+		t.Fatalf("rootIndex = %d, want 11 (from the StateRootCommitted event)", rootIndex)
 	}
 	if len(adapter.Sent) != 1 {
 		t.Fatalf("expected 1 sent tx, got %d", len(adapter.Sent))
@@ -35,6 +45,55 @@ func TestSettlementServiceCommitRootEncodesCalldata(t *testing.T) {
 	}
 	if data[35] != 7 {
 		t.Fatalf("root not encoded into calldata")
+	}
+}
+
+// TestSettlementServiceCommitRootWaitsForReceipt covers the mock's pending ->
+// mined progression: the receipt is reported pending three times before it is
+// mined, so CommitRoot must poll past all three to succeed.
+func TestSettlementServiceCommitRootWaitsForReceipt(t *testing.T) {
+	adapter := NewMockBlockchainAdapter()
+	contract := "0x00000000000000000000000000000000000000aa"
+	var root [32]byte
+	root[31] = 9
+	adapter.PendingReceipts[adapter.SendTxHash] = 3
+	adapter.Receipts[adapter.SendTxHash] = minedCommitReceipt(contract, 4, root)
+
+	svc, err := NewSettlementService(adapter, ledger.New(), contract)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if err := svc.Initialize(Config{ReceiptTimeoutSeconds: 2, ReceiptPollMillis: 1}); err != nil {
+		t.Fatalf("initialize: %v", err)
+	}
+
+	_, rootIndex, err := svc.CommitRoot(root)
+	if err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if rootIndex != 4 {
+		t.Fatalf("rootIndex = %d, want 4", rootIndex)
+	}
+	if adapter.ReceiptCalls < 4 {
+		t.Fatalf("GetTransactionReceipt calls = %d, want >= 4 (3 pending + 1 mined)", adapter.ReceiptCalls)
+	}
+}
+
+// TestSettlementServiceCommitRootRevertedErrors covers a status-0 receipt: the
+// commit reverted on-chain (e.g. `insolvent`) and must surface an error rather
+// than a bogus rootIndex.
+func TestSettlementServiceCommitRootRevertedErrors(t *testing.T) {
+	adapter := NewMockBlockchainAdapter()
+	contract := "0x00000000000000000000000000000000000000aa"
+	adapter.Receipts[adapter.SendTxHash] = &Receipt{Status: 0}
+
+	svc, err := NewSettlementService(adapter, ledger.New(), contract)
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	var root [32]byte
+	if _, _, err := svc.CommitRoot(root); err == nil {
+		t.Fatal("expected error for a reverted commit")
 	}
 }
 

@@ -65,6 +65,22 @@ type MockBlockchainAdapter struct {
 	Error             error
 	Logs              []Log
 	Sent              []*Transaction
+
+	// CallHandler, when non-nil, handles CallContract instead of the
+	// address-keyed ContractResponses map. ContractResponses is keyed only by
+	// contract address, so it cannot distinguish two methods on the same
+	// contract; CallHandler lets a test inspect the ABI selector in data.
+	CallHandler func(contract string, data []byte) ([]byte, error)
+
+	// PendingReceipts maps a tx hash to the number of GetTransactionReceipt
+	// calls that must still report the tx as pending ((nil, nil)) before the
+	// mined receipt in Receipts is returned. Tests use it to prove the caller
+	// actually waited for a receipt. A missing/zero entry is not pending.
+	PendingReceipts map[string]int
+
+	// ReceiptCalls counts GetTransactionReceipt calls, for "did it poll?"
+	// assertions.
+	ReceiptCalls int
 }
 
 // NewMockBlockchainAdapter creates a new MockBlockchainAdapter with default values
@@ -73,6 +89,7 @@ func NewMockBlockchainAdapter() *MockBlockchainAdapter {
 		BlockNumber:       12345,
 		Receipts:          make(map[string]*Receipt),
 		ContractResponses: make(map[string][]byte),
+		PendingReceipts:   make(map[string]int),
 		SendTxHash:        "0xabc123def45678900000000000000000000000000000000000000000000000000",
 	}
 }
@@ -85,10 +102,16 @@ func (m *MockBlockchainAdapter) GetBlockNumber() (uint64, error) {
 	return m.BlockNumber, nil
 }
 
-// GetTransactionReceipt returns a mock transaction receipt
+// GetTransactionReceipt returns a mock transaction receipt. An unknown tx
+// returns (nil, nil) to model a still-pending (mempool) transaction.
 func (m *MockBlockchainAdapter) GetTransactionReceipt(txHash string) (*Receipt, error) {
 	if m.Error != nil {
 		return nil, m.Error
+	}
+	m.ReceiptCalls++
+	if pending, ok := m.PendingReceipts[txHash]; ok && pending > 0 {
+		m.PendingReceipts[txHash] = pending - 1
+		return nil, nil
 	}
 	receipt, ok := m.Receipts[txHash]
 	if !ok {
@@ -101,6 +124,9 @@ func (m *MockBlockchainAdapter) GetTransactionReceipt(txHash string) (*Receipt, 
 func (m *MockBlockchainAdapter) CallContract(contract string, data []byte, blockNumber uint64) ([]byte, error) {
 	if m.Error != nil {
 		return nil, m.Error
+	}
+	if m.CallHandler != nil {
+		return m.CallHandler(contract, data)
 	}
 	response, ok := m.ContractResponses[contract]
 	if !ok {

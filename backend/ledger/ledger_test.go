@@ -160,3 +160,29 @@ func TestConservation(t *testing.T) {
 		t.Fatalf("total = %s, want %s", l.TotalBalance(7), want)
 	}
 }
+
+// TestRootAndVersion checks the atomic accessor returns the same values as the
+// separate Root()/Version() calls.
+func TestRootAndVersion(t *testing.T) {
+	l := New()
+
+	root, version := l.RootAndVersion()
+	if version != 0 {
+		t.Fatalf("empty version = %d, want 0", version)
+	}
+	if root != l.Root() {
+		t.Fatalf("empty root = %x, want %x", root, l.Root())
+	}
+
+	a := acct(1)
+	if err := l.Apply(DepositOp{Account: a, Asset: 1, Amount: amt(100), Ref: "d1"}); err != nil {
+		t.Fatalf("deposit: %v", err)
+	}
+	root, version = l.RootAndVersion()
+	if version != 1 {
+		t.Fatalf("version = %d, want 1", version)
+	}
+	if root != l.Root() {
+		t.Fatalf("root = %x, want %x", root, l.Root())
+	}
+}

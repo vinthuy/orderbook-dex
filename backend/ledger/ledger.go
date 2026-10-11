@@ -66,6 +66,15 @@ func (l *Ledger) Version() uint64 {
 	return l.version
 }
 
+// RootAndVersion returns the Merkle root and the ledger version together, under
+// a single lock, so a concurrent Apply cannot make the recorded pair
+// inconsistent (which separate Root()/Version() calls allow).
+func (l *Ledger) RootAndVersion() ([32]byte, uint64) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return merkleRoot(l.leavesLocked()), l.version
+}
+
 func (l *Ledger) Balance(a AccountID, asset AssetID) *uint256.Int {
 	l.mu.Lock()
 	defer l.mu.Unlock()

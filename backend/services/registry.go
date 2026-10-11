@@ -21,6 +21,13 @@ type Config struct {
 	RequiredConfirmations uint64
 	AnchorInterval        int64 // seconds
 	ChainID               int64
+
+	// ReceiptTimeoutSeconds bounds how long CommitRoot waits for a mined
+	// receipt before failing; ReceiptPollMillis is the interval between
+	// GetTransactionReceipt polls. Zero leaves the service defaults
+	// (60s / 1000ms) in place.
+	ReceiptTimeoutSeconds int64
+	ReceiptPollMillis     int64
 }
 
 // ServiceRegistry manages the lifecycle of services

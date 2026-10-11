@@ -66,17 +66,17 @@ func (s *StateAnchorService) Stop() error {
 	return nil
 }
 
-// AnchorOnce commits the current ledger root and records the mapping. It relies
-// on the on-chain latestRootIndex (read after commit) so a restart never assumes
-// local state.
+// AnchorOnce commits the current ledger root and records the mapping. The
+// rootIndex comes back from CommitRoot (decoded from the mined
+// StateRootCommitted event), so a commit whose view still lags — or that
+// reverted — can never be recorded as if it had landed.
 func (s *StateAnchorService) AnchorOnce() (*RootRecord, error) {
-	root := s.ledger.Root()
-	version := s.ledger.Version()
+	// Root and version are read under ONE lock: separate Root()/Version()
+	// calls could interleave with a concurrent Apply and record a
+	// (root, version) pair that never existed together.
+	root, version := s.ledger.RootAndVersion()
 
-	if _, err := s.settlement.CommitRoot(root); err != nil {
-		return nil, err
-	}
-	rootIndex, err := s.settlement.LatestRootIndex()
+	_, rootIndex, err := s.settlement.CommitRoot(root)
 	if err != nil {
 		return nil, err
 	}
