@@ -51,6 +51,30 @@ func TestSettlementServiceLatestRootIndex(t *testing.T) {
 	}
 }
 
+func TestSettlementServiceRootAt(t *testing.T) {
+	adapter := NewMockBlockchainAdapter()
+	contract := "0x00000000000000000000000000000000000000aa"
+	// rootAt(1) -> (bytes32 root=0x0b0a0d, uint64 timestamp=42)
+	resp := make([]byte, 64)
+	resp[29] = 0x0b
+	resp[30] = 0x0a
+	resp[31] = 0x0d
+	resp[63] = 42
+	adapter.ContractResponses[common.HexToAddress(contract).Hex()] = resp
+
+	svc, _ := NewSettlementService(adapter, ledger.New(), contract)
+	root, ts, err := svc.RootAt(1)
+	if err != nil {
+		t.Fatalf("rootAt: %v", err)
+	}
+	if root[29] != 0x0b || root[30] != 0x0a || root[31] != 0x0d {
+		t.Fatalf("root = %x, want ...0b0a0d", root)
+	}
+	if ts != 42 {
+		t.Fatalf("timestamp = %d, want 42", ts)
+	}
+}
+
 func TestSettlementServiceWithdrawBuildsProofCalldata(t *testing.T) {
 	adapter := NewMockBlockchainAdapter()
 	l := ledger.New()

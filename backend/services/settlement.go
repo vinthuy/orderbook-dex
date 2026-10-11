@@ -21,7 +21,8 @@ const settlementABIJSON = `[
      {"name":"amount","type":"uint256"},
      {"name":"rootIndex","type":"uint256"},
      {"name":"proof","type":"bytes32[]"}],"outputs":[]},
-  {"type":"function","name":"latestRootIndex","stateMutability":"view","inputs":[],"outputs":[{"name":"","type":"uint256"}]}
+  {"type":"function","name":"latestRootIndex","stateMutability":"view","inputs":[],"outputs":[{"name":"","type":"uint256"}]},
+  {"type":"function","name":"rootAt","stateMutability":"view","inputs":[{"name":"rootIndex","type":"uint256"}],"outputs":[{"name":"root","type":"bytes32"},{"name":"timestamp","type":"uint64"}]}
 ]`
 
 // SettlementService encodes and submits Settlement contract calls.
@@ -85,6 +86,34 @@ func (s *SettlementService) LatestRootIndex() (uint64, error) {
 		return 0, errors.New("latestRootIndex: bad type")
 	}
 	return n.Uint64(), nil
+}
+
+// RootAt reads the root and timestamp committed at a given index.
+func (s *SettlementService) RootAt(rootIndex uint64) ([32]byte, uint64, error) {
+	data, err := s.abi.Pack("rootAt", new(big.Int).SetUint64(rootIndex))
+	if err != nil {
+		return [32]byte{}, 0, err
+	}
+	out, err := s.adapter.CallContract(s.contract.Hex(), data, 0)
+	if err != nil {
+		return [32]byte{}, 0, err
+	}
+	vals, err := s.abi.Unpack("rootAt", out)
+	if err != nil {
+		return [32]byte{}, 0, err
+	}
+	if len(vals) != 2 {
+		return [32]byte{}, 0, errors.New("rootAt: unexpected output")
+	}
+	root, ok := vals[0].([32]byte)
+	if !ok {
+		return [32]byte{}, 0, errors.New("rootAt: bad root type")
+	}
+	ts, ok := vals[1].(uint64)
+	if !ok {
+		return [32]byte{}, 0, errors.New("rootAt: bad timestamp type")
+	}
+	return root, ts, nil
 }
 
 // Withdraw submits a fast withdrawal using the ledger's Merkle proof.
