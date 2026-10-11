@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -411,10 +412,12 @@ func TestSettlementServiceWithdrawProofTakenBeforeDebit(t *testing.T) {
 	}
 }
 
-// TestSettlementServiceWithdrawSameRefRetryResendsWithoutRedebit covers
-// requirement (3): replaying the same ref must not debit twice but must still
-// send another transaction.
-func TestSettlementServiceWithdrawSameRefRetryResendsWithoutRedebit(t *testing.T) {
+// TestSettlementServiceWithdrawSameRefRetryDoesNotResend covers the pinned
+// withdrawal contract: replaying the same ref must not debit twice AND must not
+// broadcast a second transaction — it converges on the first tx. (This replaces
+// the pre-fix expectation that a retry resent a tx, which was the double-pay
+// bug this fix eliminates.)
+func TestSettlementServiceWithdrawSameRefRetryDoesNotResend(t *testing.T) {
 	adapter := NewMockBlockchainAdapter()
 	l := ledger.New()
 	var acc ledger.AccountID
@@ -425,20 +428,26 @@ func TestSettlementServiceWithdrawSameRefRetryResendsWithoutRedebit(t *testing.T
 	if err != nil {
 		t.Fatalf("new: %v", err)
 	}
-	if _, err := svc.Withdraw(acc, 1, uint256.NewInt(100), uint256.NewInt(40), 1, "w1"); err != nil {
+	firstHash, err := svc.Withdraw(acc, 1, uint256.NewInt(100), uint256.NewInt(40), 1, "w1")
+	if err != nil {
 		t.Fatalf("first withdraw: %v", err)
 	}
 	if got := l.Balance(acc, 1); got.Cmp(uint256.NewInt(60)) != 0 {
 		t.Fatalf("balance after first withdraw = %s, want 60", got)
 	}
 	versionAfterFirst := l.Version()
+	adapter.Receipts[firstHash] = &Receipt{Status: 1}
 
-	// Retry with the SAME ref: balance arg must match the now-debited ledger.
-	if _, err := svc.Withdraw(acc, 1, uint256.NewInt(60), uint256.NewInt(40), 1, "w1"); err != nil {
+	// Retry with the SAME ref: no second debit and no second broadcast.
+	retryHash, err := svc.Withdraw(acc, 1, uint256.NewInt(60), uint256.NewInt(40), 1, "w1")
+	if err != nil {
 		t.Fatalf("retry withdraw: %v", err)
 	}
-	if len(adapter.Sent) != 2 {
-		t.Fatalf("retry must resend a tx, sent = %d, want 2", len(adapter.Sent))
+	if retryHash != firstHash {
+		t.Fatalf("retry hash = %q, want %q", retryHash, firstHash)
+	}
+	if len(adapter.Sent) != 1 {
+		t.Fatalf("retry must not resend a tx, sent = %d, want 1", len(adapter.Sent))
 	}
 	if got := l.Balance(acc, 1); got.Cmp(uint256.NewInt(60)) != 0 {
 		t.Fatalf("retry must not debit again, balance = %s, want 60", got)
@@ -632,5 +641,238 @@ func TestSettlementServiceCommitRootGenuineErrorFailsFast(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("CommitRoot did not fail fast on a genuine error (took %s)", elapsed)
+	}
+}
+
+// --- Bugbot finding: Withdraw must pin the first attempt per ref (double-pay) ---
+
+// extractWithdrawRootIndex unpacks the rootIndex (5th arg) from withdraw calldata.
+func extractWithdrawRootIndex(t *testing.T, data []byte) uint64 {
+	t.Helper()
+	if len(data) < 4 {
+		t.Fatalf("calldata too short: %d", len(data))
+	}
+	method, ok := testSettlementABI(t).Methods["withdraw"]
+	if !ok {
+		t.Fatalf("withdraw method missing from ABI")
+	}
+	vals, err := method.Inputs.Unpack(data[4:])
+	if err != nil {
+		t.Fatalf("unpack withdraw: %v", err)
+	}
+	if len(vals) != 6 {
+		t.Fatalf("withdraw args = %d, want 6", len(vals))
+	}
+	n, ok := vals[4].(*big.Int)
+	if !ok {
+		t.Fatalf("rootIndex arg type = %T, want *big.Int", vals[4])
+	}
+	return n.Uint64()
+}
+
+// TestSettlementServiceWithdrawRetryAfterSuccessDoesNotRebroadcast covers the
+// HIGH double-pay finding: once a ref has been broadcast, a retry with the same
+// ref must converge on the original transaction even when the caller passes a
+// NEWER rootIndex and different balance/amount. Before the fix the retry built a
+// fresh tx (a second Sent entry) using the caller's newer root, which the chain
+// can accept and pay a second time.
+func TestSettlementServiceWithdrawRetryAfterSuccessDoesNotRebroadcast(t *testing.T) {
+	adapter := NewMockBlockchainAdapter()
+	l := ledger.New()
+	var acc ledger.AccountID
+	acc[19] = 1
+	_ = l.Apply(ledger.DepositOp{Account: acc, Asset: 1, Amount: uint256.NewInt(100), Ref: "d1"})
+
+	svc, err := NewSettlementService(adapter, l, "0x00000000000000000000000000000000000000aa")
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	firstHash, err := svc.Withdraw(acc, 1, uint256.NewInt(100), uint256.NewInt(40), 1, "w1")
+	if err != nil {
+		t.Fatalf("first withdraw: %v", err)
+	}
+	if len(adapter.Sent) != 1 {
+		t.Fatalf("first withdraw must broadcast 1 tx, got %d", len(adapter.Sent))
+	}
+	// The retry polls the already-broadcast tx's receipt.
+	adapter.Receipts[firstHash] = &Receipt{Status: 1}
+
+	// Retry with a NEWER rootIndex and different balance/amount: none of it may
+	// reach the wire.
+	retryHash, err := svc.Withdraw(acc, 1, uint256.NewInt(60), uint256.NewInt(10), 7, "w1")
+	if err != nil {
+		t.Fatalf("retry withdraw: %v", err)
+	}
+	if retryHash != firstHash {
+		t.Fatalf("retry hash = %q, want the original %q", retryHash, firstHash)
+	}
+	if len(adapter.Sent) != 1 {
+		t.Fatalf("retry must not rebroadcast, sent = %d, want 1", len(adapter.Sent))
+	}
+	if got := extractWithdrawRootIndex(t, adapter.Sent[0].Data); got != 1 {
+		t.Fatalf("broadcast rootIndex = %d, want the original 1", got)
+	}
+	if got := l.Balance(acc, 1); got.Cmp(uint256.NewInt(60)) != 0 {
+		t.Fatalf("retry must not debit again, balance = %s, want 60", got)
+	}
+}
+
+// TestSettlementServiceWithdrawRetryAfterFailedSubmitReusesPinnedParams covers
+// the other half of the finding: when the first submit fails, the retry must
+// re-send the PINNED calldata (original rootIndex + proof), not the caller's
+// fresh arguments. Before the fix the retry re-encoded the newer rootIndex,
+// which is exactly the double-pay vector once the first tx is mined.
+func TestSettlementServiceWithdrawRetryAfterFailedSubmitReusesPinnedParams(t *testing.T) {
+	adapter := NewMockBlockchainAdapter()
+	l := ledger.New()
+	var acc ledger.AccountID
+	acc[19] = 1
+	_ = l.Apply(ledger.DepositOp{Account: acc, Asset: 1, Amount: uint256.NewInt(100), Ref: "d1"})
+
+	svc, err := NewSettlementService(adapter, l, "0x00000000000000000000000000000000000000aa")
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	// Fail the first submit only; a later submit succeeds.
+	attempts := 0
+	adapter.SendHandler = func(tx *Transaction) (string, error) {
+		attempts++
+		if attempts == 1 {
+			return "", errors.New("rpc down")
+		}
+		return adapter.SendTxHash, nil
+	}
+
+	if _, err := svc.Withdraw(acc, 1, uint256.NewInt(100), uint256.NewInt(40), 1, "w1"); err == nil {
+		t.Fatalf("expected the first submit to fail")
+	}
+	if len(adapter.Sent) != 0 {
+		t.Fatalf("a failed submit must not be recorded, sent = %d", len(adapter.Sent))
+	}
+
+	// Retry the same ref with a NEWER rootIndex. The retry must re-send the
+	// pinned record's calldata, so the newer rootIndex and the caller's balance
+	// never reach the wire.
+	if _, err := svc.Withdraw(acc, 1, uint256.NewInt(60), uint256.NewInt(40), 2, "w1"); err != nil {
+		t.Fatalf("retry withdraw: %v", err)
+	}
+	if got := l.Balance(acc, 1); got.Cmp(uint256.NewInt(60)) != 0 {
+		t.Fatalf("balance = %s, want 60 (debited exactly once)", got)
+	}
+	if v := l.Version(); v != 2 {
+		t.Fatalf("version = %d, want 2 (a single WithdrawOp)", v)
+	}
+	if len(adapter.Sent) != 1 {
+		t.Fatalf("a tx must be sent on retry, sent = %d, want 1", len(adapter.Sent))
+	}
+	if got := extractWithdrawRootIndex(t, adapter.Sent[0].Data); got != 1 {
+		t.Fatalf("retry broadcast rootIndex = %d, want the pinned original 1 (not the newer 2)", got)
+	}
+}
+
+// TestSettlementServiceWithdrawDuplicateRefWithoutRecordIsRefused is the core
+// double-pay regression: after a restart the in-memory withdrawal record is gone
+// while the ledger still durably remembers the applied ref, so Withdraw must
+// refuse with ErrWithdrawRecoveryRequired instead of re-broadcasting the
+// caller's fresh arguments with a newer rootIndex.
+func TestSettlementServiceWithdrawDuplicateRefWithoutRecordIsRefused(t *testing.T) {
+	firstAdapter := NewMockBlockchainAdapter()
+	l := ledger.New()
+	var acc ledger.AccountID
+	acc[19] = 1
+	_ = l.Apply(ledger.DepositOp{Account: acc, Asset: 1, Amount: uint256.NewInt(100), Ref: "d1"})
+
+	// Consume the ref through one service: the debit lands in the ledger and the
+	// tx is broadcast, but the pinned record lives only in this service.
+	svc, err := NewSettlementService(firstAdapter, l, "0x00000000000000000000000000000000000000aa")
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	if _, err := svc.Withdraw(acc, 1, uint256.NewInt(100), uint256.NewInt(40), 1, "w1"); err != nil {
+		t.Fatalf("first withdraw: %v", err)
+	}
+
+	// A fresh service over the SAME ledger models a process restart: the ledger
+	// applied-key set survives, the in-memory map does not.
+	adapter := NewMockBlockchainAdapter()
+	restarted, err := NewSettlementService(adapter, l, "0x00000000000000000000000000000000000000aa")
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+	_, err = restarted.Withdraw(acc, 1, uint256.NewInt(60), uint256.NewInt(40), 7, "w1")
+	if !errors.Is(err, ErrWithdrawRecoveryRequired) {
+		t.Fatalf("error = %v, want ErrWithdrawRecoveryRequired", err)
+	}
+	if len(adapter.Sent) != 0 {
+		t.Fatalf("a recovery-required ref must not be broadcast, sent = %d, want 0", len(adapter.Sent))
+	}
+}
+
+// concurrentReceiptAdapter serialises GetTransactionReceipt so the mock's
+// non-atomic ReceiptCalls counter stays race-free while many goroutines converge
+// on the same broadcast. It exists only for the concurrency test.
+type concurrentReceiptAdapter struct {
+	*MockBlockchainAdapter
+	mu sync.Mutex
+}
+
+func (a *concurrentReceiptAdapter) GetTransactionReceipt(hash string) (*Receipt, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.MockBlockchainAdapter.GetTransactionReceipt(hash)
+}
+
+// TestSettlementServiceWithdrawConcurrentSameRefSendsOnce runs several
+// concurrent Withdraw calls with the same ref against one service: exactly one
+// transaction may be broadcast, every caller must observe the same hash, and the
+// ledger must be debited exactly once.
+func TestSettlementServiceWithdrawConcurrentSameRefSendsOnce(t *testing.T) {
+	base := NewMockBlockchainAdapter()
+	base.Receipts[base.SendTxHash] = &Receipt{Status: 1}
+	adapter := &concurrentReceiptAdapter{MockBlockchainAdapter: base}
+
+	l := ledger.New()
+	var acc ledger.AccountID
+	acc[19] = 1
+	_ = l.Apply(ledger.DepositOp{Account: acc, Asset: 1, Amount: uint256.NewInt(100), Ref: "d1"})
+
+	svc, err := NewSettlementService(adapter, l, "0x00000000000000000000000000000000000000aa")
+	if err != nil {
+		t.Fatalf("new: %v", err)
+	}
+
+	const n = 8
+	hashes := make([]string, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			hashes[i], errs[i] = svc.Withdraw(acc, 1, uint256.NewInt(100), uint256.NewInt(40), 1, "w1")
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("goroutine %d: %v", i, err)
+		}
+	}
+	if len(base.Sent) != 1 {
+		t.Fatalf("exactly one tx must be broadcast, got %d", len(base.Sent))
+	}
+	for i, h := range hashes {
+		if h != hashes[0] {
+			t.Fatalf("goroutine %d hash = %q, want %q", i, h, hashes[0])
+		}
+	}
+	if got := l.Balance(acc, 1); got.Cmp(uint256.NewInt(60)) != 0 {
+		t.Fatalf("balance = %s, want 60 (a single debit)", got)
 	}
 }

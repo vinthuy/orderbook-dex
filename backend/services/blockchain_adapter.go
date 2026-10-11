@@ -79,6 +79,14 @@ type MockBlockchainAdapter struct {
 	// contract; CallHandler lets a test inspect the ABI selector in data.
 	CallHandler func(contract string, data []byte) ([]byte, error)
 
+	// SendHandler, when non-nil, handles SendTransaction instead of the shared
+	// Error field and the canned SendTxHash. It receives the transaction that
+	// would be submitted and returns the hash (or an error). It lets a test make
+	// one submit fail and a later submit succeed without a global error flag that
+	// would also break unrelated calls. A successful handler's tx is still
+	// recorded in Sent; a handler error is not.
+	SendHandler func(tx *Transaction) (string, error)
+
 	// PendingReceipts maps a tx hash to the number of GetTransactionReceipt
 	// calls that must still report the tx as pending ((nil, nil)) before the
 	// mined receipt in Receipts is returned. Tests use it to prove the caller
@@ -147,6 +155,14 @@ func (m *MockBlockchainAdapter) CallContract(contract string, data []byte, block
 func (m *MockBlockchainAdapter) SendTransaction(tx *Transaction) (string, error) {
 	if m.Error != nil {
 		return "", m.Error
+	}
+	if m.SendHandler != nil {
+		hash, err := m.SendHandler(tx)
+		if err != nil {
+			return "", err
+		}
+		m.Sent = append(m.Sent, tx)
+		return hash, nil
 	}
 	m.Sent = append(m.Sent, tx)
 	return m.SendTxHash, nil

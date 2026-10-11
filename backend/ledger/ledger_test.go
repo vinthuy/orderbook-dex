@@ -186,3 +186,34 @@ func TestRootAndVersion(t *testing.T) {
 		t.Fatalf("root = %x, want %x", root, l.Root())
 	}
 }
+
+// TestWasApplied covers the read-only accessor the settlement service uses to
+// detect a replayed withdrawal ref whose in-memory record is gone: false for an
+// unseen key, true once applied, and still true after a same-key replay.
+func TestWasApplied(t *testing.T) {
+	l := New()
+	a := acct(1)
+
+	if l.WasApplied("w1") {
+		t.Fatalf("WasApplied(unseen) = true, want false")
+	}
+
+	op := DepositOp{Account: a, Asset: 1, Amount: amt(100), Ref: "w1"}
+	if err := l.Apply(op); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !l.WasApplied("w1") {
+		t.Fatalf("WasApplied(applied) = false, want true")
+	}
+
+	// A same-key replay is skipped but must leave the key applied.
+	if err := l.Apply(op); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if !l.WasApplied("w1") {
+		t.Fatalf("WasApplied after replay = false, want true")
+	}
+	if got := l.Balance(a, 1).Uint64(); got != 100 {
+		t.Fatalf("balance = %d, want 100 (no double credit)", got)
+	}
+}

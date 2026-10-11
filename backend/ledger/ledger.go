@@ -105,6 +105,21 @@ func (l *Ledger) TotalBalance(asset AssetID) *uint256.Int {
 	return total
 }
 
+// WasApplied reports whether an op with the given idempotency key has already
+// been applied (and therefore would be skipped by Apply).
+//
+// It is a read-only accessor. The settlement service uses it to detect a
+// withdrawal ref that the ledger durably remembers but whose in-memory
+// withdrawal record is gone (e.g. after a process restart): in that case there
+// is no trustworthy way to reconstruct the original transaction, so the caller
+// must be told to reconcile rather than have the ref re-broadcast.
+func (l *Ledger) WasApplied(key string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	_, ok := l.applied[key]
+	return ok
+}
+
 // Apply validates and applies ops atomically. Ops whose key was already applied
 // (or repeated within the batch) are skipped. On any error nothing changes.
 func (l *Ledger) Apply(ops ...Op) error {
