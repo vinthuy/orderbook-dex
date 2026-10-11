@@ -60,7 +60,11 @@ func (l *Ledger) WithStore(s Store) *Ledger {
 	return l
 }
 
-func (l *Ledger) Version() uint64 { return l.version }
+func (l *Ledger) Version() uint64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.version
+}
 
 func (l *Ledger) Balance(a AccountID, asset AssetID) *uint256.Int {
 	l.mu.Lock()

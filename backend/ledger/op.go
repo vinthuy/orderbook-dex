@@ -64,6 +64,11 @@ func (o TransferOp) walRecord() OpRecord {
 	return OpRecord{Type: "transfer", From: o.From.Hex(), To: o.To.Hex(), Asset: uint32(o.Asset), Amount: o.Amount.Dec(), Ref: o.Ref}
 }
 func (o TransferOp) apply(t *tx) error {
+	if o.From == o.To {
+		// Self-transfer moves nothing; treat it as a successful no-op so the
+		// key is still recorded as applied and conservation is preserved.
+		return nil
+	}
 	from := t.get(o.From, o.Asset)
 	if from.Cmp(o.Amount) < 0 {
 		return ErrInsufficientBalance

@@ -88,6 +88,39 @@ func TestTransferIsZeroSum(t *testing.T) {
 	}
 }
 
+func TestSelfTransferIsNoop(t *testing.T) {
+	l := New()
+	a := acct(1)
+	_ = l.Apply(DepositOp{Account: a, Asset: 1, Amount: amt(30), Ref: "d1"})
+	before := l.Version()
+
+	op := TransferOp{From: a, To: a, Asset: 1, Amount: amt(30), Ref: "t1"}
+	if err := l.Apply(op); err != nil {
+		t.Fatalf("self-transfer: %v", err)
+	}
+	if got := l.Balance(a, 1).Uint64(); got != 30 {
+		t.Fatalf("balance = %d, want unchanged 30", got)
+	}
+	if got := l.TotalBalance(1).Uint64(); got != 30 {
+		t.Fatalf("total = %d, want unchanged 30", got)
+	}
+	applied := l.Version()
+	if applied != before+1 {
+		t.Fatalf("version = %d, want %d (op must count as applied)", applied, before+1)
+	}
+
+	// Replaying the same key must be a no-op and must not double-advance.
+	if err := l.Apply(op); err != nil {
+		t.Fatalf("self-transfer replay: %v", err)
+	}
+	if l.Version() != applied {
+		t.Fatalf("version = %d, want %d (no double advance on replay)", l.Version(), applied)
+	}
+	if got := l.TotalBalance(1).Uint64(); got != 30 {
+		t.Fatalf("total = %d, want unchanged 30 after replay", got)
+	}
+}
+
 func TestIdempotentReplay(t *testing.T) {
 	l := New()
 	a := acct(1)
