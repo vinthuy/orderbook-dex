@@ -1,0 +1,19 @@
+{
+  "name": "web3-amm-dex",
+  "version": "1.0.0",
+  "description": "AMM DEX on Ethermint (Cosmos SDK + EVM) - Learning Project",
+  "scripts": {
+    "compile": "npx hardhat compile",
+    "test": "npx hardhat test",
+    "node": "npx hardhat node",
+    "deploy": "npx hardhat run scripts/deploy.js --network localhost",
+    "start:backend": "cd backend && go run main.go"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^4.0.0",
+    "hardhat": "^2.20.0"
+  },
+  "dependencies": {
+    "playwright": "^1.63.0"
+  }
+}

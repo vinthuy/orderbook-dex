@@ -1,0 +1,1070 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Web3 AMM DEX - 完整演示</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+            background: #0a0e1a;
+            color: #fff;
+            min-height: 100vh;
+        }
+
+        .header {
+            background: linear-gradient(90deg, #0d1525, #1a2744);
+            border-bottom: 1px solid rgba(0,210,255,0.2);
+            padding: 16px 30px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .logo {
+            font-size: 1.5em;
+            font-weight: bold;
+            background: linear-gradient(90deg, #00d2ff, #7b61ff);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .nav {
+            display: flex;
+            gap: 30px;
+        }
+
+        .nav a {
+            color: #888;
+            text-decoration: none;
+            font-size: 0.95em;
+            transition: color 0.3s;
+        }
+
+        .nav a.active, .nav a:hover {
+            color: #00d2ff;
+        }
+
+        .main {
+            max-width: 500px;
+            margin: 60px auto;
+            padding: 0 20px;
+        }
+
+        .swap-card {
+            background: #131b2e;
+            border-radius: 24px;
+            padding: 24px;
+            border: 1px solid rgba(255,255,255,0.06);
+        }
+
+        .swap-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 8px;
+        }
+
+        .swap-title {
+            font-size: 1.3em;
+            font-weight: 600;
+        }
+
+        .settings-icon {
+            color: #888;
+            cursor: pointer;
+            font-size: 1.2em;
+        }
+
+        .input-group {
+            background: #1c2540;
+            border-radius: 20px;
+            padding: 16px;
+            margin-bottom: 4px;
+            border: 2px solid transparent;
+            transition: border-color 0.3s;
+        }
+
+        .input-group:focus-within {
+            border-color: rgba(0,210,255,0.5);
+        }
+
+        .input-label {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-size: 0.85em;
+            color: #888;
+        }
+
+        .input-row {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+
+        .amount-input {
+            flex: 1;
+            background: none;
+            border: none;
+            color: #fff;
+            font-size: 1.5em;
+            font-weight: 600;
+            outline: none;
+            width: 0;
+        }
+
+        .amount-input::placeholder {
+            color: #444;
+        }
+
+        .token-select {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            background: #283250;
+            border: 1px solid rgba(255,255,255,0.1);
+            border-radius: 100px;
+            padding: 8px 14px;
+            cursor: pointer;
+            font-size: 0.95em;
+            font-weight: 600;
+            white-space: nowrap;
+            transition: background 0.3s;
+        }
+
+        .token-select:hover {
+            background: #334066;
+        }
+
+        .arrow-container {
+            display: flex;
+            justify-content: center;
+            margin: -10px 0;
+            position: relative;
+            z-index: 2;
+        }
+
+        .swap-arrow {
+            background: #283250;
+            border: 4px solid #131b2e;
+            border-radius: 12px;
+            width: 44px;
+            height: 44px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            font-size: 1.2em;
+            color: #00d2ff;
+            transition: transform 0.3s, background 0.3s;
+        }
+
+        .swap-arrow:hover {
+            background: #334066;
+            transform: rotate(180deg);
+        }
+
+        .balance-text {
+            font-size: 0.8em;
+            color: #888;
+            cursor: pointer;
+        }
+
+        .balance-text:hover {
+            color: #00d2ff;
+        }
+
+        .swap-button {
+            width: 100%;
+            padding: 18px;
+            margin-top: 16px;
+            border: none;
+            border-radius: 100px;
+            font-size: 1.1em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+
+        .swap-button.ready {
+            background: linear-gradient(90deg, #00d2ff, #7b61ff);
+            color: #fff;
+        }
+
+        .swap-button.ready:hover {
+            opacity: 0.9;
+            transform: scale(1.01);
+        }
+
+        .swap-button.disabled {
+            background: #1c2540;
+            color: #555;
+            cursor: not-allowed;
+        }
+
+        .swap-button.loading {
+            background: linear-gradient(90deg, #00d2ff, #7b61ff);
+            color: #fff;
+            opacity: 0.7;
+        }
+
+        .pool-info {
+            background: #1c2540;
+            border-radius: 16px;
+            padding: 14px 16px;
+            margin-top: 16px;
+        }
+
+        .pool-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.85em;
+            margin-bottom: 6px;
+        }
+
+        .pool-row:last-child {
+            margin-bottom: 0;
+        }
+
+        .pool-label {
+            color: #888;
+        }
+
+        .pool-value {
+            color: #ddd;
+        }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            background: #131b2e;
+            border-radius: 16px;
+            padding: 4px;
+            margin-bottom: 12px;
+        }
+
+        .tab {
+            flex: 1;
+            padding: 12px;
+            text-align: center;
+            border-radius: 12px;
+            cursor: pointer;
+            font-weight: 600;
+            color: #888;
+            transition: all 0.3s;
+        }
+
+        .tab.active {
+            background: #1c2540;
+            color: #fff;
+        }
+
+        .tab:hover:not(.active) {
+            color: #aaa;
+        }
+
+        /* Transaction Log */
+        .tx-log {
+            max-width: 500px;
+            margin: 30px auto;
+            padding: 0 20px;
+        }
+
+        .tx-log h3 {
+            font-size: 0.9em;
+            color: #888;
+            margin-bottom: 12px;
+        }
+
+        .tx-item {
+            background: #131b2e;
+            border-radius: 12px;
+            padding: 14px 16px;
+            margin-bottom: 8px;
+            border-left: 3px solid;
+            animation: slideIn 0.3s ease;
+        }
+
+        @keyframes slideIn {
+            from { opacity: 0; transform: translateY(-10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .tx-item.success {
+            border-color: #00ff88;
+        }
+
+        .tx-item.pending {
+            border-color: #ffaa00;
+        }
+
+        .tx-type {
+            font-size: 0.8em;
+            color: #888;
+            margin-bottom: 4px;
+        }
+
+        .tx-detail {
+            font-size: 0.9em;
+        }
+
+        .tx-hash {
+            font-family: 'SF Mono', 'Consolas', monospace;
+            font-size: 0.8em;
+            color: #00d2ff;
+            margin-top: 4px;
+            word-break: break-all;
+        }
+
+        /* Architecture Section */
+        .architecture {
+            max-width: 900px;
+            margin: 60px auto;
+            padding: 0 20px;
+        }
+
+        .arch-title {
+            text-align: center;
+            font-size: 1.5em;
+            margin-bottom: 30px;
+            color: #00d2ff;
+        }
+
+        .arch-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 16px;
+        }
+
+        .arch-item {
+            background: #131b2e;
+            border-radius: 16px;
+            padding: 20px;
+            text-align: center;
+            border: 1px solid rgba(0,210,255,0.15);
+            transition: transform 0.3s, border-color 0.3s;
+        }
+
+        .arch-item:hover {
+            transform: translateY(-4px);
+            border-color: #00d2ff;
+        }
+
+        .arch-icon {
+            font-size: 2em;
+            margin-bottom: 10px;
+        }
+
+        .arch-name {
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .arch-desc {
+            font-size: 0.8em;
+            color: #888;
+        }
+
+        .flow-diagram {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            margin-top: 30px;
+            flex-wrap: wrap;
+        }
+
+        .flow-box {
+            background: #1c2540;
+            padding: 12px 20px;
+            border-radius: 10px;
+            font-size: 0.9em;
+        }
+
+        .flow-arrow {
+            color: #00d2ff;
+            font-size: 1.2em;
+        }
+
+        /* Token colors */
+        .token-usdt { color: #26a17b; }
+        .token-dai { color: #f5ac37; }
+        .token-eth { color: #627eea; }
+        .token-btc { color: #f7931a; }
+
+        /* Scrollbar */
+        ::-webkit-scrollbar {
+            width: 6px;
+        }
+        ::-webkit-scrollbar-track {
+            background: #0a0e1a;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: #283250;
+            border-radius: 3px;
+        }
+
+        /* Toast */
+        .toast {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            background: #1c2540;
+            border: 1px solid rgba(0,210,255,0.3);
+            border-radius: 12px;
+            padding: 16px 20px;
+            max-width: 350px;
+            z-index: 1000;
+            animation: toastIn 0.3s ease;
+            display: flex;
+            gap: 12px;
+            align-items: flex-start;
+        }
+
+        @keyframes toastIn {
+            from { opacity: 0; transform: translateX(20px); }
+            to { opacity: 1; transform: translateX(0); }
+        }
+
+        .toast-icon {
+            font-size: 1.3em;
+        }
+
+        .toast-content {
+            flex: 1;
+        }
+
+        .toast-title {
+            font-weight: 600;
+            margin-bottom: 2px;
+        }
+
+        .toast-message {
+            font-size: 0.85em;
+            color: #888;
+        }
+
+        .toast-close {
+            color: #555;
+            cursor: pointer;
+            font-size: 1.2em;
+        }
+
+        .toast-close:hover {
+            color: #fff;
+        }
+
+        /* Progress */
+        .progress-bar {
+            height: 4px;
+            background: #1c2540;
+            border-radius: 2px;
+            margin-top: 12px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: linear-gradient(90deg, #00d2ff, #7b61ff);
+            border-radius: 2px;
+            transition: width 0.3s ease;
+        }
+
+        .hidden { display: none !important; }
+
+        .token-picker-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0,0,0,0.7);
+            z-index: 100;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .token-picker-modal {
+            background: #1c2540;
+            border-radius: 20px;
+            padding: 24px;
+            width: 320px;
+            max-height: 80vh;
+            overflow-y: auto;
+        }
+
+        .token-picker-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 16px;
+        }
+
+        .token-picker-header h3 {
+            margin: 0;
+        }
+
+        .token-picker-close {
+            cursor: pointer;
+            color: #888;
+            font-size: 1.3em;
+            background: none;
+            border: none;
+            padding: 0;
+        }
+
+        .token-picker-close:hover {
+            color: #fff;
+        }
+
+        .token-option {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            padding: 12px;
+            border-radius: 12px;
+            cursor: pointer;
+            margin-bottom: 8px;
+            background: rgba(255,255,255,0.05);
+            transition: background 0.2s;
+        }
+
+        .token-option:hover {
+            background: rgba(0,210,255,0.1);
+        }
+
+        .token-icon {
+            width: 40px;
+            height: 40px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 0.8em;
+            color: #fff;
+        }
+
+        .token-info {
+            flex: 1;
+        }
+
+        .token-name {
+            font-weight: 600;
+        }
+
+        .token-fullname {
+            font-size: 0.8em;
+            color: #888;
+        }
+
+        .token-balance {
+            color: #888;
+        }
+
+        @keyframes spin {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <div class="logo">🌊 Web3 AMM DEX</div>
+        <div class="nav">
+            <a href="#" class="active">Swap</a>
+            <a href="#pools">Pools</a>
+            <a href="#architecture">Architecture</a>
+        </div>
+    </div>
+
+    <div class="main">
+        <div class="swap-card">
+            <div class="tabs">
+                <div class="tab active" onclick="switchTab('swap')">交换</div>
+                <div class="tab" onclick="switchTab('liquidity')">流动性</div>
+            </div>
+
+            <!-- Swap Tab -->
+            <div id="swapTab">
+                <div class="input-group" id="fromGroup">
+                    <div class="input-label">
+                        <span>发送</span>
+                        <span class="balance-text" onclick="setMaxFrom()">余额: <span id="fromBalance">10,000.00</span></span>
+                    </div>
+                    <div class="input-row">
+                        <input type="number" class="amount-input" id="fromAmount" placeholder="0" oninput="calculateOutput()">
+                        <div class="token-select" id="fromTokenSelect" onclick="toggleTokenPicker('from')">
+                            <span id="fromTokenSymbol">USDT</span>
+                            <span>▾</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="arrow-container">
+                    <div class="swap-arrow" onclick="swapTokens()">↓</div>
+                </div>
+
+                <div class="input-group" id="toGroup">
+                    <div class="input-label">
+                        <span>接收 (预估)</span>
+                        <span class="balance-text">余额: <span id="toBalance">5,000.00</span></span>
+                    </div>
+                    <div class="input-row">
+                        <input type="number" class="amount-input" id="toAmount" placeholder="0" readonly>
+                        <div class="token-select" id="toTokenSelect" onclick="toggleTokenPicker('to')">
+                            <span id="toTokenSymbol">DAI</span>
+                            <span>▾</span>
+                        </div>
+                    </div>
+                </div>
+
+                <button class="swap-button disabled" id="swapBtn" onclick="executeSwap()">
+                    连接钱包
+                </button>
+
+                <div class="pool-info">
+                    <div class="pool-row">
+                        <span class="pool-label">价格</span>
+                        <span class="pool-value" id="priceInfo">1 USDT = 0.998 DAI</span>
+                    </div>
+                    <div class="pool-row">
+                        <span class="pool-label">滑点容差</span>
+                        <span class="pool-value">0.5%</span>
+                    </div>
+                    <div class="pool-row">
+                        <span class="pool-label">网络费</span>
+                        <span class="pool-value">~$0.001</span>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Liquidity Tab -->
+            <div id="liquidityTab" class="hidden">
+                <div class="input-group">
+                    <div class="input-label">
+                        <span>代币 A 数量</span>
+                        <span class="balance-text">余额: 10,000.00</span>
+                    </div>
+                    <div class="input-row">
+                        <input type="number" class="amount-input" id="liqAmount0" placeholder="0">
+                        <div class="token-select">
+                            <span>USDT</span>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="arrow-container">
+                    <div class="swap-arrow" style="transform: rotate(90deg);">+</div>
+                </div>
+
+                <div class="input-group">
+                    <div class="input-label">
+                        <span>代币 B 数量</span>
+                        <span class="balance-text">余额: 5,000.00</span>
+                    </div>
+                    <div class="input-row">
+                        <input type="number" class="amount-input" id="liqAmount1" placeholder="0">
+                        <div class="token-select">
+                            <span>DAI</span>
+                        </div>
+                    </div>
+                </div>
+
+                <button class="swap-button disabled" onclick="addLiquidity()">
+                    添加流动性
+                </button>
+
+                <div class="pool-info">
+                    <div class="pool-row">
+                        <span class="pool-label">当前池比例</span>
+                        <span class="pool-value">USDT : DAI = 2 : 1</span>
+                    </div>
+                    <div class="pool-row">
+                        <span class="pool-label">LP 代币</span>
+                        <span class="pool-value">~1,414.21 LP</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Transaction Log -->
+        <div class="tx-log" id="txLog">
+            <h3>📋 最近交易</h3>
+            <div id="txList"></div>
+        </div>
+
+        <!-- Architecture -->
+        <div class="architecture" id="architecture">
+            <h2 class="arch-title">🏗️ 系统架构</h2>
+            <div class="arch-grid">
+                <div class="arch-item">
+                    <div class="arch-icon">🖥️</div>
+                    <div class="arch-name">Frontend</div>
+                    <div class="arch-desc">HTML/CSS/JS<br>响应式 UI</div>
+                </div>
+                <div class="arch-item">
+                    <div class="arch-icon">🚪</div>
+                    <div class="arch-name">API Gateway</div>
+                    <div class="arch-desc">Gin + Middleware<br>认证/限流/日志</div>
+                </div>
+                <div class="arch-item">
+                    <div class="arch-icon">⚙️</div>
+                    <div class="arch-name">Service Layer</div>
+                    <div class="arch-desc">业务逻辑<br>Service Registry</div>
+                </div>
+                <div class="arch-item">
+                    <div class="arch-icon">🔗</div>
+                    <div class="arch-name">Blockchain</div>
+                    <div class="arch-desc">Ethermint/EVM<br>智能合约</div>
+                </div>
+                <div class="arch-item">
+                    <div class="arch-icon">📡</div>
+                    <div class="arch-name">Event Bus</div>
+                    <div class="arch-desc">Pub/Sub<br>异步通信</div>
+                </div>
+            </div>
+
+            <div class="flow-diagram">
+                <div class="flow-box">用户请求</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box">Middleware</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box">API Handler</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box">Service</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box">Smart Contract</div>
+                <div class="flow-arrow">→</div>
+                <div class="flow-box">Blockchain</div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Token Picker Modal -->
+    <div id="tokenPicker" class="hidden">
+        <div class="token-picker-overlay">
+            <div class="token-picker-modal">
+                <div class="token-picker-header">
+                    <h3>选择代币</h3>
+                    <button class="token-picker-close" onclick="closeTokenPicker()">×</button>
+                </div>
+                <div id="tokenList"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Container -->
+    <div id="toastContainer"></div>
+
+    <script>
+        // DEX State
+        const state = {
+            tokens: {
+                USDT: { symbol: 'USDT', name: 'Tether USD', balance: 10000, color: '#26a17b', decimals: 6 },
+                DAI: { symbol: 'DAI', name: 'Dai Stablecoin', balance: 5000, color: '#f5ac37', decimals: 18 },
+                ETH: { symbol: 'ETH', name: 'Ethereum', balance: 10, color: '#627eea', decimals: 18 },
+                BTC: { symbol: 'BTC', name: 'Bitcoin', balance: 0.5, color: '#f7931a', decimals: 8 }
+            },
+            pools: {
+                'DAI-USDT': { token0: 'USDT', token1: 'DAI', reserve0: 100000, reserve1: 99800, fee: 0.003 },
+                'ETH-USDT': { token0: 'USDT', token1: 'ETH', reserve0: 50000, reserve1: 25, fee: 0.003 },
+                'DAI-ETH': { token0: 'DAI', token1: 'ETH', reserve0: 100000, reserve1: 50, fee: 0.003 },
+                'BTC-ETH': { token0: 'BTC', token1: 'ETH', reserve0: 50, reserve1: 800, fee: 0.003 }
+            },
+            fromToken: 'USDT',
+            toToken: 'DAI',
+            connected: false,
+            pendingTx: null
+        };
+
+        let pickingFor = null;
+
+        // Initialize
+        function init() {
+            updateBalances();
+            updatePriceInfo();
+        }
+
+        // Switch tabs
+        function switchTab(tab) {
+            document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+            event.target.classList.add('active');
+            
+            document.getElementById('swapTab').classList.toggle('hidden', tab !== 'swap');
+            document.getElementById('liquidityTab').classList.toggle('hidden', tab !== 'liquidity');
+        }
+
+        // Update balances display
+        function updateBalances() {
+            document.getElementById('fromBalance').textContent = formatNumber(state.tokens[state.fromToken].balance);
+            document.getElementById('toBalance').textContent = formatNumber(state.tokens[state.toToken].balance);
+        }
+
+        // Format number
+        function formatNumber(num) {
+            return num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+        }
+
+        // Get pool key (consistent alphabetical sort)
+        function getPoolKey(t0, t1) {
+            // Always use consistent alphabetical ordering
+            return t0 < t1 ? `${t0}-${t1}` : `${t1}-${t0}`;
+        }
+
+        // Get price from reserves
+        function getPrice(token0, token1) {
+            const poolKey = getPoolKey(token0, token1);
+            const pool = state.pools[poolKey];
+            if (!pool) return 1;
+            
+            const isSorted = pool.token0 === token0;
+            return isSorted ? pool.reserve1 / pool.reserve0 : pool.reserve0 / pool.reserve1;
+        }
+
+        // AMM calculation: x * y = k
+        function calculateSwap(amountIn, reserveIn, reserveOut) {
+            const amountInWithFee = amountIn * 0.997;
+            const amountOut = (amountInWithFee * reserveOut) / (reserveIn + amountInWithFee);
+            return amountOut;
+        }
+
+        // Calculate output
+        function calculateOutput() {
+            const amountIn = parseFloat(document.getElementById('fromAmount').value) || 0;
+            
+            if (amountIn <= 0) {
+                document.getElementById('toAmount').value = '';
+                document.getElementById('swapBtn').className = 'swap-button disabled';
+                document.getElementById('swapBtn').textContent = state.connected ? '输入数量' : '连接钱包';
+                return;
+            }
+
+            const poolKey = getPoolKey(state.fromToken, state.toToken);
+            const pool = state.pools[poolKey];
+            
+            if (!pool) {
+                document.getElementById('toAmount').value = '无可用池';
+                return;
+            }
+
+            const isSorted = pool.token0 === state.fromToken;
+            const reserveIn = isSorted ? pool.reserve0 : pool.reserve1;
+            const reserveOut = isSorted ? pool.reserve1 : pool.reserve0;
+            
+            const amountOut = calculateSwap(amountIn, reserveIn, reserveOut);
+            document.getElementById('toAmount').value = amountOut.toFixed(4);
+            
+            updatePriceInfo();
+            
+            if (state.connected) {
+                document.getElementById('swapBtn').className = 'swap-button ready';
+                document.getElementById('swapBtn').textContent = '交换';
+            }
+        }
+
+        // Update price info
+        function updatePriceInfo() {
+            const price = getPrice(state.fromToken, state.toToken);
+            document.getElementById('priceInfo').textContent = `1 ${state.fromToken} = ${price.toFixed(4)} ${state.toToken}`;
+        }
+
+        // Swap tokens
+        function swapTokens() {
+            [state.fromToken, state.toToken] = [state.toToken, state.fromToken];
+            
+            document.getElementById('fromTokenSymbol').textContent = state.fromToken;
+            document.getElementById('toTokenSymbol').textContent = state.toToken;
+            
+            updateBalances();
+            calculateOutput();
+        }
+
+        // Toggle token picker
+        function toggleTokenPicker(type) {
+            pickingFor = type;
+            const modal = document.getElementById('tokenPicker');
+            modal.classList.remove('hidden');
+            modal.classList.add('token-picker-overlay');
+            
+            const list = document.getElementById('tokenList');
+            list.innerHTML = Object.values(state.tokens).map(token => `
+                <div class="token-option" onclick="selectToken('${token.symbol}')">
+                    <div class="token-icon" style="background:${token.color};">
+                        ${token.symbol.substring(0,2)}
+                    </div>
+                    <div class="token-info">
+                        <div class="token-name">${token.symbol}</div>
+                        <div class="token-fullname">${token.name}</div>
+                    </div>
+                    <div class="token-balance">
+                        ${formatNumber(token.balance)}
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // Close token picker
+        function closeTokenPicker() {
+            const modal = document.getElementById('tokenPicker');
+            modal.classList.add('hidden');
+            modal.classList.remove('token-picker-overlay');
+            pickingFor = null;
+        }
+
+        // Select token
+        function selectToken(symbol) {
+            if (pickingFor === 'from') {
+                state.fromToken = symbol;
+                document.getElementById('fromTokenSymbol').textContent = symbol;
+            } else {
+                state.toToken = symbol;
+                document.getElementById('toTokenSymbol').textContent = symbol;
+            }
+            
+            updateBalances();
+            calculateOutput();
+            closeTokenPicker();
+        }
+
+        // Set max from
+        function setMaxFrom() {
+            document.getElementById('fromAmount').value = state.tokens[state.fromToken].balance;
+            calculateOutput();
+        }
+
+        // Execute swap
+        async function executeSwap() {
+            if (!state.connected) {
+                state.connected = true;
+                // If there's already an amount, show swap button
+                const amountIn = parseFloat(document.getElementById('fromAmount').value) || 0;
+                if (amountIn > 0) {
+                    document.getElementById('swapBtn').className = 'swap-button ready';
+                    document.getElementById('swapBtn').textContent = '交换';
+                } else {
+                    document.getElementById('swapBtn').className = 'swap-button disabled';
+                    document.getElementById('swapBtn').textContent = '输入数量';
+                }
+                showToast('✅', '钱包已连接', '0x1234...5678');
+                return;
+            }
+
+            const amountIn = parseFloat(document.getElementById('fromAmount').value);
+            const amountOut = parseFloat(document.getElementById('toAmount').value);
+            
+            if (!amountIn || !amountOut) return;
+
+            // Show loading
+            document.getElementById('swapBtn').className = 'swap-button loading';
+            document.getElementById('swapBtn').innerHTML = '<span class="loading" style="display:inline-block;width:20px;height:20px;border:2px solid rgba(255,255,255,0.3);border-radius:50%;border-top-color:#fff;animation:spin 1s linear infinite;"></span>';
+
+            // Simulate transaction
+            await simulateTx();
+
+            // Update state
+            state.tokens[state.fromToken].balance -= amountIn;
+            state.tokens[state.toToken].balance += amountOut;
+
+            const poolKey = getPoolKey(state.fromToken, state.toToken);
+            const pool = state.pools[poolKey];
+            const isSorted = pool.token0 === state.fromToken;
+            
+            if (isSorted) {
+                pool.reserve0 += amountIn;
+                pool.reserve1 -= amountOut;
+            } else {
+                pool.reserve1 += amountIn;
+                pool.reserve0 -= amountOut;
+            }
+
+            // Generate tx hash
+            const txHash = '0x' + Array.from({length: 64}, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('');
+
+            // Add to tx log
+            addTxLog('swap', `${amountIn.toFixed(2)} ${state.fromToken} → ${amountOut.toFixed(4)} ${state.toToken}`, txHash);
+
+            // Show success toast
+            showToast('🎉', '交换成功', `${amountOut.toFixed(4)} ${state.toToken} 已到账`);
+
+            // Reset
+            document.getElementById('fromAmount').value = '';
+            document.getElementById('toAmount').value = '';
+            document.getElementById('swapBtn').className = 'swap-button ready';
+            document.getElementById('swapBtn').textContent = '交换';
+
+            updateBalances();
+            updatePriceInfo();
+        }
+
+        // Add liquidity
+        async function addLiquidity() {
+            const amount0 = parseFloat(document.getElementById('liqAmount0').value) || 0;
+            const amount1 = parseFloat(document.getElementById('liqAmount1').value) || 0;
+
+            if (!amount0 || !amount1) {
+                showToast('⚠️', '请输入数量', '需要同时输入两种代币的数量');
+                return;
+            }
+
+            await simulateTx();
+
+            const lpTokens = Math.sqrt(amount0 * amount1);
+            const txHash = '0x' + Array.from({length: 64}, () => '0123456789abcdef'[Math.floor(Math.random() * 16)]).join('');
+
+            addTxLog('liquidity', `+${amount0.toFixed(2)} USDT, +${amount1.toFixed(2)} DAI → ${lpTokens.toFixed(4)} LP`, txHash);
+            showToast('💧', '流动性已添加', `获得 ${lpTokens.toFixed(4)} LP 代币`);
+
+            document.getElementById('liqAmount0').value = '';
+            document.getElementById('liqAmount1').value = '';
+        }
+
+        // Simulate transaction delay
+        function simulateTx() {
+            return new Promise(resolve => setTimeout(resolve, 1500 + Math.random() * 1000));
+        }
+
+        // Add transaction log
+        function addTxLog(type, detail, hash) {
+            const txList = document.getElementById('txList');
+            const txItem = document.createElement('div');
+            txItem.className = 'tx-item success';
+            txItem.innerHTML = `
+                <div class="tx-type">${type === 'swap' ? '💱 交换' : '💧 流动性'}</div>
+                <div class="tx-detail">${detail}</div>
+                <div class="tx-hash">${hash.substring(0, 20)}...${hash.substring(hash.length - 8)}</div>
+            `;
+            txList.insertBefore(txItem, txList.firstChild);
+
+            // Keep only last 5
+            while (txList.children.length > 5) {
+                txList.removeChild(txList.lastChild);
+            }
+        }
+
+        // Show toast
+        function showToast(icon, title, message) {
+            const container = document.getElementById('toastContainer');
+            const toast = document.createElement('div');
+            toast.className = 'toast';
+            toast.innerHTML = `
+                <div class="toast-icon">${icon}</div>
+                <div class="toast-content">
+                    <div class="toast-title">${title}</div>
+                    <div class="toast-message">${message}</div>
+                </div>
+                <div class="toast-close" onclick="this.parentElement.remove()">×</div>
+            `;
+            container.appendChild(toast);
+
+            setTimeout(() => toast.remove(), 5000);
+        }
+
+        // Initialize on load
+        init();
+    </script>
+</body>
+</html>

@@ -1,0 +1,30 @@
+# --- Node / Hardhat ---
+node_modules/
+artifacts/
+cache/
+typechain-types/
+
+# --- Go ---
+backend/cache/
+backend/data/
+*.test
+*.out
+coverage.out
+
+# --- Demo / verification artifacts (screenshots and captures) ---
+demo/*.png
+demo/*.webm
+
+# --- Secrets / env ---
+.env
+.env.*
+*.key
+*.pem
+
+# --- OS / editors ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
