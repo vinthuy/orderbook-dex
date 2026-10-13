@@ -19,10 +19,14 @@ type SettlementStack struct {
 	Adapter    BlockchainAdapter
 	Store      *ledger.FileStore
 	Ledger     *ledger.Ledger
+	Holds      *ledger.Holds
 	Settlement *SettlementService
 	Indexer    *DepositIndexer
 	Anchor     *StateAnchorService
-	Registry   *ServiceRegistry
+	Bus        *EventBus
+	// OrderBook is nil unless ORDERBOOK_MARKETS configured at least one market.
+	OrderBook *OrderBookService
+	Registry  *ServiceRegistry
 
 	closeOnce sync.Once
 	closeErr  error
@@ -68,27 +72,63 @@ func BuildSettlementStack(cfg Config, adapter BlockchainAdapter) (*SettlementSta
 		return nil, fmt.Errorf("settlement stack: recover ledger: %w", err)
 	}
 
+	// Holds and the EventBus are shared across the stack: the settlement service
+	// must withdraw only against available (balance - frozen) funds, and the
+	// order book publishes into the same bus.
+	holds := ledger.NewHolds(l)
+	bus := NewEventBus()
+
 	settlement, err := NewSettlementService(adapter, l, cfg.SettlementAddress)
 	if err != nil {
 		_ = store.Close()
 		return nil, fmt.Errorf("settlement stack: build settlement service: %w", err)
 	}
+	settlement.SetHoldProvider(holds)
 
 	indexer := NewDepositIndexer(adapter, l, cfg.SettlementAddress, cfg.RequiredConfirmations)
 	anchor := NewStateAnchorService(settlement, l)
+
+	// The order book is assembled only when markets are configured, so an
+	// unconfigured stack behaves exactly as before. A malformed market string
+	// is fatal: an operator typo must not silently trade a subset.
+	var orderBook *OrderBookService
+	if cfg.OrderBookMarkets != "" {
+		markets, err := ParseMarkets(cfg.OrderBookMarkets)
+		if err != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("settlement stack: parse ORDERBOOK_MARKETS: %w", err)
+		}
+		journal, err := NewJournal(cfg.OrderBookDataDir)
+		if err != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("settlement stack: open order book journal: %w", err)
+		}
+		orderBook, err = NewOrderBookService(markets, l, holds, journal, bus)
+		if err != nil {
+			_ = journal.Close()
+			_ = store.Close()
+			return nil, fmt.Errorf("settlement stack: build order book service: %w", err)
+		}
+	}
 
 	registry := NewServiceRegistry()
 	registry.Register(settlement)
 	registry.Register(indexer)
 	registry.Register(anchor)
+	if orderBook != nil {
+		registry.Register(orderBook)
+	}
 
 	return &SettlementStack{
 		Adapter:    adapter,
 		Store:      store,
 		Ledger:     l,
+		Holds:      holds,
 		Settlement: settlement,
 		Indexer:    indexer,
 		Anchor:     anchor,
+		Bus:        bus,
+		OrderBook:  orderBook,
 		Registry:   registry,
 	}, nil
 }
@@ -103,6 +143,13 @@ func (st *SettlementStack) Close() error {
 		if st.Registry != nil {
 			if err := st.Registry.StopAll(); err != nil {
 				errs = append(errs, fmt.Errorf("settlement stack: stop services: %w", err))
+			}
+		}
+		// Close the order-book instruction journal's file handle (Stop only
+		// halts the runner). Idempotent, so it is safe after StopAll.
+		if st.OrderBook != nil {
+			if err := st.OrderBook.Close(); err != nil {
+				errs = append(errs, fmt.Errorf("settlement stack: close order book: %w", err))
 			}
 		}
 		if st.Store != nil {
@@ -131,5 +178,7 @@ func ConfigFromSettlement(c config.SettlementConfig) Config {
 		RequiredConfirmations: c.Confirmations,
 		AnchorInterval:        c.AnchorIntervalSeconds,
 		ChainID:               c.ChainID,
+		OrderBookDataDir:      c.OrderBookDataDir,
+		OrderBookMarkets:      c.OrderBookMarkets,
 	}
 }

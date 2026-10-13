@@ -29,6 +29,12 @@ type Config struct {
 	// (60s / 1000ms) in place.
 	ReceiptTimeoutSeconds int64
 	ReceiptPollMillis     int64
+
+	// OrderBookDataDir is the order-book instruction WAL directory (empty means
+	// memory-only). OrderBookMarkets is the compact market definition string;
+	// when empty the order book is not assembled at all (backward compatible).
+	OrderBookDataDir string
+	OrderBookMarkets string
 }
 
 // ServiceRegistry manages the lifecycle of services

@@ -16,7 +16,8 @@ type Config struct {
     LogLevel    string
 }
 
-// SettlementConfig configures the settlement/ledger subsystem (subproject 1).
+// SettlementConfig configures the settlement/ledger subsystem (subproject 1)
+// and the off-chain order book that sits on top of it (subproject 3).
 type SettlementConfig struct {
     ContractAddress       string
     OperatorKey           string
@@ -25,6 +26,14 @@ type SettlementConfig struct {
     Confirmations         uint64
     AnchorIntervalSeconds int64
     ExitDelay             uint64
+
+    // OrderBookDataDir is the order-book instruction WAL directory. Empty means
+    // the order book is memory-only (no crash recovery); unset OrderBookMarkets
+    // disables the order book entirely.
+    OrderBookDataDir string
+    // OrderBookMarkets is the compact market definition string, parsed by
+    // services.ParseMarkets. A malformed string must fail startup.
+    OrderBookMarkets string
 }
 
 // LoadSettlementConfig reads settlement settings from the environment.
@@ -60,6 +69,12 @@ func LoadSettlementConfig() SettlementConfig {
         if n, err := strconv.ParseUint(v, 10, 64); err == nil {
             cfg.ExitDelay = n
         }
+    }
+    if v := os.Getenv("ORDERBOOK_DATA_DIR"); v != "" {
+        cfg.OrderBookDataDir = v
+    }
+    if v := os.Getenv("ORDERBOOK_MARKETS"); v != "" {
+        cfg.OrderBookMarkets = v
     }
     return cfg
 }

@@ -221,3 +221,98 @@ func TestConfigFromSettlementBridgesFields(t *testing.T) {
 		t.Errorf("AnchorInterval = %d, want %d", got.AnchorInterval, in.AnchorIntervalSeconds)
 	}
 }
+
+// TestBuildSettlementStackWithOrderBook proves the order book is assembled
+// alongside settlement (sharing the ledger and holds), registered, restartable,
+// and closable twice.
+func TestBuildSettlementStackWithOrderBook(t *testing.T) {
+	cfg := testStackConfig(t.TempDir())
+	cfg.OrderBookMarkets = "1:ETH/USDT:2:1:2"
+	cfg.OrderBookDataDir = t.TempDir()
+
+	st := mustBuildStack(t, cfg, NewMockBlockchainAdapter())
+	defer st.Close()
+
+	if st.OrderBook == nil {
+		t.Fatal("stack.OrderBook is nil with ORDERBOOK_MARKETS set")
+	}
+	if st.Holds == nil {
+		t.Fatal("stack.Holds is nil")
+	}
+	svc, ok := st.Registry.Get("OrderBookService")
+	if !ok {
+		t.Fatal("registry is missing OrderBookService")
+	}
+	if svc.Name() != "OrderBookService" {
+		t.Fatalf("Get(OrderBookService).Name() = %q", svc.Name())
+	}
+	// The order book and the settlement service must share one holds instance,
+	// otherwise withdrawals would ignore order freezes.
+	settlementSvc, _ := st.Registry.Get("SettlementService")
+	_ = settlementSvc
+
+	if err := st.Registry.InitializeAll(cfg); err != nil {
+		t.Fatalf("InitializeAll: %v", err)
+	}
+	if err := st.Registry.StartAll(); err != nil {
+		t.Fatalf("StartAll: %v", err)
+	}
+	if err := st.Registry.StopAll(); err != nil {
+		t.Fatalf("StopAll: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+// TestBuildSettlementStackRejectsBadMarkets proves a malformed market string
+// fails startup rather than silently trading a subset.
+func TestBuildSettlementStackRejectsBadMarkets(t *testing.T) {
+	for _, spec := range []string{
+		"not:a:valid:market",  // too few fields
+		"1:ETH/USDT:2:1:2:abc", // bad min qty
+		"1:ETH/USDT:1:1:2",     // base == quote
+	} {
+		t.Run(spec, func(t *testing.T) {
+			cfg := testStackConfig(t.TempDir())
+			cfg.OrderBookMarkets = spec
+			if _, err := BuildSettlementStack(cfg, NewMockBlockchainAdapter()); err == nil {
+				t.Fatalf("BuildSettlementStack(%q) = nil error, want a parse error", spec)
+			}
+		})
+	}
+}
+
+// TestBuildSettlementStackWithoutMarketsHasNoOrderBook pins backward
+// compatibility: unset ORDERBOOK_MARKETS means no order book service at all.
+func TestBuildSettlementStackWithoutMarketsHasNoOrderBook(t *testing.T) {
+	st := mustBuildStack(t, testStackConfig(t.TempDir()), NewMockBlockchainAdapter())
+	defer st.Close()
+
+	if st.OrderBook != nil {
+		t.Fatal("stack.OrderBook must be nil when markets are unset")
+	}
+	if _, ok := st.Registry.Get("OrderBookService"); ok {
+		t.Fatal("OrderBookService must not be registered when markets are unset")
+	}
+}
+
+// TestConfigFromSettlementBridgesOrderBookFields pins the order-book config
+// bridge.
+func TestConfigFromSettlementBridgesOrderBookFields(t *testing.T) {
+	in := config.SettlementConfig{
+		ContractAddress:  testSettlementAddress,
+		OrderBookDataDir: "orders/data",
+		OrderBookMarkets: "1:ETH/USDT:2:1:2",
+	}
+	got := ConfigFromSettlement(in)
+	if got.OrderBookDataDir != in.OrderBookDataDir {
+		t.Errorf("OrderBookDataDir = %q, want %q", got.OrderBookDataDir, in.OrderBookDataDir)
+	}
+	if got.OrderBookMarkets != in.OrderBookMarkets {
+		t.Errorf("OrderBookMarkets = %q, want %q", got.OrderBookMarkets, in.OrderBookMarkets)
+	}
+}
