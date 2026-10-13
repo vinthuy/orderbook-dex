@@ -101,3 +101,24 @@ func TestLoadSettlementConfigFromEnv(t *testing.T) {
         t.Fatalf("numeric fields not loaded: %+v", cfg)
     }
 }
+
+func TestLoadSettlementConfigOrderBook(t *testing.T) {
+    t.Setenv("ORDERBOOK_DATA_DIR", "./orders")
+    t.Setenv("ORDERBOOK_MARKETS", "1:ETH/USDT:2:1:2")
+    cfg := LoadSettlementConfig()
+    if cfg.OrderBookDataDir != "./orders" {
+        t.Fatalf("OrderBookDataDir = %q, want ./orders", cfg.OrderBookDataDir)
+    }
+    if cfg.OrderBookMarkets != "1:ETH/USDT:2:1:2" {
+        t.Fatalf("OrderBookMarkets = %q, want the raw spec string", cfg.OrderBookMarkets)
+    }
+}
+
+func TestLoadSettlementConfigOrderBookDefaultsEmpty(t *testing.T) {
+    t.Setenv("ORDERBOOK_DATA_DIR", "")
+    t.Setenv("ORDERBOOK_MARKETS", "")
+    cfg := LoadSettlementConfig()
+    if cfg.OrderBookDataDir != "" || cfg.OrderBookMarkets != "" {
+        t.Fatalf("order book config should default empty: %+v", cfg)
+    }
+}

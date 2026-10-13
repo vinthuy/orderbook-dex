@@ -64,12 +64,29 @@ type withdrawRecord struct {
 	txHash      string
 }
 
+// HoldProvider is the freeze-aware view of the ledger that a withdrawal must
+// respect: Held reports the frozen amount for (account, asset) and Spend runs
+// debit only if the *available* balance (balance - held) covers amount, holding
+// its lock across the check so a concurrent order freeze cannot take the funds
+// between the check and the debit. *ledger.Holds implements it.
+//
+// It is optional: when a SettlementService has no provider, Withdraw behaves
+// exactly as it did before the order book existed (no freeze state to respect).
+type HoldProvider interface {
+	Held(a ledger.AccountID, asset ledger.AssetID) *uint256.Int
+	Spend(a ledger.AccountID, asset ledger.AssetID, amount *uint256.Int, debit func() error) error
+}
+
 // SettlementService encodes and submits Settlement contract calls.
 type SettlementService struct {
 	adapter  BlockchainAdapter
 	abi      abi.ABI
 	contract common.Address
 	ledger   *ledger.Ledger
+
+	// holds, when non-nil, makes Withdraw respect engine-side freezes. Set via
+	// SetHoldProvider once the holds are assembled.
+	holds HoldProvider
 
 	receiptTimeout time.Duration
 	receiptPoll    time.Duration
@@ -98,6 +115,10 @@ func NewSettlementService(adapter BlockchainAdapter, l *ledger.Ledger, contract 
 }
 
 func (s *SettlementService) Name() string { return "SettlementService" }
+
+// SetHoldProvider installs the freeze-aware withdrawal gate. Passing nil
+// restores the pre-order-book behaviour (balance-only check).
+func (s *SettlementService) SetHoldProvider(h HoldProvider) { s.holds = h }
 
 func (s *SettlementService) Initialize(cfg Config) error {
 	if cfg.ReceiptTimeoutSeconds > 0 {
@@ -390,7 +411,18 @@ func (s *SettlementService) newWithdrawRecord(account ledger.AccountID, asset le
 	// (b) Debit the ledger before submitting on-chain. WithdrawOp is idempotent
 	// by ref: replaying the same ref is a no-op, so a retry after a failed
 	// submit never debits twice.
-	if err := s.ledger.Apply(ledger.WithdrawOp{Account: account, Asset: asset, Amount: amount, Ref: ref}); err != nil {
+	debit := func() error {
+		return s.ledger.Apply(ledger.WithdrawOp{Account: account, Asset: asset, Amount: amount, Ref: ref})
+	}
+	// When holds are configured, the "available balance >= amount" check and the
+	// debit happen together under Holds.mu so a concurrent Reserve (a new order
+	// freezing funds) cannot slip between them. Frozen funds are therefore not
+	// withdrawable. Without holds the debit is unchanged.
+	if s.holds != nil {
+		if err := s.holds.Spend(account, asset, amount, debit); err != nil {
+			return nil, err
+		}
+	} else if err := debit(); err != nil {
 		return nil, err
 	}
 
