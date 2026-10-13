@@ -203,6 +203,19 @@ type Trade struct {
 - **市价买**：`reserved = MaxNotional`；每笔成交扣掉该笔 `Notional`。
 - **市价卖**：`reserved = Qty`；每笔成交扣掉该笔 `Qty`。
 
+**离簿必释放（子项目 3 实现期发现并修复的泄漏）**：任何订单离开订单簿（全成、撤销、STP 被撤）
+时，都必须把 `reserved` 的**残额**一次性释放。买入冻结取 `ceil` 而每笔成交按 `floor` 扣除，两者
+之差是整数取整残额；若订单全成离簿时不释放，它会被**永久冻结**（`Available` 永久少算，且
+`OpenReserves` 已不再包含它，重放对账也修不回来）。注意释放必须发生在**扣减之后**：先释放再扣减
+会把 `reserved` 扣到 0 再减去成交额而**下溢**。该泄漏在随机指令流下表现为每笔全成买单最多 1 个
+quote 最小单位，量小但永久、且累积。
+
+**市价买预算不足的边界**：`MaxNotional` 必须 `> 0`。若预算小于"在最优价可成交的最小金额"
+（即在当前最优价上裁量后 `floor(剩余预算 × 10^BaseDecimals / Price) == 0`），则**零成交、残部撤销、
+释放全部 `MaxNotional`**——不拒绝。理由：是否"必然零成交"取决于订单簿当前状态（是竞态，不是请求
+本身的属性），把状态相关的判断塞进请求校验会让结果依赖时序；统一为"IOC 未成交即撤销"更简单，
+且不损失任何资金。
+
 `Qty > 0`、`MinQty` 校验在入簿前完成（`RequiredReserve` 阶段即可拒绝，不入簿）。
 `RequiredReserve(req)` 计算首笔冻结额（纯函数，不改状态）：
 `Limit buy → (Quote, ceil(Qty*Price/10^BaseDecimals))`；`Market buy → (Quote, MaxNotional)`；
@@ -241,10 +254,10 @@ type level struct {
 
 `Engine.Place(req)`：
 
-1. 校验：市场存在、`Qty > 0`、`Qty ≥ MinQty`、限价单 `Price > 0`、市价买 `MaxNotional > 0`
-   且 `MaxNotional ≥` 该单在最优价可成交的最小金额（否则必然零成交，直接拒绝更诚实）、
-   限价买若给了 `MaxNotional` 则须 `≥ ceil(Qty*Price/10^BaseDecimals)`。任何失败返回
-   `Rejected` 且**不改状态、不产生冻结**。
+1. 校验：市场存在、`Qty > 0`、`Qty ≥ MinQty`、限价单 `Price > 0`、市价买 `MaxNotional > 0`、
+   `Market + GTC` 非法、限价买若给了 `MaxNotional` 则须 `≥ ceil(Qty*Price/10^BaseDecimals)`。
+   任何失败返回 `Rejected`（实现上返回 `ErrBadRequest`）且**不改状态、不产生冻结、`Releases` 为空**。
+   校验**不得**依赖订单簿状态（例如"预算是否够成交一笔"），否则同一请求的结果会随时序变化。
 2. 分配 `ID`、`Seq`；置 `Status = New`。
 3. **撮合循环**：反复取对手方最优价级：
    - **价格约束**：限价买要求 `最优卖价 ≤ 本单 Price`；限价卖要求 `最优买价 ≥ 本单 Price`；
@@ -274,13 +287,17 @@ type level struct {
 1. `level.total == Σ(该级挂单剩余量)`；级空即从 `prices`/`levels` 移除，不残留空级。
 2. `side.prices` 严格有序且与 `levels` 键集合一致；买降序、卖升序。
 3. 同一价级内 `fifo` 顺序 == `Seq` 升序。
-4. 任意挂单 `0 < Filled ≤ Qty`；`remaining > 0`。
-5. `Order.reserved == 该单按 4.4 规则在"当前剩余量"下的应冻结额`（买卖各自公式；买入为
-   `ceil` 语义但按"原冻结 − 各笔 notional 累减"实现，故须校验 `reserved ≥ 0` 且
-   `reserved ≥ ceil(remaining*Price/10^BaseDecimals)`）。
+4. 任意**在簿**挂单 `0 ≤ Filled < Qty` 且 `Remaining > 0`（`Filled == 0` 对刚入簿未成交的单是
+   合法的，故不能写成 `0 < Filled`）。
+5. **在簿**挂单的 `reserved` 覆盖其剩余量应冻结额：卖单 `reserved == Remaining`；买单
+   `reserved ≥ ceil(Remaining × Price / 10^BaseDecimals)`。（`uint256` 无负值，故"`reserved ≥ 0`"
+   是空话；真正有意义的是这一条与第 8 条。）
 6. **成交零和 + 无量泄漏**：每笔成交 `Notional == floor(Qty*Price/10^BaseDecimals)`；一买一卖
    两侧记账金额恒等。
 7. **确定性**：随机指令序列下，两台同配置引擎产出逐字段相同的 `Trades` 与最终 `Book`。
+8. **冻结全账**：`Σ(所有被接受订单入簿时的冻结额) == Σ(所有 `Releases`) + Σ(`OpenReserves()`)`。
+   第 5 条只检查**在簿**订单，无法发现"订单离簿时残额未释放"这类泄漏（残额随订单一起离开视野）；
+   第 8 条是全账恒等式，是那类泄漏的唯一守护。**实现期正是靠它发现了全成买单的取整残额泄漏。**
 
 ---
 
@@ -463,5 +480,8 @@ docs/superpowers/plans/2026-10-13-matching-engine.md                        # �
 | 日志顺序 | 先落指令 WAL、再改订单簿、再应用账本 |
 | 账本应用失败 | 致命降级，拒绝后续下单/撤单，重启重放对账 |
 | 幂等键 | 成交：`trade:<TradeID>:base` / `:quote`；由确定性成交序号派生 |
+| 离簿必释放冻结残额（子项目 3 实现期修复） | 订单全成/撤销/STP 被撤时释放 `reserved` 残额；**必须在扣减之后**释放（先释放会下溢）。买入 `ceil` 冻结与 `floor` 扣减之差是全成买单的取整残额，不释放即**永久冻结**；守护不变量是「冻结全账」恒等式，而非"在簿订单"检查 |
+| 市价买预算不足（子项目 3） | 不拒绝；零成交、残部撤销、释放全部 `MaxNotional`。校验不得依赖订单簿状态 |
+| 不变量 4 措辞（子项目 3 修正） | 在簿挂单为 `0 ≤ Filled < Qty`（`Filled == 0` 合法），原 `0 < Filled` 不成立 |
 | 本轮未做（显式延后） | 订单 TTL/退出即自动撤单、手续费、订单簿快照、HTTP/WS、链上批量结算 |
 ```
