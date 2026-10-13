@@ -84,15 +84,59 @@ func genCommands(seed uint64, n int) []command {
 			tif = TIFIOC
 		}
 		price := Price(100 + r.intn(10)*25)
-		qty := uint64(1 + r.intn(20))
+		qty := amt(uint64(1 + r.intn(20)))
 		var maxNotional *uint256.Int
 		if typ == TypeMarket && side == SideBuy {
 			maxNotional = amt(uint64(1 + r.intn(500)))
 		}
 
+		// Periodically emit extreme magnitudes so the checked-arithmetic paths
+		// are exercised: a tiny-value-only generator is exactly what let the
+		// notional overflow (2^193 * 2^63 == 0 mod 2^256) escape. Qty is pushed
+		// to and past the 2^128 bound, Price to the uint64 ceiling near 2^63,
+		// MaxNotional to 2^200.
+		if r.intn(4) == 0 {
+			switch r.intn(4) {
+			case 0:
+				qty = pow2(128)
+			case 1:
+				qty = new(uint256.Int).Add(pow2(128), amt(1))
+			case 2:
+				qty = pow2(193)
+			case 3:
+				qty = new(uint256.Int).Add(pow2(192), amt(uint64(1+r.intn(1000))))
+			}
+		}
+		if r.intn(4) == 0 {
+			switch r.intn(3) {
+			case 0:
+				price = Price(1) << 63
+			case 1:
+				price = Price(^uint64(0))
+			case 2:
+				price = Price(1) << 62
+			}
+		}
+		if maxNotional != nil && r.intn(4) == 0 {
+			switch r.intn(2) {
+			case 0:
+				maxNotional = pow2(200)
+			case 1:
+				maxNotional = new(uint256.Int).Add(pow2(200), amt(1))
+			}
+		}
+		// The exact reduced repro, injected verbatim.
+		if r.intn(16) == 0 {
+			qty = pow2(193)
+			price = Price(1) << 63
+			if maxNotional != nil {
+				maxNotional = pow2(200)
+			}
+		}
+
 		switch r.intn(16) { // periodic invalid requests
 		case 0:
-			qty = 0
+			qty = amt(0)
 		case 1:
 			if typ == TypeLimit {
 				price = 0
@@ -114,7 +158,7 @@ func genCommands(seed uint64, n int) []command {
 			Type:        typ,
 			TIF:         tif,
 			Price:       price,
-			Qty:         amt(qty),
+			Qty:         qty,
 			MaxNotional: maxNotional,
 		}})
 	}
@@ -388,9 +432,13 @@ func compareLevels(t *testing.T, market MarketID, name string, a, b []LevelView)
 // runCommandsAccounting is runCommands plus the freeze bookkeeping: it records
 // every release emitted and the total freeze reserved for accepted orders
 // (what the service layer would have frozen via RequiredReserve before Place).
-func runCommandsAccounting(e *Engine, cmds []command) (trades []Trade, released map[ledger.HoldKey]*uint256.Int, reservedAtPlacement *uint256.Int) {
+// placedReserve records, per accepted order, the exact reserve that was frozen
+// for it at placement so the "reserved never exceeds what was placed" check can
+// run.
+func runCommandsAccounting(e *Engine, cmds []command) (trades []Trade, released map[ledger.HoldKey]*uint256.Int, reservedAtPlacement *uint256.Int, placedReserve map[OrderID]*uint256.Int) {
 	released = make(map[ledger.HoldKey]*uint256.Int)
 	reservedAtPlacement = uint256.NewInt(0)
+	placedReserve = make(map[OrderID]*uint256.Int)
 	addRelease := func(rs []HoldRelease) {
 		for _, r := range rs {
 			k := ledger.HoldKey{Account: r.Account, Asset: r.Asset}
@@ -415,6 +463,9 @@ func runCommandsAccounting(e *Engine, cmds []command) (trades []Trade, released 
 				panic(fmt.Sprintf("RequiredReserve accepted but Place rejected: %v", err))
 			}
 			reservedAtPlacement.Add(reservedAtPlacement, amount)
+			if res.Order != nil {
+				placedReserve[res.Order.ID] = new(uint256.Int).Set(amount)
+			}
 			addRelease(res.Releases)
 			trades = append(trades, res.Trades...)
 			continue
@@ -425,20 +476,21 @@ func runCommandsAccounting(e *Engine, cmds []command) (trades []Trade, released 
 			trades = append(trades, res.Trades...)
 		}
 	}
-	return trades, released, reservedAtPlacement
+	return trades, released, reservedAtPlacement, placedReserve
 }
 
 // TestFreezeIsFullyAccounted closes the gap that let a stranded maker freeze
 // slip through: checkBookInvariants only inspects orders that are still OPEN,
 // so a rounding remainder left on an order that had already LEFT the book was
 // invisible. Every unit ever frozen must end up either released or still
-// reserved by an open order.
+// reserved by an open order. It also asserts that no order's live reserve ever
+// exceeds the reserve that was frozen for it at placement.
 func TestFreezeIsFullyAccounted(t *testing.T) {
 	for _, seed := range []uint64{1, 5, 13, 42, 0xDEADBEEF, 0xFEEDFACE} {
 		seed := seed
 		t.Run(fmt.Sprintf("seed-%d", seed), func(t *testing.T) {
 			e := newTestEngine(t, testMarkets()...)
-			_, released, atPlacement := runCommandsAccounting(e, genCommands(seed, 500))
+			_, released, atPlacement, placedReserve := runCommandsAccounting(e, genCommands(seed, 500))
 
 			total := new(uint256.Int).Set(atPlacement)
 			for _, v := range released {
@@ -451,6 +503,17 @@ func TestFreezeIsFullyAccounted(t *testing.T) {
 			if !total.IsZero() {
 				t.Fatalf("freeze not accounted for: %s units placed=%s released=%v stillOpen=%v",
 					total, atPlacement, released, open)
+			}
+
+			// No order may hold more than the reserve placed for it.
+			for id, o := range e.all {
+				placed, ok := placedReserve[id]
+				if !ok {
+					t.Fatalf("order %d has no recorded placement reserve", id)
+				}
+				if o.reserved.Cmp(placed) > 0 {
+					t.Fatalf("order %d reserved %s exceeds placed reserve %s", id, o.reserved, placed)
+				}
 			}
 		})
 	}

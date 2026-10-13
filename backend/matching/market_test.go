@@ -55,6 +55,21 @@ func assertPanics(t *testing.T, name string, f func()) {
 	f()
 }
 
+func assertNoPanic(t *testing.T, name string, f func()) {
+	t.Helper()
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("%s: unexpected panic: %v", name, r)
+		}
+	}()
+	f()
+}
+
+// pow2 returns 2^n as a fresh uint256 (test convenience for extreme amounts).
+func pow2(n uint) *uint256.Int {
+	return new(uint256.Int).Lsh(uint256.NewInt(1), n)
+}
+
 // --- Market.Validate ---
 
 func TestMarketValidate(t *testing.T) {
@@ -159,6 +174,33 @@ func TestNotionalZeroPricePanics(t *testing.T) {
 	m := testMarket()
 	assertPanics(t, "Notional", func() { m.Notional(amt(1), 0) })
 	assertPanics(t, "NotionalCeil", func() { m.NotionalCeil(amt(1), 0) })
+}
+
+// TestNotionalOverflowPanics pins the checked arithmetic: uint256 Mul wraps
+// silently, so a product that overflows must panic instead of producing a
+// smaller (or zero) notional. With scale 100, 2^193 * 2^63 == 2^256 == 0
+// (mod 2^256): unchecked code returns 0, checked code must refuse.
+func TestNotionalOverflowPanics(t *testing.T) {
+	m := testMarket() // scale = 100
+	qty := pow2(193)
+	p := Price(1) << 63
+
+	assertPanics(t, "Notional overflow", func() { m.Notional(qty, p) })
+	assertPanics(t, "NotionalCeil overflow", func() { m.NotionalCeil(qty, p) })
+
+	// A product that fits exactly but whose ceil term pushes it over the edge
+	// must also panic in the ceil wrapper while the floor wrapper still works.
+	allOnes := new(uint256.Int).SetAllOne() // 2^256-1
+	edgeQty := new(uint256.Int).Div(allOnes, uint256.NewInt(3))
+	// 2^256-1 is divisible by 3, so edgeQty*3 == 2^256-1 (no Mul overflow).
+	if got := m.Notional(edgeQty, 3); got.IsZero() {
+		t.Fatalf("floor notional of a %d-bit product unexpectedly zero", got.BitLen())
+	}
+	assertPanics(t, "NotionalCeil overflow via +scale-1", func() { m.NotionalCeil(edgeQty, 3) })
+
+	// The zero-price panic must survive the reimplementation.
+	assertPanics(t, "Notional zero price", func() { m.Notional(amt(1), 0) })
+	assertPanics(t, "NotionalCeil zero price", func() { m.NotionalCeil(amt(1), 0) })
 }
 
 // TestNotionalDoesNotAliasInputs guards the pointer-copy rule at the math

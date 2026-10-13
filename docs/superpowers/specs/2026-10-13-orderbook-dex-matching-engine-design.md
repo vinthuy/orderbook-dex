@@ -140,6 +140,14 @@ type TradeID uint64 // 成交序号，从 1 单调递增（重放可复现）
   市场必须以"1 个整 base 单位至少值 1 个 quote 最小单位"的方向配置（即 `price ≥ 1`）。若某
   token 单价低于一个 quote 最小单位（如 1e-9 USDT），应把该市场反向报价（例如以"每 1e9 枚"
   为 base 单位）。`NewEngine` 对 `price == 0` 的挂单直接拒绝。
+- **溢出即拒绝，绝不静默取模（子项目 3 加固）**：`holiman/uint256` 的 `Mul`/`Add`/`Sub` 在
+  溢出/下溢时**静默取模**。内核的 `notional = qty*price/10^BaseDecimals` 一旦取模，就会算出一个
+  比真实值**小**（甚至为 0）的金额，而冻结额恰恰由它推导——"挂单冻结必然覆盖每一笔可能成交"
+  这一核心前提随之失效。故内核所有金额运算必须走**显式溢出检查**：`notionalChecked` 用
+  `MulOverflow`/`AddOverflow` 返回 `ErrAmountTooLarge`，`consumeReserve` 用 `SubOverflow`
+  在下溢时 panic。导出的 `Notional`/`NotionalCeil` 保持原签名与 `price == 0` 的 panic 行为，
+  改为在 `notionalChecked` 之上实现，并在溢出时 panic——这是纵深防御，引擎正常路径在
+  `validate` 阶段已先拒绝，故这些 panic 不可达。
 
 ### 4.2 市场配置
 
@@ -152,10 +160,12 @@ type Market struct {
     Base, Quote           ledger.AssetID
     BaseDecimals          uint8  // floor 基数：notional = qty*price/10^BaseDecimals
     MinQty                *uint256.Int // 可空；最小下单量（base）
+    MaxQty                *uint256.Int // 可空；最大下单量（base），缺省 2^128
 }
 ```
 
-`Market.Validate()` 校验：Base ≠ Quote、`10^BaseDecimals` 可表达、`MinQty` 非负。
+`Market.Validate()` 校验：Base ≠ Quote、`10^BaseDecimals` 可表达、`MinQty` 非负、
+`MaxQty` 非负（`nil` 表示缺省 `2^128`）。
 `NewEngine(markets []Market)` 拒绝重复 `ID`/`Symbol` 与非法市场。
 
 ### 4.3 订单与成交
@@ -202,6 +212,17 @@ type Trade struct {
 - **限价卖**：`reserved = Qty`；每笔成交扣掉该笔 `Qty`。
 - **市价买**：`reserved = MaxNotional`；每笔成交扣掉该笔 `Notional`。
 - **市价卖**：`reserved = Qty`；每笔成交扣掉该笔 `Qty`。
+
+**数量上界 `Market.MaxQty` 与"冻结覆盖每一笔成交"（子项目 3 加固）**：`Qty` 是外部输入，
+上簿前必须由 `validate` 以 `Qty > MaxQty`（`ErrAmountTooLarge`）拒绝。缺省 `MaxQty = 2^128`
+使 `qty*price ≤ 2^128·(2^64−1) < 2^192`，于是 `notional` 的乘法**在数学上不可能溢出**——这正是
+"冻结必然覆盖任意成交"得以无条件成立的前提。限价买的所需冻结额在 `validate` 中即由
+`notionalChecked` 计算：若 `qty*price` 溢出（例如 `BaseDecimals=2`、`Qty=2^193`、`Price=2^63`，
+乘积恰为 `2^256 ≡ 0 (mod 2^256)`），返回 `ErrAmountTooLarge`，而不是一个为 0 的冻结额。
+`validate`、`RequiredReserve`、`Place` 共用唯一的 `reserveFor` 推导冻结额，保证"被校验的冻结额"
+与"被扣减的冻结额"逐位一致。若允许 wrap：零冻结的买入单会被接受，首笔成交从零冻结里减出而
+**下溢**，`Holds.Release` 随即失败并触发服务致命降级，且该被污染的冻结额会经
+`Holds.Reconcile(e.OpenReserves())` 在重启后存活——因此 wrap 在本内核中不可接受。
 
 **离簿必释放（子项目 3 实现期发现并修复的泄漏）**：任何订单离开订单簿（全成、撤销、STP 被撤）
 时，都必须把 `reserved` 的**残额**一次性释放。买入冻结取 `ceil` 而每笔成交按 `floor` 扣除，两者
@@ -254,7 +275,8 @@ type level struct {
 
 `Engine.Place(req)`：
 
-1. 校验：市场存在、`Qty > 0`、`Qty ≥ MinQty`、限价单 `Price > 0`、市价买 `MaxNotional > 0`、
+1. 校验：市场存在、`Qty > 0`、`Qty ≤ MaxQty`（缺省 `2^128`）、`Qty ≥ MinQty`、限价单
+   `Price > 0`、市价买 `MaxNotional > 0`、
    `Market + GTC` 非法、限价买若给了 `MaxNotional` 则须 `≥ ceil(Qty*Price/10^BaseDecimals)`。
    任何失败返回 `Rejected`（实现上返回 `ErrBadRequest`）且**不改状态、不产生冻结、`Releases` 为空**。
    校验**不得**依赖订单簿状态（例如"预算是否够成交一笔"），否则同一请求的结果会随时序变化。
@@ -486,6 +508,7 @@ docs/superpowers/plans/2026-10-13-matching-engine.md                        # �
 | 账本应用失败 | 致命降级，拒绝后续下单/撤单，重启重放对账 |
 | 幂等键 | 成交：`trade:<TradeID>:base` / `:quote`；由确定性成交序号派生 |
 | 离簿必释放冻结残额（子项目 3 实现期修复） | 订单全成/撤销/STP 被撤时释放 `reserved` 残额；**必须在扣减之后**释放（先释放会下溢）。买入 `ceil` 冻结与 `floor` 扣减之差是全成买单的取整残额，不释放即**永久冻结**；守护不变量是「冻结全账」恒等式，而非"在簿订单"检查 |
+| 金额溢出一律拒绝/报错（子项目 3 加固） | 内核金额运算一律走显式溢出检查：`notionalChecked` 用 `MulOverflow`/`AddOverflow` 返回 `ErrAmountTooLarge`；导出的 `Notional`/`NotionalCeil` 保持原签名与 `price==0` panic，改为在 `notionalChecked` 之上实现并在溢出时 panic（纵深防御，引擎路径不可达）；`consumeReserve` 用 `SubOverflow`，下溢即 panic。`validate` 以 `Market.MaxQty`（缺省 `2^128`）拒绝 `Qty` 过大。冻结额由唯一的 `reserveFor` 推导，保证校验与扣减一致；wrap 会使"冻结覆盖每一笔成交"失效，故不可接受 |
 | 市价买预算不足（子项目 3） | 不拒绝；零成交、残部撤销、释放全部 `MaxNotional`。校验不得依赖订单簿状态 |
 | 不变量 4 措辞（子项目 3 修正） | 在簿挂单为 `0 ≤ Filled < Qty`（`Filled == 0` 合法），原 `0 < Filled` 不成立 |
 | 本轮未做（显式延后） | 订单 TTL/退出即自动撤单、手续费、订单簿快照、HTTP/WS、链上批量结算 |

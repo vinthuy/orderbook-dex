@@ -15,6 +15,10 @@ var (
 	ErrBadRequest    = errors.New("matching: invalid order")
 	ErrOrderNotFound = errors.New("matching: order not found")
 	ErrNotOwner      = errors.New("matching: not order owner")
+	// ErrAmountTooLarge reports that a request would overflow the uint256
+	// arithmetic the kernel uses to compute notional amounts, or that its qty
+	// exceeds the market's bound. It is a rejection, never a wrap.
+	ErrAmountTooLarge = errors.New("matching: notional overflows")
 )
 
 // Trade is one fill between a resting maker and an incoming taker.
@@ -101,6 +105,7 @@ func NewEngine(markets []Market) (*Engine, error) {
 		}
 		cp := m
 		cp.MinQty = cloneInt(m.MinQty)
+		cp.MaxQty = cloneInt(m.MaxQty)
 		e.markets = append(e.markets, cp)
 		e.byID[cp.ID] = cp
 		e.books[cp.ID] = newBook(cp)
@@ -116,30 +121,41 @@ func (e *Engine) Markets() []Market {
 	copy(out, e.markets)
 	for i := range out {
 		out[i].MinQty = cloneInt(out[i].MinQty)
+		out[i].MaxQty = cloneInt(out[i].MaxQty)
 	}
 	return out
 }
 
 // RequiredReserve computes the first freeze for req without changing any state:
 // limit buy -> (quote, ceil(Qty*Price)); market buy -> (quote, MaxNotional);
-// any sell -> (base, Qty). It validates the request exactly as Place does.
+// any sell -> (base, Qty). It validates the request exactly as Place does, and
+// it derives the amount with the same checked arithmetic, so the freeze it
+// reports is exactly the freeze Place charges.
 func (e *Engine) RequiredReserve(req PlaceRequest) (ledger.AssetID, *uint256.Int, error) {
 	m, err := e.validate(req)
 	if err != nil {
 		return 0, nil, err
 	}
-	asset, amount := requiredReserve(m, req)
-	return asset, amount, nil
+	return e.reserveFor(m, req)
 }
 
-func requiredReserve(m Market, req PlaceRequest) (ledger.AssetID, *uint256.Int) {
+// reserveFor derives the first freeze for an already-validated request. It is
+// the single source of truth for the reserve: validate, RequiredReserve and
+// Place all call it, so a freeze cannot be validated with one arithmetic and
+// charged with another. A limit buy's notional is computed with checked
+// arithmetic; overflow is ErrAmountTooLarge, never a wrapped reserve.
+func (e *Engine) reserveFor(m Market, req PlaceRequest) (ledger.AssetID, *uint256.Int, error) {
 	if req.Side == SideBuy {
 		if req.Type == TypeMarket {
-			return m.Quote, cloneInt(req.MaxNotional)
+			return m.Quote, cloneInt(req.MaxNotional), nil
 		}
-		return m.Quote, m.NotionalCeil(req.Qty, req.Price)
+		need, err := m.notionalChecked(req.Qty, req.Price, true)
+		if err != nil {
+			return 0, nil, err
+		}
+		return m.Quote, need, nil
 	}
-	return m.Base, cloneInt(req.Qty)
+	return m.Base, cloneInt(req.Qty), nil
 }
 
 // validate returns the market for a legal request, or a sentinel error. It is
@@ -175,12 +191,22 @@ func (e *Engine) validate(req PlaceRequest) (Market, error) {
 	if req.Qty == nil || req.Qty.Sign() == 0 {
 		return Market{}, fmt.Errorf("%w: qty must be > 0", ErrBadRequest)
 	}
+	// Bound Qty so qty*price can never overflow uint256: the freeze derived from
+	// an overflowing notional would not cover the fill.
+	if maxQty := m.maxQty(); req.Qty.Cmp(maxQty) > 0 {
+		return Market{}, fmt.Errorf("%w: qty %s exceeds max %s", ErrAmountTooLarge, req.Qty, maxQty)
+	}
 	if m.MinQty != nil && req.Qty.Cmp(m.MinQty) < 0 {
 		return Market{}, fmt.Errorf("%w: qty %s below min %s", ErrBadRequest, req.Qty, m.MinQty)
 	}
-	if req.Type == TypeLimit && req.Side == SideBuy && req.MaxNotional != nil {
-		need := m.NotionalCeil(req.Qty, req.Price)
-		if req.MaxNotional.Cmp(need) < 0 {
+	if req.Type == TypeLimit && req.Side == SideBuy {
+		// Compute the required reserve with checked arithmetic so an
+		// overflowing notional is a rejection, not a quietly wrapped freeze.
+		need, err := m.notionalChecked(req.Qty, req.Price, true)
+		if err != nil {
+			return Market{}, err
+		}
+		if req.MaxNotional != nil && req.MaxNotional.Cmp(need) < 0 {
 			return Market{}, fmt.Errorf("%w: max notional %s below required %s", ErrBadRequest, req.MaxNotional, need)
 		}
 	}
@@ -192,6 +218,12 @@ func (e *Engine) validate(req PlaceRequest) (Market, error) {
 // returns before any counter or book mutation, with no releases.
 func (e *Engine) Place(req PlaceRequest) (Result, error) {
 	m, err := e.validate(req)
+	if err != nil {
+		return Result{}, err
+	}
+	// Derive the freeze before touching any counter: the amount validated is
+	// exactly the amount charged.
+	_, reserve, err := e.reserveFor(m, req)
 	if err != nil {
 		return Result{}, err
 	}
@@ -215,7 +247,6 @@ func (e *Engine) Place(req PlaceRequest) (Result, error) {
 	if o.Type == TypeMarket {
 		o.TIF = TIFIOC
 	}
-	_, reserve := requiredReserve(m, req)
 	o.reserved = cloneInt(reserve)
 	e.all[o.ID] = o
 
@@ -259,11 +290,14 @@ func (e *Engine) Place(req PlaceRequest) (Result, error) {
 		qty := minUint(o.Remaining(), maker.Remaining())
 		var notional *uint256.Int
 		if o.Type == TypeMarket && o.Side == SideBuy {
-			left := new(uint256.Int).Sub(o.MaxNotional, spent)
+			// qty <= Market.MaxQty (validate bounds it) and price is a uint64,
+			// so this Notional cannot overflow: qty*price < 2^128 * 2^64 == 2^192.
 			notional = m.Notional(qty, price)
+			left := new(uint256.Int).Sub(o.MaxNotional, spent)
 			if notional.Cmp(left) > 0 {
-				// Cap the fill to the remaining budget:
-				// allowed = floor(left * 10^d / price).
+				// The budget binds. Here left < notional+1 <= qty*price/scale + 1,
+				// and qty <= MaxQty, so left*scale <= qty*price + scale is
+				// provably within uint256: the cap cannot wrap.
 				allowed := new(uint256.Int).Mul(left, m.scale())
 				allowed.Div(allowed, uint256.NewInt(uint64(price)))
 				qty = minUint(qty, allowed)
@@ -415,7 +449,10 @@ func levelsOf(s *side, depth int) []LevelView {
 func (e *Engine) NextSeq() Seq { return e.nextSeq + 1 }
 
 // consumeReserve shrinks an order's freeze by the leg it just gave up (quote
-// notional for buys, base qty for sells) and reports it for release.
+// notional for buys, base qty for sells) and reports it for release. It uses
+// checked subtraction: a silent wrap here is exactly what corrupted a reserve
+// and drove holds.Release into underflow, so an underflow panics loudly instead
+// of poisoning the freeze state. It is unreachable after validate bounds Qty.
 func (e *Engine) consumeReserve(m Market, o *Order, qty, notional *uint256.Int, out *[]HoldRelease) {
 	amount := notional
 	if o.Side == SideSell {
@@ -424,7 +461,15 @@ func (e *Engine) consumeReserve(m Market, o *Order, qty, notional *uint256.Int, 
 	if amount == nil || amount.IsZero() {
 		return
 	}
-	o.reserved.Sub(o.reserved, amount)
+	if o.reserved == nil {
+		panic(fmt.Sprintf("matching: consumeReserve: order %d has nil reserve", o.ID))
+	}
+	next, underflow := new(uint256.Int).SubOverflow(o.reserved, amount)
+	if underflow {
+		panic(fmt.Sprintf("matching: consumeReserve underflow: order %d reserved %s < amount %s (internal invariant violation)",
+			o.ID, o.reserved, amount))
+	}
+	o.reserved = next
 	*out = append(*out, HoldRelease{Account: o.Account, Asset: o.holdAsset(m), Amount: cloneInt(amount)})
 }
 

@@ -111,11 +111,27 @@ type Market struct {
 	Base, Quote  ledger.AssetID
 	BaseDecimals uint8        // notional = qty*price / 10^BaseDecimals
 	MinQty       *uint256.Int // optional minimum base quantity
+	// MaxQty bounds the base quantity of any accepted order so qty*price can
+	// never overflow uint256. Nil means defaultMaxQty.
+	MaxQty *uint256.Int
 }
 
 // maxBaseDecimals caps the exponent so 10^decimals stays representable in a
 // uint256 (with headroom for the +10^d-1 term in the ceil formula).
 const maxBaseDecimals = 76
+
+// defaultMaxQty bounds Qty when Market.MaxQty is nil. 2^128 is chosen so that
+// qty*price <= 2^128*(2^64-1) < 2^192, comfortably inside uint256: the
+// multiplication at the heart of Notional can never wrap for an accepted order.
+var defaultMaxQty = new(uint256.Int).Lsh(uint256.NewInt(1), 128)
+
+// maxQty returns the effective base-quantity bound for this market.
+func (m Market) maxQty() *uint256.Int {
+	if m.MaxQty != nil {
+		return m.MaxQty
+	}
+	return defaultMaxQty
+}
 
 // Validate checks the market configuration in isolation. It says nothing about
 // order legality (e.g. Market+GTC is rejected by Place, not here).
@@ -132,6 +148,9 @@ func (m Market) Validate() error {
 	if m.MinQty != nil && m.MinQty.Sign() < 0 {
 		return fmt.Errorf("matching: market %s: negative min qty", m.Symbol)
 	}
+	if m.MaxQty != nil && m.MaxQty.Sign() < 0 {
+		return fmt.Errorf("matching: market %s: negative max qty", m.Symbol)
+	}
 	return nil
 }
 
@@ -143,32 +162,59 @@ func (m Market) scale() *uint256.Int {
 // Notional returns floor(qty*price / 10^BaseDecimals), the quote amount for a
 // trade of qty base units at price. It panics on price == 0: a zero price is
 // not a valid level (limit orders require price > 0 and book levels are always
-// priced), so silently returning 0 would hide a kernel bug.
+// priced), so silently returning 0 would hide a kernel bug. It also panics on
+// uint256 overflow: wrapping would silently produce a smaller (or zero)
+// notional, and a freeze derived from a wrapped notional cannot cover the fill.
 func (m Market) Notional(qty *uint256.Int, p Price) *uint256.Int {
 	if p == 0 {
 		panic("matching: Notional called with zero price")
 	}
-	if qty == nil {
-		return uint256.NewInt(0)
+	v, err := m.notionalChecked(qty, p, false)
+	if err != nil {
+		panic("matching: Notional overflow: " + err.Error())
 	}
-	prod := new(uint256.Int).Mul(qty, uint256.NewInt(uint64(p)))
-	return new(uint256.Int).Div(prod, m.scale())
+	return v
 }
 
 // NotionalCeil returns ceil(qty*price / 10^BaseDecimals), used for buy
 // reservations so the freeze always covers the floor-deducted fills. Like
-// Notional it panics on price == 0.
+// Notional it panics on price == 0 and on uint256 overflow.
 func (m Market) NotionalCeil(qty *uint256.Int, p Price) *uint256.Int {
 	if p == 0 {
 		panic("matching: NotionalCeil called with zero price")
 	}
+	v, err := m.notionalChecked(qty, p, true)
+	if err != nil {
+		panic("matching: NotionalCeil overflow: " + err.Error())
+	}
+	return v
+}
+
+// notionalChecked computes floor(qty*price/10^BaseDecimals), or ceil when ceil
+// is true, reporting uint256 overflow instead of wrapping. p == 0 is an error:
+// callers must reject a zero price rather than derive a freeze from it. The
+// engine always routes through this (via validate/reserveFor), so the panicking
+// wrappers above are unreachable from an accepted request and exist only as
+// defense in depth.
+func (m Market) notionalChecked(qty *uint256.Int, p Price, ceil bool) (*uint256.Int, error) {
+	if p == 0 {
+		return nil, fmt.Errorf("%w: zero price", ErrBadRequest)
+	}
 	if qty == nil {
-		return uint256.NewInt(0)
+		return uint256.NewInt(0), nil
+	}
+	prod, overflow := new(uint256.Int).MulOverflow(qty, uint256.NewInt(uint64(p)))
+	if overflow {
+		return nil, ErrAmountTooLarge
 	}
 	s := m.scale()
-	prod := new(uint256.Int).Mul(qty, uint256.NewInt(uint64(p)))
-	prod.Add(prod, new(uint256.Int).Sub(s, uint256.NewInt(1)))
-	return new(uint256.Int).Div(prod, s)
+	if ceil {
+		prod, overflow = prod.AddOverflow(prod, new(uint256.Int).Sub(s, uint256.NewInt(1)))
+		if overflow {
+			return nil, ErrAmountTooLarge
+		}
+	}
+	return new(uint256.Int).Div(prod, s), nil
 }
 
 // pow10 returns 10^n. It is only ever called with n <= maxBaseDecimals, and is

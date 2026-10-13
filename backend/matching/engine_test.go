@@ -640,3 +640,206 @@ func TestOrderLookupReturnsCopy(t *testing.T) {
 		t.Fatal("unknown order reported found")
 	}
 }
+
+// --- checked arithmetic: overflow must reject, never wrap ---
+
+// TestOverflowingLimitBuyIsRejected is the reduced repro of the fund-safety
+// bug: with 2 base decimals, Qty=2^193 and Price=2^63 give qty*price == 2^256
+// == 0 (mod 2^256). Unchecked NotionalCeil returns 0, RequiredReserve returns a
+// zero freeze and Place accepts a limit buy that freezes nothing. Checked code
+// must reject with ErrAmountTooLarge and leave every counter and the book alone.
+func TestOverflowingLimitBuyIsRejected(t *testing.T) {
+	raised := testMarket()
+	raised.MaxQty = pow2(200) // keep the qty bound from masking the overflow
+	cases := []struct {
+		name string
+		m    Market
+	}{
+		{"default max qty (bound preempts)", testMarket()},
+		{"raised max qty (notional overflow must reject)", raised},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newTestEngine(t, tc.m)
+			req := PlaceRequest{
+				Market: 1, Account: tacct(1), Side: SideBuy, Type: TypeLimit, TIF: TIFGTC,
+				Price: Price(1) << 63,
+				Qty:   pow2(193),
+			}
+
+			if _, _, err := e.RequiredReserve(req); !errors.Is(err, ErrAmountTooLarge) {
+				t.Fatalf("RequiredReserve err = %v, want ErrAmountTooLarge", err)
+			}
+
+			var res Result
+			var err error
+			assertNoPanic(t, "Place overflow", func() { res, err = e.Place(req) })
+			if !errors.Is(err, ErrAmountTooLarge) {
+				t.Fatalf("Place err = %v, want ErrAmountTooLarge", err)
+			}
+			if res.Order != nil || len(res.Trades) != 0 || len(res.Releases) != 0 {
+				t.Fatalf("rejected Place returned a non-empty Result: %+v", res)
+			}
+			if len(e.all) != 0 {
+				t.Fatalf("rejected Place created %d orders", len(e.all))
+			}
+			if e.NextSeq() != 1 {
+				t.Fatalf("NextSeq = %d, want 1 (no seq consumed)", e.NextSeq())
+			}
+			if bids, asks := e.Book(1, 5); len(bids) != 0 || len(asks) != 0 {
+				t.Fatalf("book changed by rejection: bids=%v asks=%v", bids, asks)
+			}
+			if got := e.OpenReserves(); len(got) != 0 {
+				t.Fatalf("OpenReserves = %v, want empty", got)
+			}
+		})
+	}
+}
+
+// TestQtyAboveMaxIsRejected pins the request bound: a qty above Market.MaxQty
+// is a rejection, and one at/below the bound is accepted.
+func TestQtyAboveMaxIsRejected(t *testing.T) {
+	m := testMarket()
+	m.MaxQty = amt(1000)
+	e := newTestEngine(t, m)
+	a := tacct(1)
+
+	above := limitReq(1, a, SideBuy, TIFGTC, 250, 1001)
+	if _, _, err := e.RequiredReserve(above); !errors.Is(err, ErrAmountTooLarge) {
+		t.Fatalf("above-max RequiredReserve err = %v, want ErrAmountTooLarge", err)
+	}
+	if _, err := e.Place(above); !errors.Is(err, ErrAmountTooLarge) {
+		t.Fatalf("above-max Place err = %v, want ErrAmountTooLarge", err)
+	}
+	if len(e.all) != 0 || e.NextSeq() != 1 {
+		t.Fatalf("over-max order mutated state: orders=%d seq=%d", len(e.all), e.NextSeq())
+	}
+
+	atBound := limitReq(1, a, SideBuy, TIFGTC, 250, 1000)
+	if _, err := e.Place(atBound); err != nil {
+		t.Fatalf("at-bound Place err = %v, want success", err)
+	}
+	below := limitReq(1, tacct(2), SideSell, TIFGTC, 250, 999)
+	if _, err := e.Place(below); err != nil {
+		t.Fatalf("below-max Place err = %v, want success", err)
+	}
+	if len(e.all) != 2 {
+		t.Fatalf("orders = %d, want 2", len(e.all))
+	}
+}
+
+// TestMarketBuyCapDoesNotOverflow exercises the market-buy budget cap with a
+// very large MaxNotional. The cap must not wrap: with a non-binding budget the
+// whole qty fills and the unused budget is released; with a binding budget the
+// fill is clamped by floor(left*scale/price).
+func TestMarketBuyCapDoesNotOverflow(t *testing.T) {
+	t.Run("huge budget does not bind", func(t *testing.T) {
+		e := newTestEngine(t, testMarket())
+		a, b := tacct(1), tacct(2)
+		placeOK(t, e, limitReq(1, b, SideSell, TIFGTC, 250, 1000))
+
+		budget := pow2(200)
+		req := PlaceRequest{
+			Market: 1, Account: a, Side: SideBuy, Type: TypeMarket, TIF: TIFIOC,
+			Qty: pow2(128), MaxNotional: budget,
+		}
+		var got Result
+		assertNoPanic(t, "market buy with 2^200 budget", func() { got = placeOK(t, e, req) })
+
+		if len(got.Trades) != 1 {
+			t.Fatalf("trades = %d, want 1", len(got.Trades))
+		}
+		if got.Trades[0].Qty.Uint64() != 1000 || got.Trades[0].Notional.Uint64() != 2500 {
+			t.Fatalf("trade qty=%s notional=%s, want 1000/2500", got.Trades[0].Qty, got.Trades[0].Notional)
+		}
+		// The whole budget is released: the fill's notional funds the transfer
+		// and the remainder is the unused budget. No freeze may be stranded.
+		if s := releaseSum(got.Releases, a, 1); s.Cmp(budget) != 0 {
+			t.Fatalf("released = %s, want the full budget %s", s, budget)
+		}
+		if len(e.OpenReserves()) != 0 {
+			t.Fatalf("OpenReserves = %v, want empty", e.OpenReserves())
+		}
+	})
+
+	t.Run("binding budget clamps without wrapping", func(t *testing.T) {
+		e := newTestEngine(t, testMarket())
+		a, b := tacct(1), tacct(2)
+		// A deep maker at a high price forces the else branch: at full size the
+		// fill's notional (2^128*2^63/100) exceeds the much smaller budget.
+		placeOK(t, e, PlaceRequest{
+			Market: 1, Account: b, Side: SideSell, Type: TypeLimit, TIF: TIFGTC,
+			Price: Price(1) << 63, Qty: pow2(128),
+		})
+
+		budget := pow2(100)
+		req := PlaceRequest{
+			Market: 1, Account: a, Side: SideBuy, Type: TypeMarket, TIF: TIFIOC,
+			Qty: pow2(128), MaxNotional: budget,
+		}
+		var got Result
+		assertNoPanic(t, "market buy with binding budget", func() { got = placeOK(t, e, req) })
+
+		if len(got.Trades) != 1 {
+			t.Fatalf("trades = %d, want 1", len(got.Trades))
+		}
+		// allowed = floor(2^100 * 100 / 2^63).
+		wantQty := new(uint256.Int).Div(new(uint256.Int).Mul(budget, testMarket().scale()), amt(1<<63))
+		if got.Trades[0].Qty.Cmp(wantQty) != 0 {
+			t.Fatalf("trade qty = %s, want %s", got.Trades[0].Qty, wantQty)
+		}
+		if got.Trades[0].Notional.Cmp(budget) > 0 {
+			t.Fatalf("trade notional %s exceeds budget %s", got.Trades[0].Notional, budget)
+		}
+		if s := releaseSum(got.Releases, a, 1); s.Cmp(budget) > 0 {
+			t.Fatalf("released %s exceeds budget %s", s, budget)
+		}
+	})
+}
+
+// TestConsumeReserveUnderflowPanics pins that a reserve can never be subtracted
+// below zero: the silent wrap is exactly what corrupted the reserve and drove
+// holds.Release into underflow, so it must panic instead.
+func TestConsumeReserveUnderflowPanics(t *testing.T) {
+	e := newTestEngine(t, testMarket())
+
+	o := &Order{ID: 1, Side: SideSell, reserved: amt(5)}
+	var rel []HoldRelease
+	assertPanics(t, "consumeReserve underflow", func() {
+		e.consumeReserve(testMarket(), o, amt(10), nil, &rel)
+	})
+	if len(rel) != 0 {
+		t.Fatalf("underflow emitted releases: %v", rel)
+	}
+
+	// A reserve that exactly covers the amount must consume cleanly.
+	exact := &Order{ID: 2, Side: SideSell, reserved: amt(10)}
+	assertNoPanic(t, "consumeReserve exact", func() {
+		e.consumeReserve(testMarket(), exact, amt(10), nil, &rel)
+	})
+	if exact.reserved.Sign() != 0 {
+		t.Fatalf("exact consume left reserved %s, want 0", exact.reserved)
+	}
+}
+
+// The overflow fix must reject overflow, not size: a large but representable
+// buy still has to produce a non-zero freeze. Guards against "fixing" the wrap
+// by rejecting anything with a big magnitude.
+func TestLargeRepresentableBuyReserveIsNonZero(t *testing.T) {
+	e := newTestEngine(t, testMarket())
+	qty := new(uint256.Int).Lsh(uint256.NewInt(1), 100) // 2^100, comfortably under MaxQty
+	asset, amount, err := e.RequiredReserve(PlaceRequest{
+		Market: 1, Account: tacct(1),
+		Side: SideBuy, Type: TypeLimit, TIF: TIFGTC,
+		Price: Price(1 << 40), Qty: qty,
+	})
+	if err != nil {
+		t.Fatalf("RequiredReserve err = %v, want nil", err)
+	}
+	if asset != 1 {
+		t.Fatalf("reserve asset = %d, want 1 (quote)", asset)
+	}
+	if amount.IsZero() {
+		t.Fatal("required reserve is zero for a large legitimate buy")
+	}
+}
