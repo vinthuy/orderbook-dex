@@ -141,6 +141,9 @@ func (m Market) Validate() error {
 	if m.MaxQty != nil && m.MaxQty.Sign() < 0 {
 		return fmt.Errorf("perp: market %s: negative max qty", m.Symbol)
 	}
+	if m.MinQty != nil && m.MaxQty != nil && m.MinQty.Cmp(m.MaxQty) > 0 {
+		return fmt.Errorf("perp: market %s: min qty %s exceeds max qty %s", m.Symbol, m.MinQty, m.MaxQty)
+	}
 	return nil
 }
 

@@ -17,9 +17,14 @@ type Position struct {
 	Account    ledger.AccountID
 	Side       Side
 	Size       *uint256.Int // base quantity, > 0
-	EntryPrice Price        // notional-weighted average entry price
+	EntryPrice Price        // quantity-weighted average entry price
 	Margin     *uint256.Int // total frozen margin (quote)
 	Leverage   uint32       // user-selected leverage (<= market max)
+
+	// qtyPrice is the cumulative Σ(qty·price) over the fills that opened this
+	// position, kept so EntryPrice can be recomputed exactly as
+	// floor(qtyPrice/size) on increases without drifting (spec §4.6.2).
+	qtyPrice *uint256.Int
 }
 
 func (p *Position) clone() *Position {
@@ -29,6 +34,7 @@ func (p *Position) clone() *Position {
 	c := *p
 	c.Size = cloneInt(p.Size)
 	c.Margin = cloneInt(p.Margin)
+	c.qtyPrice = cloneInt(p.qtyPrice)
 	return &c
 }
 

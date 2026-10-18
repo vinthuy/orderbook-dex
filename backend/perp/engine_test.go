@@ -189,6 +189,17 @@ func TestMarketOrderRequiresMaxNotional(t *testing.T) {
 	}
 }
 
+func TestMarketOrderRejectsNonZeroPrice(t *testing.T) {
+	e, _ := NewEngine([]Market{mkMarket()})
+	req := PlaceRequest{Market: 1, Account: acct(1), Side: SideLong, Type: TypeMarket, TIF: TIFIOC, Price: 1, Qty: uint256.NewInt(10), MaxNotional: uint256.NewInt(100), Leverage: 10}
+	if _, err := e.RequiredMargin(req); err == nil {
+		t.Fatal("market order with non-zero Price should be rejected")
+	}
+	if _, err := e.Place(req); err == nil {
+		t.Fatal("Place of market order with non-zero Price should be rejected")
+	}
+}
+
 func TestMarketOrderMarginFromMaxNotional(t *testing.T) {
 	e, _ := NewEngine([]Market{mkMarket()})
 	req := PlaceRequest{Market: 1, Account: acct(1), Side: SideLong, Type: TypeMarket, TIF: TIFIOC, Price: 0, Qty: uint256.NewInt(10), MaxNotional: uint256.NewInt(100), Leverage: 10}

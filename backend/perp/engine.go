@@ -213,7 +213,11 @@ func (e *Engine) validate(req PlaceRequest) (Market, error) {
 		}
 	} else {
 		// Market order: no order price, so margin is derived from MaxNotional,
-		// which is therefore required and must be > 0.
+		// which is therefore required and must be > 0. A non-zero price is
+		// rejected so an attacker cannot depress the derived margin.
+		if req.Price != 0 {
+			return Market{}, fmt.Errorf("%w: market order must have price 0", ErrBadRequest)
+		}
 		if req.MaxNotional == nil || req.MaxNotional.Sign() <= 0 {
 			return Market{}, fmt.Errorf("%w: market order requires MaxNotional > 0", ErrBadRequest)
 		}
@@ -265,9 +269,6 @@ func (e *Engine) Place(req PlaceRequest) (Result, error) {
 		Leverage:    req.Leverage,
 		Filled:      uint256.NewInt(0),
 		Status:      StatusNew,
-	}
-	if o.Type == TypeMarket {
-		o.TIF = TIFIOC
 	}
 	o.reserved = cloneInt(margin)
 	e.all[o.ID] = o
@@ -391,7 +392,7 @@ func (e *Engine) Place(req PlaceRequest) (Result, error) {
 // marginPrice is the price used for position-level margin: the order's own
 // price for limit orders, or the fill price for market orders (whose Price is 0).
 func marginPrice(o *Order, fillPrice Price) Price {
-	if o.Price == 0 {
+	if o.Type == TypeMarket {
 		return fillPrice
 	}
 	return o.Price
@@ -417,7 +418,13 @@ func (e *Engine) applyFill(m Market, o *Order, qty *uint256.Int, fillPrice Price
 		if err != nil {
 			panic("perp: applyFill margin: " + err.Error())
 		}
-		o.reserved, _ = new(uint256.Int).SubOverflow(o.reserved, margin)
+		next, underflow := new(uint256.Int).SubOverflow(o.reserved, margin)
+		if underflow {
+			panic(fmt.Sprintf("perp: applyFill reserve underflow: order %d reserved %s < margin %s", o.ID, o.reserved, margin))
+		}
+		o.reserved = next
+
+		addQtyPrice := new(uint256.Int).Mul(qty, uint256.NewInt(uint64(fillPrice)))
 
 		if pos == nil {
 			byAcct[o.Account] = &Position{
@@ -428,20 +435,16 @@ func (e *Engine) applyFill(m Market, o *Order, qty *uint256.Int, fillPrice Price
 				EntryPrice: fillPrice,
 				Margin:     cloneInt(margin),
 				Leverage:   o.Leverage,
+				qtyPrice:   cloneInt(addQtyPrice),
 			}
 			return
 		}
-		// Increase same side: quantity-weighted average entry price. It is the
-		// exact integer average Σ(qty·price)/Σqty in price units. (The plan's
-		// Σnotional/Σsize is scale times smaller and rounds to zero for small
-		// positions, collapsing EntryPrice and later panicking Notional on a
-		// zero price — see the deviation note.)
-		oldQtyPrice := new(uint256.Int).Mul(pos.Size, uint256.NewInt(uint64(pos.EntryPrice)))
-		addQtyPrice := new(uint256.Int).Mul(qty, uint256.NewInt(uint64(fillPrice)))
-		newSize := new(uint256.Int).Add(pos.Size, qty)
-		newQtyPrice := new(uint256.Int).Add(oldQtyPrice, addQtyPrice)
-		pos.EntryPrice = Price(new(uint256.Int).Div(newQtyPrice, newSize).Uint64())
-		pos.Size = newSize
+		// Increase same side: exact quantity-weighted average entry price
+		// floor(Σ(qty·price)/Σqty), accumulated in pos.qtyPrice so repeated
+		// increases never drift from the integer average (spec §4.6.2).
+		pos.qtyPrice.Add(pos.qtyPrice, addQtyPrice)
+		pos.Size.Add(pos.Size, qty)
+		pos.EntryPrice = Price(new(uint256.Int).Div(pos.qtyPrice, pos.Size).Uint64())
 		pos.Margin.Add(pos.Margin, margin)
 		pos.Leverage = o.Leverage
 		return
@@ -451,6 +454,10 @@ func (e *Engine) applyFill(m Market, o *Order, qty *uint256.Int, fillPrice Price
 	// a close never consumes the order's own opening freeze.
 	prevSize := cloneInt(pos.Size)
 	closed := minUint(pos.Size, qty)
+
+	// Reduce the cumulative qty·price proportionally so EntryPrice stays
+	// consistent (floor(qtyPrice/size) unchanged) on a later increase.
+	pos.qtyPrice.Sub(pos.qtyPrice, new(uint256.Int).Mul(closed, uint256.NewInt(uint64(pos.EntryPrice))))
 
 	// Realize PnL on the closed portion against the entry price.
 	entryNotional := m.Notional(closed, pos.EntryPrice)
@@ -482,7 +489,11 @@ func (e *Engine) applyFill(m Market, o *Order, qty *uint256.Int, fillPrice Price
 		if err != nil {
 			panic("perp: applyFill flip margin: " + err.Error())
 		}
-		o.reserved, _ = new(uint256.Int).SubOverflow(o.reserved, margin)
+		next, underflow := new(uint256.Int).SubOverflow(o.reserved, margin)
+		if underflow {
+			panic(fmt.Sprintf("perp: applyFill flip reserve underflow: order %d reserved %s < margin %s", o.ID, o.reserved, margin))
+		}
+		o.reserved = next
 		byAcct[o.Account] = &Position{
 			Market:     m.ID,
 			Account:    o.Account,
@@ -491,6 +502,7 @@ func (e *Engine) applyFill(m Market, o *Order, qty *uint256.Int, fillPrice Price
 			EntryPrice: fillPrice,
 			Margin:     cloneInt(margin),
 			Leverage:   o.Leverage,
+			qtyPrice:   new(uint256.Int).Mul(remainder, uint256.NewInt(uint64(fillPrice))),
 		}
 	}
 }
