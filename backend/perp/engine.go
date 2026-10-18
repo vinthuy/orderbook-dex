@@ -132,6 +132,33 @@ func (e *Engine) Position(m MarketID, a ledger.AccountID) (*Position, bool) {
 	return p.clone(), true
 }
 
+// OpenMargins returns the margin currently attributed to open positions,
+// aggregated by (account, quote asset). It is the recovery hook the service
+// layer passes to Holds.Reconcile: after replaying the instruction WAL the
+// kernel's final position state is authoritative, so the freeze state is set
+// once from this map rather than replayed incrementally.
+//
+// A position's margin is frozen in its market's quote asset, so two markets
+// that share a quote asset aggregate into one hold bucket per account. Zero
+// margins are skipped so the map stays canonical.
+func (e *Engine) OpenMargins() map[ledger.HoldKey]*uint256.Int {
+	out := make(map[ledger.HoldKey]*uint256.Int)
+	for _, byAcct := range e.positions {
+		for _, pos := range byAcct {
+			if pos.Margin == nil || pos.Margin.IsZero() {
+				continue
+			}
+			key := ledger.HoldKey{Account: pos.Account, Asset: e.byID[pos.Market].Quote}
+			if cur, ok := out[key]; ok {
+				out[key] = new(uint256.Int).Add(cur, pos.Margin)
+				continue
+			}
+			out[key] = cloneInt(pos.Margin)
+		}
+	}
+	return out
+}
+
 // RequiredMargin computes the order-level freeze a request must pre-reserve to
 // open/increase its position, without changing state. It validates exactly as
 // Place does.

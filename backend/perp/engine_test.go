@@ -26,6 +26,58 @@ func shortReq(a ledger.AccountID, price Price, qty uint64, lev uint32) PlaceRequ
 	return PlaceRequest{Market: 1, Account: a, Side: SideShort, Type: TypeLimit, TIF: TIFGTC, Price: price, Qty: uint256.NewInt(qty), Leverage: lev}
 }
 
+func TestOpenMargins(t *testing.T) {
+	// Two markets share quote asset 1, so the same account's margin must
+	// aggregate into one hold bucket; a resting order's reserved margin is not
+	// position margin and must not appear.
+	m1 := mkMarket()
+	m2 := Market{ID: 2, Symbol: "BTC-PERP", Base: 3, Quote: 1, BaseDecimals: 2, MaxLeverage: 10}
+	e, err := NewEngine([]Market{m1, m2})
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
+	place := func(m MarketID, a ledger.AccountID, side Side, price Price, qty uint64) {
+		t.Helper()
+		if _, err := e.Place(PlaceRequest{Market: m, Account: a, Side: side, Type: TypeLimit, TIF: TIFGTC, Price: price, Qty: uint256.NewInt(qty), Leverage: 10}); err != nil {
+			t.Fatalf("place market %d %s: %v", m, side, err)
+		}
+	}
+	// Market 1: account 1 opens short 100 @ 100, account 2 crosses long.
+	place(1, acct(1), SideShort, 100, 100)
+	place(1, acct(2), SideLong, 100, 100)
+	// Market 2: account 1 opens short 100 @ 100, account 3 crosses long.
+	place(2, acct(1), SideShort, 100, 100)
+	place(2, acct(3), SideLong, 100, 100)
+	// Account 4 rests a long bid: it has order-level reserved margin (5) but no
+	// position and therefore no open margin.
+	res, err := e.Place(PlaceRequest{Market: 1, Account: acct(4), Side: SideLong, Type: TypeLimit, TIF: TIFGTC, Price: 90, Qty: uint256.NewInt(50), Leverage: 10})
+	if err != nil {
+		t.Fatalf("resting place: %v", err)
+	}
+	if res.Order == nil || !res.Order.IsOpen() {
+		t.Fatalf("order should rest, got %+v", res.Order)
+	}
+
+	got := e.OpenMargins()
+	want := map[ledger.HoldKey]*uint256.Int{
+		{Account: acct(1), Asset: 1}: uint256.NewInt(20), // 10 + 10 across markets
+		{Account: acct(2), Asset: 1}: uint256.NewInt(10),
+		{Account: acct(3), Asset: 1}: uint256.NewInt(10),
+	}
+	if len(got) != len(want) {
+		t.Fatalf("OpenMargins len = %d, want %d: %+v", len(got), len(want), got)
+	}
+	for key, amount := range want {
+		open, ok := got[key]
+		if !ok {
+			t.Fatalf("OpenMargins missing %v", key)
+		}
+		if open.Cmp(amount) != 0 {
+			t.Fatalf("OpenMargins[%v] = %s, want %s", key, open.Dec(), amount.Dec())
+		}
+	}
+}
+
 func TestRequiredMarginLong(t *testing.T) {
 	e, err := NewEngine([]Market{mkMarket()})
 	if err != nil {
