@@ -140,6 +140,18 @@ func (e *Engine) RequiredMargin(req PlaceRequest) (*uint256.Int, error) {
 	if err != nil {
 		return nil, err
 	}
+	return e.orderMarginCeil(m, req)
+}
+
+// orderMarginCeil derives the order-level freeze. A limit order uses its price;
+// a market order (price 0) uses its MaxNotional cap (spec §4.4).
+func (e *Engine) orderMarginCeil(m Market, req PlaceRequest) (*uint256.Int, error) {
+	if req.Type == TypeMarket {
+		if req.MaxNotional == nil {
+			return nil, fmt.Errorf("%w: market order requires MaxNotional", ErrBadRequest)
+		}
+		return m.marginCeilAmount(req.MaxNotional, req.Leverage)
+	}
 	return m.marginCeil(req.Qty, req.Price, req.Leverage)
 }
 
@@ -161,8 +173,15 @@ func (e *Engine) validate(req PlaceRequest) (Market, error) {
 		if req.Price == 0 {
 			return Market{}, fmt.Errorf("%w: limit order requires price > 0", ErrBadRequest)
 		}
-	} else if req.TIF == TIFGTC {
-		return Market{}, fmt.Errorf("%w: market order cannot be GTC", ErrBadRequest)
+	} else {
+		// Market order: no order price, so margin is derived from MaxNotional,
+		// which is therefore required and must be > 0.
+		if req.MaxNotional == nil || req.MaxNotional.Sign() <= 0 {
+			return Market{}, fmt.Errorf("%w: market order requires MaxNotional > 0", ErrBadRequest)
+		}
+		if req.TIF == TIFGTC {
+			return Market{}, fmt.Errorf("%w: market order cannot be GTC", ErrBadRequest)
+		}
 	}
 	if req.Qty == nil || req.Qty.Sign() == 0 {
 		return Market{}, fmt.Errorf("%w: qty must be > 0", ErrBadRequest)
@@ -187,7 +206,7 @@ func (e *Engine) Place(req PlaceRequest) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	margin, err := m.marginCeil(req.Qty, req.Price, req.Leverage)
+	margin, err := e.orderMarginCeil(m, req)
 	if err != nil {
 		return Result{}, err
 	}
@@ -331,12 +350,22 @@ func (e *Engine) Place(req PlaceRequest) (Result, error) {
 	return Result{Order: o.clone(), Trades: trades, Releases: releases, PnL: pnl}, nil
 }
 
+// marginPrice is the price used for position-level margin: the order's own
+// price for limit orders, or the fill price for market orders (whose Price is 0).
+func marginPrice(o *Order, fillPrice Price) Price {
+	if o.Price == 0 {
+		return fillPrice
+	}
+	return o.Price
+}
+
 // applyFill updates one account's position for a fill of qty base units at
 // fillPrice, in the direction of the given order o (Long = buying base, Short =
 // selling base). It transfers the opening leg's floor margin from the order's
 // reserved freeze into the position, realizes PnL on the closing leg, and
-// releases margin on closes. The order price and leverage (o.Price/o.Leverage)
-// drive margin, per spec §4.4; the fill price drives PnL and the entry price.
+// releases margin on closes. The order's leverage and its margin price
+// (o.Price for limit orders, the fill price for market orders) drive margin,
+// per spec §4.4; the fill price drives PnL and the entry price.
 func (e *Engine) applyFill(m Market, o *Order, qty *uint256.Int, fillPrice Price, tradeID TradeID, releases *[]MarginRelease, pnl *[]PnLSettlement) {
 	byAcct := e.positions[m.ID]
 	pos := byAcct[o.Account]
@@ -346,7 +375,7 @@ func (e *Engine) applyFill(m Market, o *Order, qty *uint256.Int, fillPrice Price
 		// freeze to the position. SubOverflow must never fire because floor is
 		// subadditive and the reserved amount was ceil(whole order) — but panic
 		// loudly rather than silently wrap if it ever does.
-		margin, err := m.marginFloor(qty, o.Price, o.Leverage)
+		margin, err := m.marginFloor(qty, marginPrice(o, fillPrice), o.Leverage)
 		if err != nil {
 			panic("perp: applyFill margin: " + err.Error())
 		}
@@ -411,7 +440,7 @@ func (e *Engine) applyFill(m Market, o *Order, qty *uint256.Int, fillPrice Price
 	// position, transferring floor margin from the order's reserved freeze.
 	remainder := new(uint256.Int).Sub(qty, closed)
 	if remainder.Sign() > 0 {
-		margin, err := m.marginFloor(remainder, o.Price, o.Leverage)
+		margin, err := m.marginFloor(remainder, marginPrice(o, fillPrice), o.Leverage)
 		if err != nil {
 			panic("perp: applyFill flip margin: " + err.Error())
 		}

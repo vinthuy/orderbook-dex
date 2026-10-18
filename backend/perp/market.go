@@ -220,6 +220,22 @@ func (m Market) marginFloor(qty *uint256.Int, price Price, leverage uint32) (*ui
 	return new(uint256.Int).Div(notional, uint256.NewInt(uint64(leverage))), nil
 }
 
+// marginCeilAmount derives order-level margin from a quote notional cap:
+// ceil(quoteAmount / leverage). Used by market orders, which have no price.
+func (m Market) marginCeilAmount(quoteAmount *uint256.Int, leverage uint32) (*uint256.Int, error) {
+	if leverage < 1 {
+		return nil, fmt.Errorf("%w: leverage must be >= 1", ErrBadRequest)
+	}
+	if quoteAmount == nil {
+		return uint256.NewInt(0), nil
+	}
+	q, overflow := new(uint256.Int).AddOverflow(quoteAmount, uint256.NewInt(uint64(leverage-1)))
+	if overflow {
+		return nil, ErrAmountTooLarge
+	}
+	return new(uint256.Int).Div(q, uint256.NewInt(uint64(leverage))), nil
+}
+
 func pow10(n uint8) *uint256.Int {
 	out := uint256.NewInt(1)
 	ten := uint256.NewInt(10)

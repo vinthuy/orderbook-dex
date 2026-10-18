@@ -127,3 +127,43 @@ func TestCancel(t *testing.T) {
 		t.Fatalf("status = %s, want cancelled", c.Order.Status)
 	}
 }
+
+func TestMarketOrderRequiresMaxNotional(t *testing.T) {
+	e, _ := NewEngine([]Market{mkMarket()})
+	req := PlaceRequest{Market: 1, Account: acct(1), Side: SideLong, Type: TypeMarket, TIF: TIFIOC, Price: 0, Qty: uint256.NewInt(10), Leverage: 10}
+	if _, err := e.RequiredMargin(req); err == nil {
+		t.Fatal("market order without MaxNotional should be rejected")
+	}
+}
+
+func TestMarketOrderMarginFromMaxNotional(t *testing.T) {
+	e, _ := NewEngine([]Market{mkMarket()})
+	req := PlaceRequest{Market: 1, Account: acct(1), Side: SideLong, Type: TypeMarket, TIF: TIFIOC, Price: 0, Qty: uint256.NewInt(10), MaxNotional: uint256.NewInt(100), Leverage: 10}
+	got, err := e.RequiredMargin(req)
+	if err != nil {
+		t.Fatalf("RequiredMargin: %v", err)
+	}
+	if got.Uint64() != 10 { // ceil(100/10)
+		t.Fatalf("margin = %s, want 10", got.Dec())
+	}
+}
+
+func TestMarketOrderCrossesAndOpensPosition(t *testing.T) {
+	e, _ := NewEngine([]Market{mkMarket()})
+	// Rest a short 100 @ 100.
+	if _, err := e.Place(shortReq(acct(1), 100, 100, 10)); err != nil {
+		t.Fatalf("rest short: %v", err)
+	}
+	// Market long 100 with cap 10050 (covers 100@100 = 100 notional).
+	res, err := e.Place(PlaceRequest{Market: 1, Account: acct(2), Side: SideLong, Type: TypeMarket, TIF: TIFIOC, Price: 0, Qty: uint256.NewInt(100), MaxNotional: uint256.NewInt(10050), Leverage: 10})
+	if err != nil {
+		t.Fatalf("market long: %v", err)
+	}
+	if len(res.Trades) != 1 {
+		t.Fatalf("trades = %d, want 1", len(res.Trades))
+	}
+	p2, ok := e.Position(1, acct(2))
+	if !ok || p2.Side != SideLong || p2.Size.Uint64() != 100 {
+		t.Fatalf("p2 = %+v, want long 100", p2)
+	}
+}
