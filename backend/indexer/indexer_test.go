@@ -124,3 +124,40 @@ func TestIndexerPollRespectsConfirmations(t *testing.T) {
 		t.Fatalf("events = %d, want 0 (unconfirmed)", len(events))
 	}
 }
+
+func TestDecodeEventStateRootCommitted(t *testing.T) {
+	// topics[0]=sig, topics[1]=rootIndex; data[0:32]=root, data[56:64]=timestamp
+	topic0 := crypto.Keccak256Hash([]byte("StateRootCommitted(uint256,bytes32,uint64)")).Hex()
+	rootIdx := common.BigToHash(new(big.Int).SetUint64(7)).Hex()
+	data := make([]byte, 64)
+	data[0] = 0xAB // part of root bytes32
+	data[63] = 42   // timestamp
+	l := services.Log{Topics: []string{topic0, rootIdx}, Data: data}
+	ev, err := decodeEvent(l)
+	if err != nil {
+		t.Fatalf("decodeEvent: %v", err)
+	}
+	if ev == nil || ev.Kind != "root" || ev.RootIndex != 7 || ev.Timestamp != 42 {
+		t.Fatalf("ev = %+v, want root/7/42", ev)
+	}
+}
+
+func TestDecodeEventExitFinalized(t *testing.T) {
+	topic0 := crypto.Keccak256Hash([]byte("ExitFinalized(address,uint32,uint256,uint256)")).Hex()
+	account := common.HexToAddress("0x3333333333333333333333333333333333333333")
+	topic1 := common.BytesToHash(account.Bytes()).Hex()
+	topic2 := common.BigToHash(new(big.Int).SetUint64(1)).Hex()
+	data := make([]byte, 64)
+	amt := new(big.Int).SetUint64(55).Bytes()
+	copy(data[32-len(amt):32], amt)
+	rootIdx := common.BigToHash(new(big.Int).SetUint64(3))
+	copy(data[32:64], rootIdx.Bytes())
+	l := services.Log{Topics: []string{topic0, topic1, topic2}, Data: data, TxHash: "0xtx", LogIndex: 0, BlockNumber: 8}
+	ev, err := decodeEvent(l)
+	if err != nil {
+		t.Fatalf("decodeEvent: %v", err)
+	}
+	if ev == nil || ev.Kind != "exit" || ev.Asset != 1 || ev.Amount != "55" || ev.RootIndex != 3 {
+		t.Fatalf("ev = %+v, want exit/1/55/3", ev)
+	}
+}

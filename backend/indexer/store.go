@@ -3,6 +3,7 @@ package indexer
 import (
 	"encoding/json"
 	"fmt"
+	"sort"
 
 	bolt "go.etcd.io/bbolt"
 )
@@ -62,10 +63,13 @@ func (s *Store) PutRootEvent(e RootEvent) error {
 func (s *Store) putJSON(bucket, key []byte, v any) error {
 	data, err := json.Marshal(v)
 	if err != nil {
-		return err
+		return fmt.Errorf("indexer: marshal: %w", err)
 	}
 	return s.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket(bucket).Put(key, data)
+		if err := tx.Bucket(bucket).Put(key, data); err != nil {
+			return fmt.Errorf("indexer: put %s: %w", key, err)
+		}
+		return nil
 	})
 }
 
@@ -126,10 +130,10 @@ func (s *Store) QueryFundEvents(account string, asset uint32, limit int) ([]Fund
 	if limit <= 0 {
 		limit = 100
 	}
-	out := []FundEvent{}
+	all := []FundEvent{}
 	err := s.db.View(func(tx *bolt.Tx) error {
 		c := tx.Bucket(bucketFunds).Cursor()
-		for k, v := c.Last(); k != nil; k, v = c.Prev() {
+		for k, v := c.First(); k != nil; k, v = c.Next() {
 			var e FundEvent
 			if err := json.Unmarshal(v, &e); err != nil {
 				return err
@@ -140,14 +144,23 @@ func (s *Store) QueryFundEvents(account string, asset uint32, limit int) ([]Fund
 			if asset != 0 && e.Asset != asset {
 				continue
 			}
-			out = append(out, e)
-			if len(out) >= limit {
-				break
-			}
+			all = append(all, e)
 		}
 		return nil
 	})
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].Block != all[j].Block {
+			return all[i].Block > all[j].Block // newest first
+		}
+		return all[i].LogIndex > all[j].LogIndex
+	})
+	if len(all) > limit {
+		all = all[:limit]
+	}
+	return all, nil
 }
 
 // QueryRoots returns root events in ascending root-index order, up to limit.

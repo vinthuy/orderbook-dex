@@ -70,13 +70,13 @@ func (q *QueryServer) reconcile(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "reconcile requires an adapter"})
 		return
 	}
+	if q.Running == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "reconcile requires the running ledger"})
+		return
+	}
 	rebuilt, err := Rebuild(q.Adapter, q.Chain, 1, q.Confirmations)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-	if q.Running == nil {
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "reconcile requires the running ledger"})
 		return
 	}
 	deltas, err := CompareTotals(rebuilt, q.Running)

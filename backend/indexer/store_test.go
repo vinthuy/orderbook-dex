@@ -2,8 +2,6 @@ package indexer
 
 import (
 	"testing"
-
-	"go.etcd.io/bbolt"
 )
 
 func mustOpenStore(t *testing.T) *Store {
@@ -91,5 +89,39 @@ func TestStorePersistsAcrossReopen(t *testing.T) {
 	}
 }
 
-// Keep bbolt imported for the doc reference even if unused here.
-var _ = bbolt.DefaultOptions
+func TestQueryFundEventsSortedByBlockDesc(t *testing.T) {
+	s := mustOpenStore(t)
+	// Insert in a deliberately non-chronological order.
+	_ = s.PutFundEvent(FundEvent{Kind: "deposit", TxHash: "0xa", LogIndex: 0, Block: 5, Account: "0xaa", Asset: 1, Amount: "1"})
+	_ = s.PutFundEvent(FundEvent{Kind: "deposit", TxHash: "0xb", LogIndex: 0, Block: 9, Account: "0xaa", Asset: 1, Amount: "2"})
+	_ = s.PutFundEvent(FundEvent{Kind: "deposit", TxHash: "0xc", LogIndex: 0, Block: 7, Account: "0xaa", Asset: 1, Amount: "3"})
+
+	got, err := s.QueryFundEvents("", 0, 10)
+	if err != nil {
+		t.Fatalf("QueryFundEvents: %v", err)
+	}
+	if len(got) != 3 || got[0].Block != 9 || got[1].Block != 7 || got[2].Block != 5 {
+		t.Fatalf("events = %v, want blocks [9 7 5] newest first", got)
+	}
+}
+
+func TestStoreTradeKeysSortNumerically(t *testing.T) {
+	s := mustOpenStore(t)
+	for _, id := range []uint64{9, 10, 11, 2} {
+		_ = s.PutTrade(TradeRecord{TradeID: id, Market: 1, Price: 1, Qty: "1", Notional: "1", Maker: "0xaa", Taker: "0xbb", MakerSide: "sell"})
+	}
+	got, err := s.QueryTrades(0, "", 10)
+	if err != nil {
+		t.Fatalf("QueryTrades: %v", err)
+	}
+	// newest first => 11, 10, 9, 2
+	want := []uint64{11, 10, 9, 2}
+	if len(got) != 4 {
+		t.Fatalf("len = %d, want 4", len(got))
+	}
+	for i, w := range want {
+		if got[i].TradeID != w {
+			t.Fatalf("got[%d].TradeID = %d, want %d (order %v)", i, got[i].TradeID, w, got)
+		}
+	}
+}

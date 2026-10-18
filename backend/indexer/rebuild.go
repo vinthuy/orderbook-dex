@@ -3,8 +3,8 @@ package indexer
 import (
 	"errors"
 	"fmt"
+	"math/big"
 	"sort"
-	"strconv"
 
 	"github.com/holiman/uint256"
 
@@ -14,8 +14,10 @@ import (
 
 // Rebuild replays the settlement contract's funding events into a fresh ledger,
 // yielding per-asset total balances. Matching legs are zero-sum and absent from
-// the chain, so only per-asset totals are meaningful (spec §6.1). It is
-// read-only with respect to the running ledger.
+// the chain, so per-account balances are NOT reconstructed — instead each
+// asset's net flow (Σdeposit − Σwithdrawal − Σexit) is accumulated and credited
+// to a single synthetic account, giving the correct per-asset total without the
+// per-account non-negativity constraint that would reject a profitable trader.
 func Rebuild(adapter services.BlockchainAdapter, chain string, fromBlock uint64, confirmations uint64) (*ledger.Ledger, error) {
 	l := ledger.New()
 	if adapter == nil {
@@ -32,21 +34,20 @@ func Rebuild(adapter services.BlockchainAdapter, chain string, fromBlock uint64,
 		return l, nil // not enough confirmed blocks yet
 	}
 	to := latest - confirmations
-	topics := [][]string{{
-		depositTopic.Hex(), withdrawTopic.Hex(), exitTopic.Hex(),
-	}}
+
+	topics := [][]string{{depositTopic.Hex(), withdrawTopic.Hex(), exitTopic.Hex()}}
 	logs, err := adapter.GetLogs(fromBlock, to, chain, topics)
 	if err != nil {
 		return nil, err
 	}
-	// Rebuild in event order (block, then log index) so deposits/withdrawals
-	// apply in the order they occurred.
 	sort.SliceStable(logs, func(i, j int) bool {
 		if logs[i].BlockNumber != logs[j].BlockNumber {
 			return logs[i].BlockNumber < logs[j].BlockNumber
 		}
 		return logs[i].LogIndex < logs[j].LogIndex
 	})
+
+	net := make(map[ledger.AssetID]*big.Int)
 	for _, lg := range logs {
 		ev, err := decodeEvent(lg)
 		if err != nil {
@@ -55,24 +56,38 @@ func Rebuild(adapter services.BlockchainAdapter, chain string, fromBlock uint64,
 		if ev == nil || ev.Kind == "root" {
 			continue
 		}
-		account, err := ledger.AccountFromHex(ev.Account)
-		if err != nil {
-			return nil, err
+		amount, ok := new(big.Int).SetString(ev.Amount, 10)
+		if !ok {
+			return nil, fmt.Errorf("indexer: rebuild: bad amount %q", ev.Amount)
 		}
-		amount, err := uint256.FromDecimal(ev.Amount)
-		if err != nil {
-			return nil, fmt.Errorf("indexer: rebuild: bad amount %q: %w", ev.Amount, err)
+		asset := ledger.AssetID(ev.Asset)
+		cur := net[asset]
+		if cur == nil {
+			cur = new(big.Int)
+			net[asset] = cur
 		}
-		ref := lg.TxHash + ":" + strconv.Itoa(int(lg.LogIndex))
 		switch ev.Kind {
 		case "deposit":
-			if err := l.Apply(ledger.DepositOp{Account: account, Asset: ledger.AssetID(ev.Asset), Amount: amount, Ref: ref}); err != nil {
-				return nil, err
-			}
+			cur.Add(cur, amount)
 		case "withdrawal", "exit":
-			if err := l.Apply(ledger.WithdrawOp{Account: account, Asset: ledger.AssetID(ev.Asset), Amount: amount, Ref: ref}); err != nil {
-				return nil, err
-			}
+			cur.Sub(cur, amount)
+		}
+	}
+
+	synth := ledger.AccountID{} // zero account: a synthetic vault bucket, never a real trader
+	for asset, n := range net {
+		if n.Sign() < 0 {
+			return nil, fmt.Errorf("indexer: rebuild: asset %d has negative net %s", asset, n.String())
+		}
+		if n.Sign() == 0 {
+			continue
+		}
+		amt, overflow := uint256.FromBig(n)
+		if overflow {
+			return nil, fmt.Errorf("indexer: rebuild: asset %d net overflows uint256", asset)
+		}
+		if err := l.Apply(ledger.DepositOp{Account: synth, Asset: asset, Amount: amt, Ref: fmt.Sprintf("rebuild:%d", asset)}); err != nil {
+			return nil, err
 		}
 	}
 	return l, nil

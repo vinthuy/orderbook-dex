@@ -101,7 +101,7 @@ func (s *IndexerService) Start() error {
 					return
 				case <-ticker.C:
 					if err := s.PollOnce(); err != nil {
-						log.Printf("indexer: poll: %v", err)
+						s.setDegraded(err)
 					}
 				}
 			}
@@ -184,7 +184,10 @@ func (s *IndexerService) PollOnce() error {
 	// Seed the cursor from the store on first run so a restart resumes where it
 	// left off rather than re-scanning from genesis.
 	if s.nextBlock == 1 {
-		if h, err := s.store.LastProcessedBlock(); err == nil && h > 0 {
+		h, err := s.store.LastProcessedBlock()
+		if err != nil {
+			log.Printf("indexer: read cursor: %v (rescanning from genesis)", err)
+		} else if h > 0 {
 			s.nextBlock = h + 1
 		}
 	}

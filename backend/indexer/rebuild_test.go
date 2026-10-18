@@ -68,3 +68,44 @@ func TestCompareTotalsDetectsMismatch(t *testing.T) {
 		t.Fatalf("deltas = %v, want exactly one non-matching asset", deltas)
 	}
 }
+
+func TestRebuildNetWinnerDoesNotFail(t *testing.T) {
+	// Trader deposits 100, withdraws 150 (they won 50 in matching). Per-account
+	// rebuild would underflow; per-asset net rebuild must yield 0... wait, net is
+	// 100-150 = -50 for that single account, but another account deposited 50.
+	// Construct two accounts so the asset net stays non-negative but the winner's
+	// own account is net-negative.
+	winner := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	loser := common.HexToAddress("0x2222222222222222222222222222222222222222")
+	adapter := services.NewMockBlockchainAdapter()
+	adapter.BlockNumber = 40
+	adapter.Logs = []services.Log{
+		tradeLog(t, "Deposit(address,uint32,uint256,uint256)", 5, loser, 1, 150, 1),    // loser deposits 150
+		tradeLog(t, "Deposit(address,uint32,uint256,uint256)", 6, winner, 1, 100, 1),   // winner deposits 100
+		tradeLog(t, "Withdrawal(address,uint32,uint256,uint256)", 7, winner, 1, 150, 1), // winner withdraws 150 (net -50)
+	}
+	rebuilt, err := Rebuild(adapter, "0xvault", 1, 1)
+	if err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+	// total = 150 + 100 - 150 = 100
+	if got := rebuilt.TotalBalance(1).Uint64(); got != 100 {
+		t.Fatalf("total = %d, want 100", got)
+	}
+}
+
+func TestRebuildRespectsConfirmations(t *testing.T) {
+	account := common.HexToAddress("0x1111111111111111111111111111111111111111")
+	adapter := services.NewMockBlockchainAdapter()
+	adapter.BlockNumber = 20
+	adapter.Logs = []services.Log{
+		tradeLog(t, "Deposit(address,uint32,uint256,uint256)", 19, account, 1, 100, 1), // unconfirmed with confirmations=5
+	}
+	rebuilt, err := Rebuild(adapter, "0xvault", 1, 5)
+	if err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+	if got := rebuilt.TotalBalance(1).Uint64(); got != 0 {
+		t.Fatalf("total = %d, want 0 (block 19 unconfirmed at confirmations=5)", got)
+	}
+}
