@@ -6,11 +6,13 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"web3-amm-dex-backend/config"
 	"web3-amm-dex-backend/gateway"
 	"web3-amm-dex-backend/handlers"
+	"web3-amm-dex-backend/indexer"
 	"web3-amm-dex-backend/services"
 )
 
@@ -48,6 +50,37 @@ func main() {
 		log.Printf("order book gateway mounted at /v1 and /ws")
 	}
 
+	// Mount the history indexer's read-only query routes and reconcile endpoint.
+	var istore *indexer.Store
+	if settlement != nil {
+		sc := config.LoadSettlementConfig()
+		ic := config.LoadIndexerConfig()
+		istore, err = indexer.OpenStore(ic.DBPath)
+		if err != nil {
+			log.Fatalf("Failed to open indexer store: %v", err)
+		}
+		idxSvc := indexer.New(istore, settlement.Bus, settlement.Adapter, sc.ContractAddress, sc.Confirmations)
+		idxSvc.SetPollInterval(time.Duration(ic.PollInterval) * time.Second)
+		qs := &indexer.QueryServer{
+			Store:   istore,
+			Adapter: settlement.Adapter,
+			Chain:   sc.ContractAddress,
+			Running: settlement.Ledger,
+		}
+		qs.Register(r)
+		settlement.Registry.Register(idxSvc)
+		if err := idxSvc.Initialize(services.Config{
+			SettlementAddress:     sc.ContractAddress,
+			RequiredConfirmations: sc.Confirmations,
+		}); err != nil {
+			log.Fatalf("Failed to initialize indexer: %v", err)
+		}
+		if err := idxSvc.Start(); err != nil {
+			log.Fatalf("Failed to start indexer: %v", err)
+		}
+		log.Printf("indexer mounted at /v1/trades, /v1/fund-events, /v1/roots, /v1/reconcile")
+	}
+
 	r.GET("/health", handlers.HealthCheck)
 	r.GET("/pools", handlers.GetAllPools)
 	r.GET("/pools/:pool", handlers.GetPoolInfo)
@@ -79,6 +112,11 @@ func main() {
 	if gw != nil {
 		if err := gw.Close(); err != nil {
 			log.Printf("gateway shutdown error: %v", err)
+		}
+	}
+	if istore != nil {
+		if err := istore.Close(); err != nil {
+			log.Printf("indexer store shutdown error: %v", err)
 		}
 	}
 	if settlement != nil {

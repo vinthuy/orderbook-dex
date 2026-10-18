@@ -84,6 +84,26 @@ func (c SettlementConfig) AnchorInterval() time.Duration {
     return time.Duration(c.AnchorIntervalSeconds) * time.Second
 }
 
+// IndexerConfig configures the history indexer (subproject 5).
+type IndexerConfig struct {
+    DBPath       string
+    PollInterval int64
+}
+
+// LoadIndexerConfig reads indexer settings from the environment.
+func LoadIndexerConfig() IndexerConfig {
+    cfg := IndexerConfig{PollInterval: 5}
+    if v := os.Getenv("INDEXER_DB_PATH"); v != "" {
+        cfg.DBPath = v
+    }
+    if v := os.Getenv("INDEXER_POLL_INTERVAL"); v != "" {
+        if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+            cfg.PollInterval = n
+        }
+    }
+    return cfg
+}
+
 // GatewayConfig configures the order-book gateway (subproject 4).
 type GatewayConfig struct {
     DomainName    string
