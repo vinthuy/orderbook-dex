@@ -191,15 +191,22 @@ type Trade struct {
 
 ### 4.4 冻结额推导（保证金）
 
-保证金**按订单价**计算并冻结，**成交价不重算保证金**：
+保证金**按订单价**计算并冻结，**成交价不重算保证金**。沿用现货的「整单 ceil 冻结 + 逐笔 floor 扣减」技巧，
+靠 `floor` 的次可加性保证冻结永不被超扣（`Σ floor(逐笔) ≤ floor(整单) ≤ ceil(整单)`）：
 
-- **开仓/加仓做多/做空**：`required = ceil(notional(qty, orderPrice) / leverage)`（quote），做多做空一致，**都冻结 quote**。
-- 减仓/平仓不新增冻结，反而**释放**被减仓部分对应的保证金（按持仓占比 `floor(margin × closed / prevSize)`）。
-- 成交价与订单价的差异导致的杠杆漂移，是 6a 的**已知简化**——真实风控靠 6c 的维持保证金（按标记价）+ 强平兜底，6a 不做。
+- **订单级冻结（下单时）**：`required = ceil(notional(qty, orderPrice) / leverage)`（quote），做多做空一致，都
+  冻结 quote。这是服务层 `holds.Reserve` 的一次性预冻结。
+- **持仓级记账（开仓/加仓成交时）**：`margin = floor(notional(fillQty, orderPrice) / leverage)`，从该订单的
+  冻结残额转入 `Position.Margin`。总冻结量不变（只是从「订单」归因到「持仓」）。
+- **减仓/平仓**：不新增冻结，释放被减仓部分对应的保证金 `floor(pos.Margin × closed / prevSize)`。
+- **离簿/撤销**：释放订单冻结残额（`ceil` 与 `Σ floor` 之差）。
 
-`RequiredMargin(req)` 是纯函数，返回开仓所需冻结的 quote 金额；校验与扣减共用同一 `marginFor` 推导，保证
-一致。金额运算全部走显式溢出检查（`MulOverflow`/`AddOverflow`/`SubOverflow`），溢出即 `ErrAmountTooLarge`
-拒绝，绝不静默取模——这是从现货子项目 3 学到的关键安全属性。
+成交价与订单价的差异导致的杠杆漂移，是 6a 的**已知简化**——真实风控靠 6c 的维持保证金（按标记价）+ 强平
+兜底，6a 不做。
+
+`RequiredMargin(req)` 是纯函数，返回订单级冻结额 `ceil(notional(qty, orderPrice)/leverage)`。金额运算全部走
+显式溢出检查（`MulOverflow`/`AddOverflow`/`SubOverflow`），溢出即 `ErrAmountTooLarge` 拒绝，绝不静默取模——
+这是从现货子项目 3 学到的关键安全属性。
 
 ### 4.5 订单簿与撮合语义
 
@@ -211,10 +218,11 @@ type Trade struct {
 type Result struct {
     Order    *Order
     Trades   []Trade
-    // Releases 是「因成交/撤销而释放的保证金」清单。
+    // Releases 是「因减仓/撤销而释放的保证金」清单（服务层据此 holds.Release）。
+    // 开仓/加仓不产生 Release：保证金从订单冻结残额转入持仓，总冻结量不变。
     Releases []MarginRelease
-    // Opens 是「因开仓/加仓而新增的仓位保证金」清单（服务层据此冻结）。
-    Opens    []MarginOpen
+    // PnL 是「因减仓/平仓而实现」的净盈亏，服务层据此做 DepositOp/WithdrawOp。
+    PnL      []PnLSettlement
 }
 ```
 
@@ -228,8 +236,9 @@ type Result struct {
 
 1. 同一账户在同一市场至多一个仓位（`Size > 0`），且 `Side` 与 `Size` 一致。
 2. 仓位 `EntryPrice` 是 notional 加权均价：`EntryPrice == floor(Σnotional / Σsize)`（按整数重算，防舍入漂移）。
-3. 任意**在簿**挂单的 `reserved` 覆盖其剩余量应冻结的保证金。
-4. 保证金全账恒等式：`Σ(开仓冻结) == Σ(Opens) == Σ(Releases) + Σ(在簿/持仓残额)`（防泄漏，现货教训）。
+3. 任意**在簿**挂单的 `reserved` 覆盖其剩余量应冻结的保证金（`reserved ≥ Σ floor(剩余逐笔)`）。
+4. **保证金全账恒等式（防泄漏，现货教训）**：`Σ(订单级冻结) == Σ(Releases) + Σ(在簿 reserved 残额) + Σ(持仓 Margin)`。
+   任何开仓/减仓/撤销都必须守恒——这是发现「残额未释放」这类泄漏的唯一守护。
 5. 成交在仓位层零和：每笔成交买卖双方 `Size` 增减绝对值相等。
 6. **确定性**：随机指令流下两台同配置引擎产出逐字段相同的 `Trades` 与最终 `Position`。
 
@@ -349,5 +358,6 @@ docs/superpowers/plans/2026-10-18-orderbook-dex-perp.md          # 实施计划
 | 击穿 | 亏损 > 保证金 → 致命降级（6a 已知缺口，交 6c 强平） |
 | 冻结语义 | 多空都冻结 quote 保证金（不复用现货「卖冻结 base」） |
 | 保证金定价 | 按**订单价**冻结，成交价不重算；杠杆漂移是 6a 已知简化，6c 用维持保证金兜底 |
+| 保证金冻结模型 | 订单级 `ceil(notional(qty,orderPrice)/lev)` 预冻结；持仓级 `floor(notional(fillQty,orderPrice)/lev)` 逐笔记账；减仓 `floor(margin×closed/prevSize)` 释放；离簿释放 `ceil-Σfloor` 残额。`floor` 次可加性保证永不被超扣（现货子项目 3 技巧） |
 | 幂等键 | 盈亏结算 `perp:pnl:<tradeID>`；保证金冻结走 Holds.Reconcile |
 | 本轮未做（显式延后） | 标记价/oracle、资金费率（6b）、强平（6c）、全仓保证金、永续网关、手续费、合约改动 |
