@@ -80,6 +80,35 @@ Read endpoints are unauthenticated. nonce is a persistent append log; its
 corruption cannot cause fund loss (the ledger's trade-id idempotency keys
 still prevent double settlement). The sequencer is single-process.
 
+## History Indexer (subproject 5)
+
+The indexer persists trades, on-chain funding events, and state roots to bbolt,
+and can rebuild an independent ledger from chain events to reconcile against the
+running ledger.
+
+### Query API (read-only, unauthenticated)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET    | `/v1/trades?market=&account=&limit=` | Trade history |
+| GET    | `/v1/fund-events?account=&asset=&limit=` | Deposit/withdrawal/exit history |
+| GET    | `/v1/roots?from=&limit=` | State root history |
+| POST   | `/v1/reconcile` | Rebuild from chain and reconcile per-asset totals |
+
+### Configuration
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `INDEXER_DB_PATH` | (required for persistence) | bbolt file path |
+| `INDEXER_POLL_INTERVAL` | 5 | chain-event poll interval (seconds) |
+
+### Residual trust assumptions
+
+Reconciliation compares **per-asset totals** only: matching legs are zero-sum and
+absent from the chain, so per-account balances differ between a rebuilt ledger
+and the running ledger. Per-account reconciliation requires per-trade Merkle
+proofs on-chain (deferred).
+
 ## Quick Start
 
 ### 1. Install dependencies
