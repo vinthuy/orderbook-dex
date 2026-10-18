@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -10,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"web3-amm-dex-backend/config"
+	"web3-amm-dex-backend/gateway"
 	"web3-amm-dex-backend/handlers"
 	"web3-amm-dex-backend/services"
 )
@@ -25,14 +25,28 @@ func main() {
 	go services.ListenEvents()
 
 	// Start the settlement stack alongside the AMM API. When SETTLEMENT_ADDRESS
-	// is unset, startSettlementStack returns a nil closer and settlement stays
+	// is unset, startSettlementStack returns a nil stack and settlement stays
 	// disabled while the AMM API keeps serving as before.
-	settlementCloser, err := startSettlementStack(os.Getenv, nil)
+	settlement, err := startSettlementStack(os.Getenv, nil)
 	if err != nil {
 		log.Fatalf("Failed to start settlement stack: %v", err)
 	}
 
 	r := gin.Default()
+
+	// Mount the order-book gateway when the settlement stack assembled an
+	// order book (ORDERBOOK_MARKETS configured at least one market). It shares
+	// the same gin engine and EventBus as the order book so WS pushes work.
+	var gw *gateway.Gateway
+	if settlement != nil && settlement.OrderBook != nil {
+		g, err := gateway.New(settlement.OrderBook, settlement.Bus, gatewayConfigFromEnv())
+		if err != nil {
+			log.Fatalf("Failed to build gateway: %v", err)
+		}
+		g.Register(r)
+		gw = g
+		log.Printf("order book gateway mounted at /v1 and /ws")
+	}
 
 	r.GET("/health", handlers.HealthCheck)
 	r.GET("/pools", handlers.GetAllPools)
@@ -59,10 +73,16 @@ func main() {
 	<-quit
 	fmt.Println("\nShutting down...")
 
-	// Stop the settlement stack before exiting. A Close error is logged only:
+	// Stop the gateway before the settlement stack so no request races a closed
+	// nonce store; then stop the settlement stack. A Close error is logged only:
 	// the process is already shutting down and must not log.Fatal here.
-	if settlementCloser != nil {
-		if err := settlementCloser.Close(); err != nil {
+	if gw != nil {
+		if err := gw.Close(); err != nil {
+			log.Printf("gateway shutdown error: %v", err)
+		}
+	}
+	if settlement != nil {
+		if err := settlement.Close(); err != nil {
 			log.Printf("settlement stack shutdown error: %v", err)
 		}
 	}
@@ -70,7 +90,7 @@ func main() {
 
 // startSettlementStack wires the settlement subsystem into the running process.
 //
-// It returns a nil closer when SETTLEMENT_ADDRESS is unset: settlement is then
+// It returns a nil stack when SETTLEMENT_ADDRESS is unset: settlement is then
 // disabled (not an error) and only the AMM API is served. getenv is the
 // environment-lookup injection point so tests can drive the orchestration
 // without mutating the real environment; adapter injects a blockchain adapter
@@ -79,7 +99,7 @@ func main() {
 // Order matters: build -> InitializeAll -> StartAll, and every step releases
 // the already-open resources when it fails so a rejected start cannot leak the
 // ledger's WAL handle.
-func startSettlementStack(getenv func(string) string, adapter services.BlockchainAdapter) (io.Closer, error) {
+func startSettlementStack(getenv func(string) string, adapter services.BlockchainAdapter) (*services.SettlementStack, error) {
 	sc := config.LoadSettlementConfig()
 	if sc.ContractAddress == "" {
 		log.Println("settlement stack disabled: SETTLEMENT_ADDRESS is not set; serving AMM API only")
@@ -122,4 +142,17 @@ func getEnv(key, defaultVal string) string {
 		return val
 	}
 	return defaultVal
+}
+
+// gatewayConfigFromEnv bridges config.GatewayConfig into gateway.Config.
+func gatewayConfigFromEnv() gateway.Config {
+	gc := config.LoadGatewayConfig()
+	return gateway.Config{
+		ChainID:       gc.ChainID,
+		DomainName:    gc.DomainName,
+		DomainVersion: gc.DomainVersion,
+		Rate:          gc.Rate,
+		Burst:         gc.Burst,
+		NonceDir:      gc.NonceDir,
+	}
 }
