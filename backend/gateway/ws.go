@@ -32,9 +32,20 @@ func (s subscription) matches(m *matching.MarketID, a *ledger.AccountID) bool {
 
 // wsClient is one connected peer: its outbound queue and its filters.
 type wsClient struct {
-	conn *websocket.Conn
-	send chan []byte
-	subs []subscription
+	conn   *websocket.Conn
+	send   chan []byte
+	subsMu sync.Mutex
+	subs   []subscription
+	once   sync.Once
+}
+
+// close idempotently closes the send channel and connection, guaranteeing the
+// writer pump exits exactly once.
+func (c *wsClient) close() {
+	c.once.Do(func() {
+		close(c.send)
+		_ = c.conn.Close()
+	})
 }
 
 // wsFrame is the wire envelope for every push: {type, data}.
@@ -152,17 +163,17 @@ func (h *Hub) enqueue(c *wsClient, data []byte) {
 	}
 }
 
+// drop removes a client whose queue is full. The caller holds h.mu.
 func (h *Hub) drop(c *wsClient) {
 	delete(h.clients, c)
-	close(c.send)
-	_ = c.conn.Close()
+	c.close()
 }
 
 // add registers a client; remove deregisters it.
 func (h *Hub) add(c *wsClient) {
 	h.mu.Lock()
+	defer h.mu.Unlock()
 	h.clients[c] = struct{}{}
-	h.mu.Unlock()
 }
 
 func (h *Hub) remove(c *wsClient) {
@@ -171,9 +182,12 @@ func (h *Hub) remove(c *wsClient) {
 		delete(h.clients, c)
 	}
 	h.mu.Unlock()
+	c.close()
 }
 
 func (c *wsClient) subscribed(market *matching.MarketID, account *ledger.AccountID) bool {
+	c.subsMu.Lock()
+	defer c.subsMu.Unlock()
 	for _, s := range c.subs {
 		if s.matches(market, account) {
 			return true
@@ -182,11 +196,12 @@ func (c *wsClient) subscribed(market *matching.MarketID, account *ledger.Account
 	return false
 }
 
-// setSubs replaces the client's subscription filters (guarded by the hub lock
-// via add/remove; the read in subscribed races with this only at unsubscribe,
-// which is acceptable: a torn subscription delivers at most one extra frame).
+// setSubs replaces the client's subscription filters under subsMu so it never
+// races with subscribed.
 func (c *wsClient) setSubs(subs []subscription) {
+	c.subsMu.Lock()
 	c.subs = subs
+	c.subsMu.Unlock()
 }
 
 // upgrader is the websocket upgrader shared by the /ws handler.

@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"errors"
 	"fmt"
 	"math/big"
 
@@ -106,6 +107,10 @@ func NewVerifier(chainID int64, name, version string) *Verifier {
 	}}
 }
 
+// ErrBadAmount is returned when an amount field is not a valid decimal string;
+// the HTTP layer maps it to 400 (bad request) rather than 401 (unauthorized).
+var ErrBadAmount = errors.New("gateway: bad amount")
+
 // parseUint parses a decimal string, treating "" as zero (an absent optional
 // field hashes as 0).
 func parseUint(s string) (*uint256.Int, error) {
@@ -114,7 +119,7 @@ func parseUint(s string) (*uint256.Int, error) {
 	}
 	v, err := uint256.FromDecimal(s)
 	if err != nil {
-		return nil, fmt.Errorf("gateway: bad decimal %q: %w", s, err)
+		return nil, fmt.Errorf("%w: %q", ErrBadAmount, s)
 	}
 	return v, nil
 }

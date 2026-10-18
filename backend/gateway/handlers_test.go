@@ -1,13 +1,19 @@
 package gateway
 
 import (
+	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/holiman/uint256"
+
+	"web3-amm-dex-backend/ledger"
 )
 
 func newTestGateway(t *testing.T) *Gateway {
@@ -74,5 +80,41 @@ func TestPlaceOrderRejectsBadSignature(t *testing.T) {
 	w := doJSON(t, g, http.MethodPost, "/v1/orders", body)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("code = %d, want 401, body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestPlaceOrderSignedLimitBuy(t *testing.T) {
+	ob, l := testOrderBook(t)
+	g, err := New(ob, nil, Config{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = g.Close() })
+
+	v := NewVerifier(13700, "", "")
+	o := SignedOrder{
+		Market: 1, Side: 0, Type: 0, TIF: 0, Price: 1,
+		Qty: "1", MaxNotional: "", Nonce: 1,
+		Expiry: uint64(time.Now().Add(time.Hour).Unix()),
+	}
+	signer, sig := signOrder(t, v, o)
+	account := ledger.AccountID(signer)
+	if err := l.Apply(ledger.DepositOp{Account: account, Asset: 1, Amount: uint256.NewInt(1000), Ref: "dep1"}); err != nil {
+		t.Fatalf("deposit: %v", err)
+	}
+
+	body := fmt.Sprintf(`{"order":{"market":1,"side":0,"type":0,"tif":0,"price":1,"qty":"1","maxNotional":"","nonce":1,"expiry":%d},"signature":"0x%s"}`, o.Expiry, hex.EncodeToString(sig))
+	w := doJSON(t, g, http.MethodPost, "/v1/orders", body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code = %d, want 200, body = %s", w.Code, w.Body.String())
+	}
+}
+
+func TestPlaceOrderMalformedQtyReturns400(t *testing.T) {
+	g := newTestGateway(t)
+	body := `{"order":{"market":1,"side":0,"type":0,"tif":0,"price":1,"qty":"abc","maxNotional":"0","nonce":1,"expiry":9999999999},"signature":"0x00"}`
+	w := doJSON(t, g, http.MethodPost, "/v1/orders", body)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("code = %d, want 400, body = %s", w.Code, w.Body.String())
 	}
 }

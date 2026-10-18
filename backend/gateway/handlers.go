@@ -143,6 +143,10 @@ func (g *Gateway) placeOrder(c *gin.Context) {
 	}
 	signer, err := g.verifier.RecoverOrder(env)
 	if err != nil {
+		if errors.Is(err, ErrBadAmount) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request", "detail": err.Error()})
+			return
+		}
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
 		return
 	}
@@ -318,20 +322,24 @@ func orderToPlaceRequest(account ledger.AccountID, o SignedOrder) (matching.Plac
 	if err != nil {
 		return matching.PlaceRequest{}, err
 	}
-	maxNotional, err := parseUint(o.MaxNotional)
-	if err != nil {
-		return matching.PlaceRequest{}, err
+	req := matching.PlaceRequest{
+		Market:  matching.MarketID(o.Market),
+		Account: account,
+		Side:    matching.Side(o.Side),
+		Type:    matching.Type(o.Type),
+		TIF:     matching.TIF(o.TIF),
+		Price:   matching.Price(o.Price),
+		Qty:     qty,
 	}
-	return matching.PlaceRequest{
-		Market:      matching.MarketID(o.Market),
-		Account:     account,
-		Side:        matching.Side(o.Side),
-		Type:        matching.Type(o.Type),
-		TIF:         matching.TIF(o.TIF),
-		Price:       matching.Price(o.Price),
-		Qty:         qty,
-		MaxNotional: maxNotional,
-	}, nil
+	// MaxNotional is only meaningful for market buys: an empty/"0" value must
+	// map to nil, otherwise the kernel treats a non-nil 0 as a cap and rejects
+	// limit buys (nil == no cap).
+	if v, err := parseUint(o.MaxNotional); err != nil {
+		return matching.PlaceRequest{}, err
+	} else if !v.IsZero() {
+		req.MaxNotional = v
+	}
+	return req, nil
 }
 
 func tradesToViews(ts []matching.Trade) []tradeView {
@@ -352,7 +360,7 @@ func mapOrderBookError(err error) (int, string) {
 	case errors.Is(err, matching.ErrBadRequest),
 		errors.Is(err, matching.ErrUnknownMarket),
 		errors.Is(err, matching.ErrAmountTooLarge):
-		return http.StatusBadRequest, "order_rejected"
+		return http.StatusUnprocessableEntity, "order_rejected"
 	case errors.Is(err, matching.ErrNotOwner):
 		return http.StatusForbidden, "not_owner"
 	case errors.Is(err, matching.ErrOrderNotFound):
@@ -372,7 +380,7 @@ func (g *Gateway) serveWS(c *gin.Context) {
 	}
 	client := &wsClient{conn: conn, send: make(chan []byte, wsSendBuffer)}
 	g.hub.add(client)
-	defer func() { g.hub.remove(client); _ = conn.Close() }()
+	defer g.hub.remove(client)
 
 	// writer pump
 	go func() {
