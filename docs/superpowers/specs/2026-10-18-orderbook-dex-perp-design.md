@@ -191,9 +191,11 @@ type Trade struct {
 
 ### 4.4 冻结额推导（保证金）
 
-- **开仓/加仓做多**：`required = ceil(notional(qty, price) / leverage)`（quote）
-- **开仓/加仓做空**：`required = ceil(notional(qty, price) / leverage)`（quote）——与做多一致，**都冻结 quote**
-- 减仓/平仓不新增冻结，反而**释放**被减仓部分对应的保证金。
+保证金**按订单价**计算并冻结，**成交价不重算保证金**：
+
+- **开仓/加仓做多/做空**：`required = ceil(notional(qty, orderPrice) / leverage)`（quote），做多做空一致，**都冻结 quote**。
+- 减仓/平仓不新增冻结，反而**释放**被减仓部分对应的保证金（按持仓占比 `floor(margin × closed / prevSize)`）。
+- 成交价与订单价的差异导致的杠杆漂移，是 6a 的**已知简化**——真实风控靠 6c 的维持保证金（按标记价）+ 强平兜底，6a 不做。
 
 `RequiredMargin(req)` 是纯函数，返回开仓所需冻结的 quote 金额；校验与扣减共用同一 `marginFor` 推导，保证
 一致。金额运算全部走显式溢出检查（`MulOverflow`/`AddOverflow`/`SubOverflow`），溢出即 `ErrAmountTooLarge`
@@ -346,5 +348,6 @@ docs/superpowers/plans/2026-10-18-orderbook-dex-perp.md          # 实施计划
 | 开仓均价 | notional 加权 `Σnotional/Σsize` |
 | 击穿 | 亏损 > 保证金 → 致命降级（6a 已知缺口，交 6c 强平） |
 | 冻结语义 | 多空都冻结 quote 保证金（不复用现货「卖冻结 base」） |
+| 保证金定价 | 按**订单价**冻结，成交价不重算；杠杆漂移是 6a 已知简化，6c 用维持保证金兜底 |
 | 幂等键 | 盈亏结算 `perp:pnl:<tradeID>`；保证金冻结走 Holds.Reconcile |
 | 本轮未做（显式延后） | 标记价/oracle、资金费率（6b）、强平（6c）、全仓保证金、永续网关、手续费、合约改动 |
