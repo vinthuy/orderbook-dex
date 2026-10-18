@@ -196,9 +196,9 @@ type Trade struct {
 
 - **订单级冻结（下单时）**：`required = ceil(notional(qty, orderPrice) / leverage)`（quote），做多做空一致，都
   冻结 quote。这是服务层 `holds.Reserve` 的一次性预冻结。
-- **市价单（无订单价）**：`orderPrice` 为 0，改用 `MaxNotional` 推导冻结额
-  `required = ceil(MaxNotional / leverage)`（quote）；因此 **`MaxNotional` 对市价单必填**（对限价单只是可选的
-  安全上界）。市价单的持仓级记账同样以 `MaxNotional` 为该订单的「名义额上限」而非逐笔成交价。
+- **市价单（无订单价）**：`orderPrice` **必须为 0**（非 0 即拒绝，防止攻击者用自选价压低保证金）；改用
+  `MaxNotional` 推导冻结额 `required = ceil(MaxNotional / leverage)`（quote）；因此 **`MaxNotional` 对市价单必填**
+  （对限价单只是可选的安全上界，v1 仅对市价单生效）。市价单的持仓级记账同样以成交价 `fillPrice` 为准。
 - **持仓级记账（开仓/加仓成交时）**：`margin = floor(notional(fillQty, orderPrice) / leverage)`，从该订单的
   冻结残额转入 `Position.Margin`。总冻结量不变（只是从「订单」归因到「持仓」）。市价单以成交价 `fillPrice`
   计算 `floor(notional(fillQty, fillPrice)/leverage)`，因成交价必 ≤ `MaxNotional` 对应的均价，`Σfloor ≤ required`。
@@ -239,8 +239,9 @@ type Result struct {
 ### 4.6 内核不变量（必须由测试守护）
 
 1. 同一账户在同一市场至多一个仓位（`Size > 0`），且 `Side` 与 `Size` 一致。
-2. 仓位 `EntryPrice` 是**数量加权**均价：`EntryPrice == floor(Σ(qty·price) / Σqty)`（整数运算，防舍入漂移）。
-   注意：不是 `Σnotional/Σsize`——`notional` 已除过 `10^BaseDecimals`，那样会差一个量纲并在小仓位上塌缩为 0。
+2. 仓位 `EntryPrice` 是**数量加权**均价：`EntryPrice == floor(Σ(qty·price) / Σqty)`，允许 ±1 个 quote 最小单位
+   的增量取整误差（逐笔整数平均会复用已取整的均价）。注意：不是 `Σnotional/Σsize`——`notional` 已除过
+   `10^BaseDecimals`，那样会差一个量纲并在小仓位上塌缩为 0。
 3. 任意**在簿**挂单的 `reserved` 覆盖其剩余量应冻结的保证金（`reserved ≥ Σ floor(剩余逐笔)`）。
 4. **保证金全账恒等式（防泄漏，现货教训）**：`Σ(订单级冻结) == Σ(Releases) + Σ(在簿 reserved 残额) + Σ(持仓 Margin)`。
    任何开仓/减仓/撤销都必须守恒——这是发现「残额未释放」这类泄漏的唯一守护。
@@ -279,13 +280,18 @@ Place(req):
 
 ### 5.3 成交的账本编码
 
-平仓/减仓的净盈亏，按仓位方向与成交价相对 `EntryPrice` 计算，物化为一条 `DepositOp` 或 `WithdrawOp`，
-幂等键 `perp:pnl:<tradeID>`（确定性成交序号派生）。持仓不变（加仓、开仓）不产生盈亏结算，只做保证金冻结。
+平仓/减仓的净盈亏，按仓位方向与成交价相对 `EntryPrice` 计算，物化为一条 `DepositOp` 或 `WithdrawOp`。
+持仓不变（加仓、开仓）不产生盈亏结算，只做保证金冻结。
+
+**幂等键必须含账户**：`perp:pnl:<tradeID>:<account>`。原因：一笔成交可能**双方都在平仓**（maker 与 taker 各
+自减仓），引擎会为同一个 `TradeID` 产出**两条** `PnLSettlement`。若只用 `perp:pnl:<tradeID>`，账本按 `Ref`
+去重会静默丢弃其中一条（资金被销毁或凭空铸造）。加账户后缀使每条结算唯一。
 
 ### 5.4 指令日志与崩溃重放
 
 沿用现货 `Journal`：`orders.wal`，`place`/`cancel` 两类指令；尾损容忍；重启重放重建仓位与冻结额；盈亏结算
-按 `perp:pnl:<tradeID>` 幂等。保证金冻结由 `Holds.Reconcile` 以内核最终状态一次设定。
+按 `perp:pnl:<tradeID>:<account>` 幂等。保证金冻结由 `Holds.Reconcile` 以内核最终状态一次设定（**含在簿挂单的
+`reserved` 残额**，否则重启后可用余额虚高、后续撤单会下溢）。
 
 ### 5.5 致命降级
 
@@ -366,5 +372,5 @@ docs/superpowers/plans/2026-10-18-orderbook-dex-perp.md          # 实施计划
 | 保证金冻结模型 | 订单级 `ceil(notional(qty,orderPrice)/lev)` 预冻结；持仓级 `floor(notional(fillQty,orderPrice)/lev)` 逐笔记账；减仓 `floor(margin×closed/prevSize)` 释放；离簿释放 `ceil-Σfloor` 残额。`floor` 次可加性保证永不被超扣（现货子项目 3 技巧） |
 | 市价单保证金 | 无订单价，改用 `MaxNotional` 推导：`required = ceil(MaxNotional/lev)`；`MaxNotional` 对市价单必填 |
 | 开仓均价 | **数量加权** `floor(Σ(qty·price)/Σqty)`；不是 `Σnotional/Σsize`（差量纲、会塌缩为 0） |
-| 幂等键 | 盈亏结算 `perp:pnl:<tradeID>`；保证金冻结走 Holds.Reconcile |
+| 幂等键 | 盈亏结算 `perp:pnl:<tradeID>:<account>`（**必须含账户**：一笔成交可能双方都平仓，同一 TradeID 产出两条结算，仅用 tradeID 会被账本去重丢一条）；保证金冻结走 Holds.Reconcile（含在簿 reserved） |
 | 本轮未做（显式延后） | 标记价/oracle、资金费率（6b）、强平（6c）、全仓保证金、永续网关、手续费、合约改动 |
