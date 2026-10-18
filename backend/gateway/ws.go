@@ -204,6 +204,14 @@ func (c *wsClient) setSubs(subs []subscription) {
 	c.subsMu.Unlock()
 }
 
+// addSub appends a subscription under subsMu so the caller never reads c.subs
+// outside the lock.
+func (c *wsClient) addSub(sub subscription) {
+	c.subsMu.Lock()
+	c.subs = append(c.subs, sub)
+	c.subsMu.Unlock()
+}
+
 // upgrader is the websocket upgrader shared by the /ws handler.
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,

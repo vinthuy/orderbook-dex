@@ -11,7 +11,7 @@ import (
 	"web3-amm-dex-backend/services"
 )
 
-func testOrderBook(t *testing.T) (*services.OrderBookService, *ledger.Ledger) {
+func testOrderBook(t *testing.T) (*services.OrderBookService, *ledger.Ledger, *services.EventBus) {
 	t.Helper()
 	markets := []matching.Market{
 		{ID: 1, Symbol: "ETH/USDT", Base: 2, Quote: 1, BaseDecimals: 2},
@@ -23,16 +23,17 @@ func testOrderBook(t *testing.T) (*services.OrderBookService, *ledger.Ledger) {
 		t.Fatalf("journal: %v", err)
 	}
 	t.Cleanup(func() { _ = journal.Close() })
-	ob, err := services.NewOrderBookService(markets, l, holds, journal, services.NewEventBus())
+	bus := services.NewEventBus()
+	ob, err := services.NewOrderBookService(markets, l, holds, journal, bus)
 	if err != nil {
 		t.Fatalf("order book: %v", err)
 	}
 	t.Cleanup(func() { _ = ob.Stop() })
-	return ob, l
+	return ob, l, bus
 }
 
 func TestSequencerAssignsStrictlyIncreasingIDs(t *testing.T) {
-	ob, l := testOrderBook(t)
+	ob, l, _ := testOrderBook(t)
 	// Fund quote (asset 1) so the buy can freeze it.
 	if err := l.Apply(ledger.DepositOp{Account: acct(1), Asset: 1, Amount: uint256.NewInt(1000), Ref: "dep1"}); err != nil {
 		t.Fatalf("deposit: %v", err)
@@ -57,7 +58,7 @@ func TestSequencerAssignsStrictlyIncreasingIDs(t *testing.T) {
 }
 
 func TestSequencerSerializesConcurrentPlaces(t *testing.T) {
-	ob, l := testOrderBook(t)
+	ob, l, _ := testOrderBook(t)
 	if err := l.Apply(ledger.DepositOp{Account: acct(2), Asset: 1, Amount: uint256.NewInt(1000), Ref: "dep2"}); err != nil {
 		t.Fatalf("deposit: %v", err)
 	}

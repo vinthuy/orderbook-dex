@@ -156,7 +156,11 @@ func (g *Gateway) placeOrder(c *gin.Context) {
 		return
 	}
 	if err := g.nonce.CheckAndAdvance(account, env.Order.Nonce); err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "nonce_reused"})
+		if errors.Is(err, ErrNonceReused) {
+			c.JSON(http.StatusConflict, gin.H{"error": "nonce_reused"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal", "detail": err.Error()})
 		return
 	}
 
@@ -216,7 +220,11 @@ func (g *Gateway) cancelOrder(c *gin.Context) {
 		return
 	}
 	if err := g.nonce.CheckAndAdvance(account, env.Cancel.Nonce); err != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "nonce_reused"})
+		if errors.Is(err, ErrNonceReused) {
+			c.JSON(http.StatusConflict, gin.H{"error": "nonce_reused"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal", "detail": err.Error()})
 		return
 	}
 
@@ -414,7 +422,7 @@ func (g *Gateway) serveWS(c *gin.Context) {
 				}
 				sub.account = &a
 			}
-			client.setSubs(append(client.subs, sub))
+			client.addSub(sub)
 		case "unsubscribe":
 			client.setSubs(nil)
 		}

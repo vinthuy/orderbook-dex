@@ -56,7 +56,9 @@ func (sm *StateMachine) Accept(requestID uint64, orderID matching.OrderID) {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	sm.requests[requestID] = RequestRecord{RequestID: requestID, State: StateAccepted, OrderID: orderID}
-	sm.byOrder[orderID] = requestID
+	if orderID != 0 {
+		sm.byOrder[orderID] = requestID
+	}
 }
 
 // Reject marks the request rejected with a reason.

@@ -63,7 +63,7 @@ func New(ob *services.OrderBookService, bus *services.EventBus, cfg Config) (*Ga
 		return nil, ErrOrderBookRequired
 	}
 	if bus == nil {
-		bus = services.NewEventBus()
+		return nil, errors.New("gateway: EventBus is required (must be the same bus the order book publishes to)")
 	}
 	applyDefaults(&cfg)
 

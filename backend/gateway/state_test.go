@@ -40,6 +40,15 @@ func TestStateMachineRequestForOrder(t *testing.T) {
 	}
 }
 
+func TestStateMachineAcceptZeroOrderIDNotIndexed(t *testing.T) {
+	sm := NewStateMachine()
+	sm.Begin(1)
+	sm.Accept(1, 0)
+	if _, ok := sm.RequestForOrder(0); ok {
+		t.Fatal("orderID 0 must not be indexed")
+	}
+}
+
 type errSentinel struct{}
 
 func (errSentinel) Error() string { return "rejected" }

@@ -19,8 +19,8 @@ import (
 func newTestGateway(t *testing.T) *Gateway {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
-	ob, _ := testOrderBook(t)
-	g, err := New(ob, nil, Config{})
+	ob, _, bus := testOrderBook(t)
+	g, err := New(ob, bus, Config{})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -84,8 +84,8 @@ func TestPlaceOrderRejectsBadSignature(t *testing.T) {
 }
 
 func TestPlaceOrderSignedLimitBuy(t *testing.T) {
-	ob, l := testOrderBook(t)
-	g, err := New(ob, nil, Config{})
+	ob, l, bus := testOrderBook(t)
+	g, err := New(ob, bus, Config{})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -116,5 +116,138 @@ func TestPlaceOrderMalformedQtyReturns400(t *testing.T) {
 	w := doJSON(t, g, http.MethodPost, "/v1/orders", body)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("code = %d, want 400, body = %s", w.Code, w.Body.String())
+	}
+}
+
+// signedOrderBody builds the JSON wire body for a signed order.
+func signedOrderBody(o SignedOrder, sig []byte) string {
+	return fmt.Sprintf(`{"order":{"market":%d,"side":%d,"type":%d,"tif":%d,"price":%d,"qty":"%s","maxNotional":"%s","nonce":%d,"expiry":%d},"signature":"0x%s"}`,
+		o.Market, o.Side, o.Type, o.TIF, o.Price, o.Qty, o.MaxNotional, o.Nonce, o.Expiry, hex.EncodeToString(sig))
+}
+
+func TestNewRejectsNilBus(t *testing.T) {
+	ob, _, _ := testOrderBook(t)
+	if _, err := New(ob, nil, Config{}); err == nil {
+		t.Fatal("New with nil bus should error")
+	}
+}
+
+func TestPlaceOrderNonceReusedReturns409(t *testing.T) {
+	ob, l, bus := testOrderBook(t)
+	g, err := New(ob, bus, Config{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = g.Close() })
+
+	v := NewVerifier(13700, "", "")
+	expiry := uint64(time.Now().Add(time.Hour).Unix())
+	o1 := SignedOrder{Market: 1, Side: 0, Type: 0, TIF: 0, Price: 1, Qty: "1", MaxNotional: "", Nonce: 1, Expiry: expiry}
+	o2 := SignedOrder{Market: 1, Side: 0, Type: 0, TIF: 0, Price: 1, Qty: "2", MaxNotional: "", Nonce: 1, Expiry: expiry}
+	signer, sigs := signOrders(t, v, o1, o2)
+	account := ledger.AccountID(signer)
+	if err := l.Apply(ledger.DepositOp{Account: account, Asset: 1, Amount: uint256.NewInt(1000), Ref: "dep1"}); err != nil {
+		t.Fatalf("deposit: %v", err)
+	}
+
+	_ = doJSON(t, g, http.MethodPost, "/v1/orders", signedOrderBody(o1, sigs[0]))
+	w2 := doJSON(t, g, http.MethodPost, "/v1/orders", signedOrderBody(o2, sigs[1]))
+	if w2.Code != http.StatusConflict {
+		t.Fatalf("second order code = %d, want 409, body = %s", w2.Code, w2.Body.String())
+	}
+}
+
+func TestPlaceOrderRateLimitedReturns429(t *testing.T) {
+	ob, l, bus := testOrderBook(t)
+	g, err := New(ob, bus, Config{Rate: 0.001, Burst: 1})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = g.Close() })
+
+	v := NewVerifier(13700, "", "")
+	expiry := uint64(time.Now().Add(time.Hour).Unix())
+	o1 := SignedOrder{Market: 1, Side: 0, Type: 0, TIF: 0, Price: 1, Qty: "1", MaxNotional: "", Nonce: 1, Expiry: expiry}
+	o2 := SignedOrder{Market: 1, Side: 0, Type: 0, TIF: 0, Price: 1, Qty: "1", MaxNotional: "", Nonce: 2, Expiry: expiry}
+	signer, sigs := signOrders(t, v, o1, o2)
+	account := ledger.AccountID(signer)
+	if err := l.Apply(ledger.DepositOp{Account: account, Asset: 1, Amount: uint256.NewInt(1000), Ref: "dep1"}); err != nil {
+		t.Fatalf("deposit: %v", err)
+	}
+
+	_ = doJSON(t, g, http.MethodPost, "/v1/orders", signedOrderBody(o1, sigs[0]))
+	w2 := doJSON(t, g, http.MethodPost, "/v1/orders", signedOrderBody(o2, sigs[1]))
+	if w2.Code != http.StatusTooManyRequests {
+		t.Fatalf("second order code = %d, want 429, body = %s", w2.Code, w2.Body.String())
+	}
+}
+
+func TestPlaceOrderInsufficientBalanceReturns422(t *testing.T) {
+	ob, _, bus := testOrderBook(t)
+	g, err := New(ob, bus, Config{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = g.Close() })
+
+	v := NewVerifier(13700, "", "")
+	o := SignedOrder{Market: 1, Side: 0, Type: 0, TIF: 0, Price: 1, Qty: "1", MaxNotional: "", Nonce: 1, Expiry: uint64(time.Now().Add(time.Hour).Unix())}
+	_, sig := signOrder(t, v, o)
+	// No deposit: the buy must fail with insufficient balance.
+
+	w := doJSON(t, g, http.MethodPost, "/v1/orders", signedOrderBody(o, sig))
+	if w.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("code = %d, want 422, body = %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp["error"] != "insufficient_balance" {
+		t.Fatalf("error = %v, want insufficient_balance", resp["error"])
+	}
+}
+
+func TestCancelOrderNotOwnerReturns403(t *testing.T) {
+	ob, l, bus := testOrderBook(t)
+	g, err := New(ob, bus, Config{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() { _ = g.Close() })
+
+	v := NewVerifier(13700, "", "")
+	expiry := uint64(time.Now().Add(time.Hour).Unix())
+
+	// Account A places a resting limit buy.
+	o := SignedOrder{Market: 1, Side: 0, Type: 0, TIF: 0, Price: 1, Qty: "1", MaxNotional: "", Nonce: 1, Expiry: expiry}
+	signerA, sigA := signOrder(t, v, o)
+	accountA := ledger.AccountID(signerA)
+	if err := l.Apply(ledger.DepositOp{Account: accountA, Asset: 1, Amount: uint256.NewInt(1000), Ref: "depA"}); err != nil {
+		t.Fatalf("deposit: %v", err)
+	}
+	w1 := doJSON(t, g, http.MethodPost, "/v1/orders", signedOrderBody(o, sigA))
+	if w1.Code != http.StatusOK {
+		t.Fatalf("place code = %d, body = %s", w1.Code, w1.Body.String())
+	}
+	var placed struct {
+		Order struct {
+			ID uint64 `json:"id"`
+		} `json:"order"`
+	}
+	if err := json.Unmarshal(w1.Body.Bytes(), &placed); err != nil {
+		t.Fatalf("unmarshal place response: %v", err)
+	}
+	if placed.Order.ID == 0 {
+		t.Fatal("placed order id was 0")
+	}
+
+	// Account B (different key) tries to cancel A's order.
+	c := SignedCancel{Market: 1, OrderID: placed.Order.ID, Nonce: 1, Expiry: expiry}
+	_, sigB := signCancel(t, v, c)
+	body := fmt.Sprintf(`{"cancel":{"market":1,"orderId":%d,"nonce":1,"expiry":%d},"signature":"0x%s"}`, placed.Order.ID, expiry, hex.EncodeToString(sigB))
+	w2 := doJSON(t, g, http.MethodDelete, fmt.Sprintf("/v1/orders/%d", placed.Order.ID), body)
+	if w2.Code != http.StatusForbidden {
+		t.Fatalf("cancel code = %d, want 403, body = %s", w2.Code, w2.Body.String())
 	}
 }

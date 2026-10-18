@@ -27,6 +27,48 @@ func signOrder(t *testing.T, v *Verifier, o SignedOrder) (common.Address, []byte
 	return crypto.PubkeyToAddress(key.PublicKey), sig
 }
 
+// signOrders signs each order with one fresh key and returns the signer address
+// and the per-order signatures. It lets a test exercise several requests from
+// the same account (signOrder mints a new key per call).
+func signOrders(t *testing.T, v *Verifier, orders ...SignedOrder) (common.Address, [][]byte) {
+	t.Helper()
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	sigs := make([][]byte, len(orders))
+	for i, o := range orders {
+		h, err := v.hashOrder(o)
+		if err != nil {
+			t.Fatalf("hashOrder: %v", err)
+		}
+		sig, err := crypto.Sign(h, key)
+		if err != nil {
+			t.Fatalf("Sign: %v", err)
+		}
+		sigs[i] = sig
+	}
+	return crypto.PubkeyToAddress(key.PublicKey), sigs
+}
+
+// signCancel hashes and signs a cancel payload, mirroring signOrder.
+func signCancel(t *testing.T, v *Verifier, c SignedCancel) (common.Address, []byte) {
+	t.Helper()
+	h, err := v.hashCancel(c)
+	if err != nil {
+		t.Fatalf("hashCancel: %v", err)
+	}
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	sig, err := crypto.Sign(h, key)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	return crypto.PubkeyToAddress(key.PublicKey), sig
+}
+
 func TestVerifierRecoverOrder(t *testing.T) {
 	v := NewVerifier(13700, "", "")
 	o := SignedOrder{
@@ -67,5 +109,30 @@ func TestVerifierRecoverOrderBadQty(t *testing.T) {
 	o := SignedOrder{Market: 1, Side: 0, Type: 0, TIF: 0, Price: 1, Qty: "not-a-number", Nonce: 1, Expiry: 1}
 	if _, err := v.RecoverOrder(SignedOrderEnvelope{Order: o, Signature: []byte{}}); err == nil {
 		t.Fatal("expected error for a malformed qty")
+	}
+}
+
+func TestVerifierRecoverCancel(t *testing.T) {
+	v := NewVerifier(13700, "", "")
+	c := SignedCancel{Market: 1, OrderID: 42, Nonce: 1, Expiry: uint64(time.Now().Add(time.Hour).Unix())}
+	h, err := v.hashCancel(c)
+	if err != nil {
+		t.Fatalf("hashCancel: %v", err)
+	}
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	sig, err := crypto.Sign(h, key)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	want := crypto.PubkeyToAddress(key.PublicKey)
+	got, err := v.RecoverCancel(SignedCancelEnvelope{Cancel: c, Signature: sig})
+	if err != nil {
+		t.Fatalf("RecoverCancel: %v", err)
+	}
+	if got != want {
+		t.Fatalf("recovered %s, want %s", got.Hex(), want.Hex())
 	}
 }
