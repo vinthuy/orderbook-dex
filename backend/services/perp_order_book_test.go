@@ -1,6 +1,7 @@
 package services
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/holiman/uint256"
@@ -171,5 +172,128 @@ func TestPerpReplayRestoresPositionAndRestingOrderHolds(t *testing.T) {
 	}
 	if held := holds.Held(perpAcct(3), 1); !held.IsZero() {
 		t.Fatalf("account 3 held = %s, want 0 after cancel", held.Dec())
+	}
+}
+
+// TestPerpCloseCloseSettlesBothSides covers a trade where BOTH sides are
+// reducing positions (maker and taker each close). The engine emits two
+// PnLSettlements with the SAME TradeID; the ledger ref must include the account
+// or the second settlement is silently deduplicated, destroying or minting the
+// difference. It also replays the WAL and asserts the per-account refs stay
+// idempotent across restart.
+func TestPerpCloseCloseSettlesBothSides(t *testing.T) {
+	l := ledger.New()
+	holds := ledger.NewHolds(l)
+	bus := NewEventBus()
+
+	fund := func(a ledger.AccountID, ref string) {
+		t.Helper()
+		if err := l.Apply(ledger.DepositOp{Account: a, Asset: 1, Amount: uint256.NewInt(1000), Ref: ref}); err != nil {
+			t.Fatalf("fund %s: %v", ref, err)
+		}
+	}
+	fund(perpAcct(1), "cc1")
+	fund(perpAcct(2), "cc2")
+
+	dir := t.TempDir()
+	j1 := mustPerpJournal(t, dir)
+	svc, err := NewPerpOrderBookService(perpMarkets(), l, holds, j1, bus)
+	if err != nil {
+		t.Fatalf("NewPerpOrderBookService: %v", err)
+	}
+
+	// Build opposite positions at 100: acct2 rests a short, acct1 crosses long.
+	if _, err := svc.Place(perp.PlaceRequest{Market: 1, Account: perpAcct(2), Side: perp.SideShort, Type: perp.TypeLimit, TIF: perp.TIFGTC, Price: 100, Qty: uint256.NewInt(100), Leverage: 10}); err != nil {
+		t.Fatalf("open short: %v", err)
+	}
+	if _, err := svc.Place(perp.PlaceRequest{Market: 1, Account: perpAcct(1), Side: perp.SideLong, Type: perp.TypeLimit, TIF: perp.TIFGTC, Price: 100, Qty: uint256.NewInt(100), Leverage: 10}); err != nil {
+		t.Fatalf("open long: %v", err)
+	}
+
+	// Both close at 110 in one trade. acct1 (long) rests a closing ask, acct2
+	// (short) crosses it with a closing bid, so BOTH fill legs reduce positions.
+	if _, err := svc.Place(perp.PlaceRequest{Market: 1, Account: perpAcct(1), Side: perp.SideShort, Type: perp.TypeLimit, TIF: perp.TIFGTC, Price: 110, Qty: uint256.NewInt(100), Leverage: 10}); err != nil {
+		t.Fatalf("rest close: %v", err)
+	}
+	res, err := svc.Place(perp.PlaceRequest{Market: 1, Account: perpAcct(2), Side: perp.SideLong, Type: perp.TypeLimit, TIF: perp.TIFGTC, Price: 110, Qty: uint256.NewInt(100), Leverage: 10})
+	if err != nil {
+		t.Fatalf("close short: %v", err)
+	}
+
+	// The engine must emit two settlements for one trade, one per side.
+	if len(res.PnL) != 2 {
+		t.Fatalf("PnL settlements = %d, want 2 (taker + maker): %+v", len(res.PnL), res.PnL)
+	}
+	if res.PnL[0].TradeID != res.PnL[1].TradeID {
+		t.Fatalf("settlements have different trade ids: %d vs %d", res.PnL[0].TradeID, res.PnL[1].TradeID)
+	}
+	pnlByAcct := make(map[ledger.AccountID]*uint256.Int, len(res.PnL))
+	for _, p := range res.PnL {
+		pnlByAcct[p.Account] = p.Profit
+	}
+	acct1PnL := pnlByAcct[perpAcct(1)] // long 100 closed at 110: +10
+	acct2PnL := pnlByAcct[perpAcct(2)] // short 100 closed at 110: -10
+	if acct1PnL == nil || acct2PnL == nil {
+		t.Fatalf("missing per-account settlements: %+v", res.PnL)
+	}
+	if acct1PnL.Sign() <= 0 || acct2PnL.Sign() >= 0 {
+		t.Fatalf("unexpected PnL signs: acct1=%s acct2=%s, want +10/-10", acct1PnL.Dec(), acct2PnL.Dec())
+	}
+	if !new(uint256.Int).Add(acct1PnL, acct2PnL).IsZero() {
+		t.Fatalf("PnL not zero-sum: acct1=%s acct2=%s", acct1PnL.Dec(), acct2PnL.Dec())
+	}
+
+	// Both per-account idempotency keys must have been applied to the ledger.
+	tradeID := res.PnL[0].TradeID
+	for _, a := range []ledger.AccountID{perpAcct(1), perpAcct(2)} {
+		ref := fmt.Sprintf("perp:pnl:%d:%s", tradeID, a.Hex())
+		if !l.WasApplied(ref) {
+			t.Fatalf("settlement ref %q was not applied", ref)
+		}
+	}
+
+	// Conservation: 1000 + 1000 in, 1010 + 990 out, total unchanged.
+	assertLedger := func(when string) {
+		t.Helper()
+		if got := l.Balance(perpAcct(1), 1).Uint64(); got != 1010 {
+			t.Fatalf("%s: account 1 balance = %d, want 1010", when, got)
+		}
+		if got := l.Balance(perpAcct(2), 1).Uint64(); got != 990 {
+			t.Fatalf("%s: account 2 balance = %d, want 990", when, got)
+		}
+		if got := l.TotalBalance(1).Uint64(); got != 2000 {
+			t.Fatalf("%s: total balance = %d, want 2000 (funds destroyed or minted)", when, got)
+		}
+	}
+	assertLedger("after close")
+
+	for _, a := range []ledger.AccountID{perpAcct(1), perpAcct(2)} {
+		if held := holds.Held(a, 1); !held.IsZero() {
+			t.Fatalf("account %s held = %s, want 0 after close", a.Hex(), held.Dec())
+		}
+		if _, ok := svc.Engine().Position(1, a); ok {
+			t.Fatalf("account %s still has a position, want closed", a.Hex())
+		}
+	}
+
+	// Restart must replay the same settlements without paying them twice.
+	if err := svc.Close(); err != nil {
+		t.Fatalf("close service: %v", err)
+	}
+	j2 := mustPerpJournal(t, dir)
+	svc2, err := NewPerpOrderBookService(perpMarkets(), l, holds, j2, bus)
+	if err != nil {
+		t.Fatalf("reopen service: %v", err)
+	}
+	defer svc2.Close()
+
+	assertLedger("after replay")
+	for _, a := range []ledger.AccountID{perpAcct(1), perpAcct(2)} {
+		if held := holds.Held(a, 1); !held.IsZero() {
+			t.Fatalf("after replay account %s held = %s, want 0", a.Hex(), held.Dec())
+		}
+		if _, ok := svc2.Engine().Position(1, a); ok {
+			t.Fatalf("after replay account %s still has a position, want closed", a.Hex())
+		}
 	}
 }

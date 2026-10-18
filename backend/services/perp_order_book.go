@@ -168,8 +168,11 @@ func (s *PerpOrderBookService) Cancel(m perp.MarketID, a ledger.AccountID, id pe
 }
 
 // settlePnL realizes each PnL settlement as a DepositOp (profit) or WithdrawOp
-// (loss) in the settlement's market quote asset, keyed by trade id so a replay
-// is idempotent.
+// (loss) in the settlement's market quote asset, keyed by trade id AND account
+// so a replay is idempotent. The account is part of the key because a single
+// trade can settle BOTH sides (maker and taker each reducing a position); a
+// trade-only key would make the ledger silently drop the second settlement,
+// destroying or minting funds.
 func (s *PerpOrderBookService) settlePnL(pnls []perp.PnLSettlement) error {
 	for _, p := range pnls {
 		quote := s.markets[p.Market].Quote
@@ -180,7 +183,7 @@ func (s *PerpOrderBookService) settlePnL(pnls []perp.PnLSettlement) error {
 		if amt.IsZero() {
 			continue
 		}
-		ref := fmt.Sprintf("perp:pnl:%d", p.TradeID)
+		ref := fmt.Sprintf("perp:pnl:%d:%s", p.TradeID, p.Account.Hex())
 		if p.Profit.Sign() >= 0 {
 			if err := s.ledger.Apply(ledger.DepositOp{Account: p.Account, Asset: quote, Amount: amt, Ref: ref}); err != nil {
 				return err
