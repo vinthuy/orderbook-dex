@@ -48,6 +48,38 @@
 | `/liquidity` | DELETE | Remove liquidity |
 | `/events` | GET | Get recent events |
 
+## Order Book Gateway (subproject 4)
+
+The order-book gateway exposes the matching engine over HTTP/WebSocket.
+
+### HTTP API
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST   | `/v1/orders` | signed | Submit an EIP-712 signed order |
+| DELETE | `/v1/orders/:id` | signed | Cancel an order (signed) |
+| GET    | `/v1/orders/:id` | none | Order status |
+| GET    | `/v1/markets` | none | Market list |
+| GET    | `/v1/book/:market?depth=N` | none | Depth snapshot |
+| GET    | `/v1/accounts/:account/balances` | none | Balance / available / held |
+
+### WebSocket
+
+`/ws` — subscribe with `{"op":"subscribe","market":1,"account":"0x..."}`
+(optional filters). Pushes `order`, `trade`, `depth`, and `degraded` frames.
+
+### Signature format
+
+Orders and cancels are EIP-712 typed data over domain
+`Web3 Orderbook DEX` v1. Qty/MaxNotional are decimal strings; replay is
+blocked by a per-account nonce and an expiry timestamp.
+
+### Residual trust assumptions
+
+Read endpoints are unauthenticated. nonce is a persistent append log; its
+corruption cannot cause fund loss (the ledger's trade-id idempotency keys
+still prevent double settlement). The sequencer is single-process.
+
 ## Quick Start
 
 ### 1. Install dependencies
