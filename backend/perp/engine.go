@@ -132,29 +132,40 @@ func (e *Engine) Position(m MarketID, a ledger.AccountID) (*Position, bool) {
 	return p.clone(), true
 }
 
-// OpenMargins returns the margin currently attributed to open positions,
-// aggregated by (account, quote asset). It is the recovery hook the service
-// layer passes to Holds.Reconcile: after replaying the instruction WAL the
-// kernel's final position state is authoritative, so the freeze state is set
-// once from this map rather than replayed incrementally.
+// OpenMargins returns the total frozen margin per (account, quote asset) that
+// the service layer must hold: every position's Margin plus every resting
+// order's reserved remainder. Without the order leg a restart would under-freeze
+// resting orders, overstating available balance and making a later Cancel
+// release more than is held (ErrHoldUnderflow).
 //
-// A position's margin is frozen in its market's quote asset, so two markets
-// that share a quote asset aggregate into one hold bucket per account. Zero
-// margins are skipped so the map stays canonical.
+// Margin is frozen in the market's quote asset, so two markets that share a
+// quote asset aggregate into one hold bucket per account. Zero amounts are
+// skipped so the map stays canonical.
 func (e *Engine) OpenMargins() map[ledger.HoldKey]*uint256.Int {
 	out := make(map[ledger.HoldKey]*uint256.Int)
-	for _, byAcct := range e.positions {
-		for _, pos := range byAcct {
-			if pos.Margin == nil || pos.Margin.IsZero() {
-				continue
-			}
-			key := ledger.HoldKey{Account: pos.Account, Asset: e.byID[pos.Market].Quote}
-			if cur, ok := out[key]; ok {
-				out[key] = new(uint256.Int).Add(cur, pos.Margin)
-				continue
-			}
-			out[key] = cloneInt(pos.Margin)
+	add := func(key ledger.HoldKey, amount *uint256.Int) {
+		if amount == nil || amount.IsZero() {
+			return
 		}
+		cur := out[key]
+		if cur == nil {
+			cur = uint256.NewInt(0)
+			out[key] = cur
+		}
+		cur.Add(cur, amount)
+	}
+	for m, byAcct := range e.positions {
+		mk := e.byID[m]
+		for _, p := range byAcct {
+			add(ledger.HoldKey{Account: p.Account, Asset: mk.Quote}, p.Margin)
+		}
+	}
+	for _, o := range e.all {
+		if !o.IsOpen() {
+			continue
+		}
+		mk := e.byID[o.Market]
+		add(ledger.HoldKey{Account: o.Account, Asset: mk.Quote}, o.reserved)
 	}
 	return out
 }

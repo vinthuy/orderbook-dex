@@ -27,9 +27,9 @@ func shortReq(a ledger.AccountID, price Price, qty uint64, lev uint32) PlaceRequ
 }
 
 func TestOpenMargins(t *testing.T) {
-	// Two markets share quote asset 1, so the same account's margin must
-	// aggregate into one hold bucket; a resting order's reserved margin is not
-	// position margin and must not appear.
+	// Two markets share quote asset 1, so the same account's position margin
+	// must aggregate into one hold bucket; a resting order's reserved margin is
+	// not position margin but is still frozen and must be included.
 	m1 := mkMarket()
 	m2 := Market{ID: 2, Symbol: "BTC-PERP", Base: 3, Quote: 1, BaseDecimals: 2, MaxLeverage: 10}
 	e, err := NewEngine([]Market{m1, m2})
@@ -48,8 +48,8 @@ func TestOpenMargins(t *testing.T) {
 	// Market 2: account 1 opens short 100 @ 100, account 3 crosses long.
 	place(2, acct(1), SideShort, 100, 100)
 	place(2, acct(3), SideLong, 100, 100)
-	// Account 4 rests a long bid: it has order-level reserved margin (5) but no
-	// position and therefore no open margin.
+	// Account 4 rests a long bid: it has no position, but its order-level
+	// reserved margin (notional ceil = 40, / 10 = 4) stays frozen.
 	res, err := e.Place(PlaceRequest{Market: 1, Account: acct(4), Side: SideLong, Type: TypeLimit, TIF: TIFGTC, Price: 90, Qty: uint256.NewInt(50), Leverage: 10})
 	if err != nil {
 		t.Fatalf("resting place: %v", err)
@@ -63,6 +63,7 @@ func TestOpenMargins(t *testing.T) {
 		{Account: acct(1), Asset: 1}: uint256.NewInt(20), // 10 + 10 across markets
 		{Account: acct(2), Asset: 1}: uint256.NewInt(10),
 		{Account: acct(3), Asset: 1}: uint256.NewInt(10),
+		{Account: acct(4), Asset: 1}: uint256.NewInt(4), // resting order reserved
 	}
 	if len(got) != len(want) {
 		t.Fatalf("OpenMargins len = %d, want %d: %+v", len(got), len(want), got)
