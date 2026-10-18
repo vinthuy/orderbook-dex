@@ -151,7 +151,7 @@ type Position struct {
     Account    ledger.AccountID
     Side       Side
     Size       *uint256.Int // base 数量，> 0
-    EntryPrice Price        // notional 加权开仓均价
+    EntryPrice Price        // 数量加权开仓均价
     Margin     *uint256.Int // 已冻结保证金（quote）
     Leverage   uint32       // 用户选定杠杆（≤ 市场上限）
 }
@@ -167,7 +167,7 @@ type Order struct {
     TIF     TIF
     Price   Price       // 限价必填；市价 0
     Qty     *uint256.Int // base 数量（两类订单一致）
-    MaxNotional *uint256.Int // 市价买/市价卖的开仓金额上限（quote），可空
+    MaxNotional *uint256.Int // 市价单必填：开仓名义额上限（quote），用于推导保证金；限价单可选，作安全上界
     Filled  *uint256.Int
     Status  Status
     reserved *uint256.Int // 内部：当前仍冻结的保证金
@@ -196,8 +196,12 @@ type Trade struct {
 
 - **订单级冻结（下单时）**：`required = ceil(notional(qty, orderPrice) / leverage)`（quote），做多做空一致，都
   冻结 quote。这是服务层 `holds.Reserve` 的一次性预冻结。
+- **市价单（无订单价）**：`orderPrice` 为 0，改用 `MaxNotional` 推导冻结额
+  `required = ceil(MaxNotional / leverage)`（quote）；因此 **`MaxNotional` 对市价单必填**（对限价单只是可选的
+  安全上界）。市价单的持仓级记账同样以 `MaxNotional` 为该订单的「名义额上限」而非逐笔成交价。
 - **持仓级记账（开仓/加仓成交时）**：`margin = floor(notional(fillQty, orderPrice) / leverage)`，从该订单的
-  冻结残额转入 `Position.Margin`。总冻结量不变（只是从「订单」归因到「持仓」）。
+  冻结残额转入 `Position.Margin`。总冻结量不变（只是从「订单」归因到「持仓」）。市价单以成交价 `fillPrice`
+  计算 `floor(notional(fillQty, fillPrice)/leverage)`，因成交价必 ≤ `MaxNotional` 对应的均价，`Σfloor ≤ required`。
 - **减仓/平仓**：不新增冻结，释放被减仓部分对应的保证金 `floor(pos.Margin × closed / prevSize)`。
 - **离簿/撤销**：释放订单冻结残额（`ceil` 与 `Σ floor` 之差）。
 
@@ -235,7 +239,8 @@ type Result struct {
 ### 4.6 内核不变量（必须由测试守护）
 
 1. 同一账户在同一市场至多一个仓位（`Size > 0`），且 `Side` 与 `Size` 一致。
-2. 仓位 `EntryPrice` 是 notional 加权均价：`EntryPrice == floor(Σnotional / Σsize)`（按整数重算，防舍入漂移）。
+2. 仓位 `EntryPrice` 是**数量加权**均价：`EntryPrice == floor(Σ(qty·price) / Σqty)`（整数运算，防舍入漂移）。
+   注意：不是 `Σnotional/Σsize`——`notional` 已除过 `10^BaseDecimals`，那样会差一个量纲并在小仓位上塌缩为 0。
 3. 任意**在簿**挂单的 `reserved` 覆盖其剩余量应冻结的保证金（`reserved ≥ Σ floor(剩余逐笔)`）。
 4. **保证金全账恒等式（防泄漏，现货教训）**：`Σ(订单级冻结) == Σ(Releases) + Σ(在簿 reserved 残额) + Σ(持仓 Margin)`。
    任何开仓/减仓/撤销都必须守恒——这是发现「残额未释放」这类泄漏的唯一守护。
@@ -359,5 +364,7 @@ docs/superpowers/plans/2026-10-18-orderbook-dex-perp.md          # 实施计划
 | 冻结语义 | 多空都冻结 quote 保证金（不复用现货「卖冻结 base」） |
 | 保证金定价 | 按**订单价**冻结，成交价不重算；杠杆漂移是 6a 已知简化，6c 用维持保证金兜底 |
 | 保证金冻结模型 | 订单级 `ceil(notional(qty,orderPrice)/lev)` 预冻结；持仓级 `floor(notional(fillQty,orderPrice)/lev)` 逐笔记账；减仓 `floor(margin×closed/prevSize)` 释放；离簿释放 `ceil-Σfloor` 残额。`floor` 次可加性保证永不被超扣（现货子项目 3 技巧） |
+| 市价单保证金 | 无订单价，改用 `MaxNotional` 推导：`required = ceil(MaxNotional/lev)`；`MaxNotional` 对市价单必填 |
+| 开仓均价 | **数量加权** `floor(Σ(qty·price)/Σqty)`；不是 `Σnotional/Σsize`（差量纲、会塌缩为 0） |
 | 幂等键 | 盈亏结算 `perp:pnl:<tradeID>`；保证金冻结走 Holds.Reconcile |
 | 本轮未做（显式延后） | 标记价/oracle、资金费率（6b）、强平（6c）、全仓保证金、永续网关、手续费、合约改动 |
