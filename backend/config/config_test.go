@@ -123,6 +123,24 @@ func TestLoadSettlementConfigOrderBookDefaultsEmpty(t *testing.T) {
     }
 }
 
+func TestLoadPerpConfig(t *testing.T) {
+    t.Setenv("PERP_MARKETS", "")
+    t.Setenv("PERP_DATA_DIR", "")
+    if cfg := LoadPerpConfig(); cfg.Markets != "" || cfg.DataDir != "" {
+        t.Fatalf("perp config should default empty: %+v", cfg)
+    }
+
+    t.Setenv("PERP_MARKETS", "1:ETH-PERP:2:1:18:10:1000000000000000")
+    t.Setenv("PERP_DATA_DIR", "./perp")
+    cfg := LoadPerpConfig()
+    if cfg.Markets != "1:ETH-PERP:2:1:18:10:1000000000000000" {
+        t.Fatalf("Markets = %q, want the raw PERP_MARKETS string", cfg.Markets)
+    }
+    if cfg.DataDir != "./perp" {
+        t.Fatalf("DataDir = %q, want ./perp", cfg.DataDir)
+    }
+}
+
 func TestLoadGatewayConfig(t *testing.T) {
     t.Setenv("EIP712_DOMAIN_NAME", "Test DEX")
     t.Setenv("EIP712_DOMAIN_VERSION", "2")

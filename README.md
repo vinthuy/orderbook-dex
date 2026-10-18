@@ -209,3 +209,41 @@ D:\code\web3\
 3. Explore Ethermint (Cosmos SDK + EVM compatibility)
 4. Build Go backend services interacting with blockchain
 5. Practice full-stack Web3 development
+
+## Perpetual Futures (subproject 6a)
+
+Perpetual markets trade positions (long/short) with isolated margin and
+user-selected leverage. Margin is frozen in the market's quote asset on both
+sides; PnL is realized into the ledger on close.
+
+The kernel lives in its own `backend/perp` package; the spot `matching` package
+is untouched (no file changed, no semantics shared):
+
+```
+backend/perp/
+  market.go            # market definition, leverage bounds, validation
+  order.go             # positions, orders, margin derivation
+  book.go              # price-level + time-priority book
+  engine.go            # matching loop, position updates, cancels, market discretion
+  invariants_test.go   # kernel invariants and deterministic replay
+backend/services/
+  perp_order_book.go   # service wiring, instruction WAL, degrade, PnL settlement
+  perp_journal.go      # perpetual instruction WAL
+backend/config/config.go  # PERP_* configuration
+```
+
+### Known gaps (6a)
+- No mark price or funding rate (6b); PnL uses the trade price.
+- No liquidation engine (6c): a loss exceeding margin causes a fatal degrade
+  rather than forced liquidation.
+
+### Configuration
+| Key | Default | Description |
+|-----|---------|-------------|
+| `PERP_MARKETS` | (empty) | `ID:SYMBOL:BASE:QUOTE:BASE_DECIMALS:MAX_LEVERAGE[:MIN_QTY]`, `;`-separated |
+| `PERP_DATA_DIR` | (empty) | instruction WAL dir (empty = memory-only) |
+
+Example: `PERP_MARKETS=1:ETH-PERP:2:1:18:10:1000000000000000` (market 1, base
+asset 2, quote asset 1, 18 base decimals, 10x max leverage, minimum 0.001 base
+units). A malformed value fails startup instead of silently trading a subset of
+the configured markets.

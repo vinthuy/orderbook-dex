@@ -150,3 +150,21 @@ func LoadGatewayConfig() GatewayConfig {
     }
     return cfg
 }
+
+// PerpConfig configures the perpetual order book (subproject 6a).
+type PerpConfig struct {
+    // Markets is the compact market definition string, parsed by
+    // services.ParsePerpMarkets. Empty disables the perpetual order book.
+    Markets string
+    // DataDir is the perpetual instruction WAL directory. Empty means the
+    // journal is memory-only (no crash recovery).
+    DataDir string
+}
+
+// LoadPerpConfig reads perpetual order book settings from the environment.
+func LoadPerpConfig() PerpConfig {
+    return PerpConfig{
+        Markets: os.Getenv("PERP_MARKETS"),
+        DataDir: os.Getenv("PERP_DATA_DIR"),
+    }
+}
