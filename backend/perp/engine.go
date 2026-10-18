@@ -364,12 +364,16 @@ func (e *Engine) applyFill(m Market, o *Order, qty *uint256.Int, fillPrice Price
 			}
 			return
 		}
-		// Increase same side: notional-weighted average entry price.
-		oldNotional := m.Notional(pos.Size, pos.EntryPrice)
-		addNotional := m.Notional(qty, fillPrice)
+		// Increase same side: quantity-weighted average entry price. It is the
+		// exact integer average Σ(qty·price)/Σqty in price units. (The plan's
+		// Σnotional/Σsize is scale times smaller and rounds to zero for small
+		// positions, collapsing EntryPrice and later panicking Notional on a
+		// zero price — see the deviation note.)
+		oldQtyPrice := new(uint256.Int).Mul(pos.Size, uint256.NewInt(uint64(pos.EntryPrice)))
+		addQtyPrice := new(uint256.Int).Mul(qty, uint256.NewInt(uint64(fillPrice)))
 		newSize := new(uint256.Int).Add(pos.Size, qty)
-		newNotional := new(uint256.Int).Add(oldNotional, addNotional)
-		pos.EntryPrice = Price(new(uint256.Int).Div(newNotional, newSize).Uint64())
+		newQtyPrice := new(uint256.Int).Add(oldQtyPrice, addQtyPrice)
+		pos.EntryPrice = Price(new(uint256.Int).Div(newQtyPrice, newSize).Uint64())
 		pos.Size = newSize
 		pos.Margin.Add(pos.Margin, margin)
 		pos.Leverage = o.Leverage
