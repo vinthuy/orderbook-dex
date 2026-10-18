@@ -16,7 +16,7 @@ import (
 // yielding per-asset total balances. Matching legs are zero-sum and absent from
 // the chain, so only per-asset totals are meaningful (spec §6.1). It is
 // read-only with respect to the running ledger.
-func Rebuild(adapter services.BlockchainAdapter, chain string, fromBlock uint64) (*ledger.Ledger, error) {
+func Rebuild(adapter services.BlockchainAdapter, chain string, fromBlock uint64, confirmations uint64) (*ledger.Ledger, error) {
 	l := ledger.New()
 	if adapter == nil {
 		return nil, errors.New("indexer: rebuild requires an adapter")
@@ -25,10 +25,17 @@ func Rebuild(adapter services.BlockchainAdapter, chain string, fromBlock uint64)
 	if err != nil {
 		return nil, err
 	}
+	if confirmations == 0 {
+		confirmations = 1
+	}
+	if latest < confirmations {
+		return l, nil // not enough confirmed blocks yet
+	}
+	to := latest - confirmations
 	topics := [][]string{{
 		depositTopic.Hex(), withdrawTopic.Hex(), exitTopic.Hex(),
 	}}
-	logs, err := adapter.GetLogs(fromBlock, latest, chain, topics)
+	logs, err := adapter.GetLogs(fromBlock, to, chain, topics)
 	if err != nil {
 		return nil, err
 	}

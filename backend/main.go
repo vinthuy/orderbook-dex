@@ -26,10 +26,36 @@ func main() {
 
 	go services.ListenEvents()
 
+	sc := config.LoadSettlementConfig()
+	ic := config.LoadIndexerConfig()
+
+	// Build the indexer before the settlement stack so its trade handler can be
+	// subscribed to the stack's EventBus BEFORE the order book is constructed:
+	// the order book replays its instruction WAL in its constructor and re-emits
+	// settled trades, which are lost if no subscriber is attached yet.
+	var (
+		istore *indexer.Store
+		idxSvc *indexer.IndexerService
+		err    error
+	)
+	if sc.ContractAddress != "" {
+		istore, err = indexer.OpenStore(ic.DBPath)
+		if err != nil {
+			log.Fatalf("Failed to open indexer store: %v", err)
+		}
+		idxSvc = indexer.New(istore, nil, nil, sc.ContractAddress, sc.Confirmations)
+		idxSvc.SetPollInterval(time.Duration(ic.PollInterval) * time.Second)
+	}
+
+	var onTrade services.EventHandler
+	if idxSvc != nil {
+		onTrade = idxSvc.HandleTrade
+	}
+
 	// Start the settlement stack alongside the AMM API. When SETTLEMENT_ADDRESS
 	// is unset, startSettlementStack returns a nil stack and settlement stays
 	// disabled while the AMM API keeps serving as before.
-	settlement, err := startSettlementStack(os.Getenv, nil)
+	settlement, err := startSettlementStack(os.Getenv, nil, onTrade)
 	if err != nil {
 		log.Fatalf("Failed to start settlement stack: %v", err)
 	}
@@ -51,21 +77,14 @@ func main() {
 	}
 
 	// Mount the history indexer's read-only query routes and reconcile endpoint.
-	var istore *indexer.Store
-	if settlement != nil {
-		sc := config.LoadSettlementConfig()
-		ic := config.LoadIndexerConfig()
-		istore, err = indexer.OpenStore(ic.DBPath)
-		if err != nil {
-			log.Fatalf("Failed to open indexer store: %v", err)
-		}
-		idxSvc := indexer.New(istore, settlement.Bus, settlement.Adapter, sc.ContractAddress, sc.Confirmations)
-		idxSvc.SetPollInterval(time.Duration(ic.PollInterval) * time.Second)
+	if settlement != nil && idxSvc != nil {
+		idxSvc.SetAdapter(settlement.Adapter)
 		qs := &indexer.QueryServer{
-			Store:   istore,
-			Adapter: settlement.Adapter,
-			Chain:   sc.ContractAddress,
-			Running: settlement.Ledger,
+			Store:         istore,
+			Adapter:       settlement.Adapter,
+			Chain:         sc.ContractAddress,
+			Running:       settlement.Ledger,
+			Confirmations: sc.Confirmations,
 		}
 		qs.Register(r)
 		settlement.Registry.Register(idxSvc)
@@ -137,7 +156,7 @@ func main() {
 // Order matters: build -> InitializeAll -> StartAll, and every step releases
 // the already-open resources when it fails so a rejected start cannot leak the
 // ledger's WAL handle.
-func startSettlementStack(getenv func(string) string, adapter services.BlockchainAdapter) (*services.SettlementStack, error) {
+func startSettlementStack(getenv func(string) string, adapter services.BlockchainAdapter, onTrade ...services.EventHandler) (*services.SettlementStack, error) {
 	sc := config.LoadSettlementConfig()
 	if sc.ContractAddress == "" {
 		log.Println("settlement stack disabled: SETTLEMENT_ADDRESS is not set; serving AMM API only")
@@ -155,7 +174,7 @@ func startSettlementStack(getenv func(string) string, adapter services.Blockchai
 	}
 	cfg.RPCURL = rpcURL
 
-	stack, err := services.BuildSettlementStack(cfg, adapter)
+	stack, err := services.BuildSettlementStack(cfg, adapter, onTrade...)
 	if err != nil {
 		return nil, fmt.Errorf("build settlement stack: %w", err)
 	}

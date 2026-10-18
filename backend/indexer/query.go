@@ -13,10 +13,11 @@ import (
 // QueryServer exposes read-only history queries and the reconcile endpoint. It
 // is assembled by main and mounted onto the existing gin engine.
 type QueryServer struct {
-	Store   *Store
-	Adapter services.BlockchainAdapter
-	Chain   string
-	Running *ledger.Ledger // optional: the running ledger to reconcile against
+	Store         *Store
+	Adapter       services.BlockchainAdapter
+	Chain         string
+	Running       *ledger.Ledger // optional: the running ledger to reconcile against
+	Confirmations uint64
 }
 
 // Register mounts the /v1 read routes. Read endpoints are unauthenticated
@@ -69,7 +70,7 @@ func (q *QueryServer) reconcile(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "reconcile requires an adapter"})
 		return
 	}
-	rebuilt, err := Rebuild(q.Adapter, q.Chain, 1)
+	rebuilt, err := Rebuild(q.Adapter, q.Chain, 1, q.Confirmations)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

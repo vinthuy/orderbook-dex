@@ -46,7 +46,7 @@ func (s *Store) Close() error { return s.db.Close() }
 
 // PutTrade upserts a trade record keyed by trade:<id>.
 func (s *Store) PutTrade(t TradeRecord) error {
-	return s.putJSON(bucketTrades, []byte(fmt.Sprintf("trade:%d", t.TradeID)), t)
+	return s.putJSON(bucketTrades, tradeKey(t.TradeID), t)
 }
 
 // PutFundEvent upserts a funding event keyed by txHash:logIndex.
@@ -56,7 +56,7 @@ func (s *Store) PutFundEvent(e FundEvent) error {
 
 // PutRootEvent upserts a root event keyed by root:<index>.
 func (s *Store) PutRootEvent(e RootEvent) error {
-	return s.putJSON(bucketRoots, []byte(fmt.Sprintf("root:%d", e.RootIndex)), e)
+	return s.putJSON(bucketRoots, rootKey(e.RootIndex), e)
 }
 
 func (s *Store) putJSON(bucket, key []byte, v any) error {
@@ -158,7 +158,7 @@ func (s *Store) QueryRoots(from, limit int) ([]RootEvent, error) {
 	out := []RootEvent{}
 	err := s.db.View(func(tx *bolt.Tx) error {
 		c := tx.Bucket(bucketRoots).Cursor()
-		start := []byte(fmt.Sprintf("root:%d", from))
+		start := rootKey(uint64(from))
 		for k, v := c.Seek(start); k != nil; k, v = c.Next() {
 			var r RootEvent
 			if err := json.Unmarshal(v, &r); err != nil {
@@ -194,3 +194,6 @@ func binaryBigEndianUint64(b []byte) uint64 {
 	return uint64(b[0])<<56 | uint64(b[1])<<48 | uint64(b[2])<<40 | uint64(b[3])<<32 |
 		uint64(b[4])<<24 | uint64(b[5])<<16 | uint64(b[6])<<8 | uint64(b[7])
 }
+
+func tradeKey(id uint64) []byte { return []byte(fmt.Sprintf("trade:%020d", id)) }
+func rootKey(idx uint64) []byte { return []byte(fmt.Sprintf("root:%020d", idx)) }

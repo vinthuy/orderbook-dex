@@ -37,6 +37,9 @@ type IndexerService struct {
 	interval  time.Duration
 	stop      chan struct{}
 	started   bool
+
+	degradedMu  sync.Mutex
+	degradedErr error
 }
 
 func New(store *Store, bus *services.EventBus, adapter services.BlockchainAdapter, chain string, confirmations uint64) *IndexerService {
@@ -86,7 +89,7 @@ func (s *IndexerService) Start() error {
 	s.mu.Unlock()
 
 	if s.bus != nil {
-		s.bus.Subscribe(services.TopicOrderBookTrade, s.handleTrade)
+		s.bus.Subscribe(services.TopicOrderBookTrade, s.HandleTrade)
 	}
 	if s.adapter != nil {
 		go func() {
@@ -117,8 +120,36 @@ func (s *IndexerService) Stop() error {
 	return nil
 }
 
-// Store exposes the underlying store for query handlers.
-func (s *IndexerService) Store() *Store { return s.store }
+// HandleTrade persists one fill. It is the callback main passes to the stack so
+// the indexer subscribes before the order book replays its journal; the bus also
+// invokes it for live trades.
+func (s *IndexerService) HandleTrade(e services.Event) error {
+	if err := s.handleTrade(e); err != nil {
+		s.setDegraded(err)
+		return err
+	}
+	return nil
+}
+
+// SetAdapter sets the blockchain adapter used for chain-event polling. main
+// calls it after the stack is built.
+func (s *IndexerService) SetAdapter(a services.BlockchainAdapter) { s.adapter = a }
+
+// Degraded reports the first index-write error, or nil if none occurred.
+func (s *IndexerService) Degraded() error {
+	s.degradedMu.Lock()
+	defer s.degradedMu.Unlock()
+	return s.degradedErr
+}
+
+func (s *IndexerService) setDegraded(err error) {
+	s.degradedMu.Lock()
+	if s.degradedErr == nil {
+		s.degradedErr = err
+	}
+	s.degradedMu.Unlock()
+	log.Printf("indexer: degraded: %v", err)
+}
 
 // handleTrade persists one fill.
 func (s *IndexerService) handleTrade(e services.Event) error {

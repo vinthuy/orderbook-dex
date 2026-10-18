@@ -20,7 +20,7 @@ func TestRebuildAndCompareTotals(t *testing.T) {
 		tradeLog(t, "Withdrawal(address,uint32,uint256,uint256)", 7, account, 1, 30, 1),
 	}
 
-	rebuilt, err := Rebuild(adapter, "0xvault", 1)
+	rebuilt, err := Rebuild(adapter, "0xvault", 1, 1)
 	if err != nil {
 		t.Fatalf("Rebuild: %v", err)
 	}

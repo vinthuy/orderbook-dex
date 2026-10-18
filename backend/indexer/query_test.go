@@ -47,7 +47,7 @@ func TestQueryServerReconcile(t *testing.T) {
 		tradeLog(t, "Deposit(address,uint32,uint256,uint256)", 5, common.HexToAddress("0x1111111111111111111111111111111111111111"), 1, 100, 1),
 	}
 
-	qs := &QueryServer{Store: s, Adapter: adapter, Chain: "0xvault", Running: ledger.New()}
+	qs := &QueryServer{Store: s, Adapter: adapter, Chain: "0xvault", Running: ledger.New(), Confirmations: 1}
 	r := gin.New()
 	qs.Register(r)
 
