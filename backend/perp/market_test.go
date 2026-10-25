@@ -4,8 +4,6 @@ import (
 	"testing"
 
 	"github.com/holiman/uint256"
-
-	"web3-amm-dex-backend/ledger"
 )
 
 func TestMarketValidate(t *testing.T) {
@@ -56,6 +54,33 @@ func TestMarginFor(t *testing.T) {
 	}
 }
 
-func TestAccountIDUnchanged(t *testing.T) {
-	_ = ledger.AssetID(1)
+func TestMarginCeilRoundsTheDivisionUp(t *testing.T) {
+	// The order-level freeze is ceil(notional/leverage), NOT
+	// floor(ceil(qty*price/scale)/leverage). With qty 101, price 100 and two
+	// base decimals: notional = floor(101*100/100) = 101, so the freeze must be
+	// ceil(101/10) = 11 (the old formula returned 10 and under-froze by one).
+	m := Market{ID: 1, Symbol: "X", Base: 2, Quote: 1, BaseDecimals: 2, MaxLeverage: 10}
+	got, err := m.marginCeil(uint256.NewInt(101), 100, 10)
+	if err != nil {
+		t.Fatalf("marginCeil: %v", err)
+	}
+	if got.Uint64() != 11 {
+		t.Fatalf("marginCeil(101,100,10) = %s, want 11", got.Dec())
+	}
+	// A market-order cap rounds the same way: ceil(101/10) = 11.
+	got2, err := m.marginCeilAmount(uint256.NewInt(101), 10)
+	if err != nil {
+		t.Fatalf("marginCeilAmount: %v", err)
+	}
+	if got2.Uint64() != 11 {
+		t.Fatalf("marginCeilAmount(101,10) = %s, want 11", got2.Dec())
+	}
+	// Exact division stays exact.
+	got3, err := m.marginCeil(uint256.NewInt(100), 100, 10)
+	if err != nil {
+		t.Fatalf("marginCeil: %v", err)
+	}
+	if got3.Uint64() != 10 {
+		t.Fatalf("marginCeil(100,100,10) = %s, want 10", got3.Dec())
+	}
 }

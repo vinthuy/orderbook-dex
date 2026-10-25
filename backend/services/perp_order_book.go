@@ -214,8 +214,11 @@ func (s *PerpOrderBookService) publish(res perp.Result) {
 	}
 }
 
-// recover replays the instruction WAL, re-settling PnL idempotently and then
-// reconciling holds from the kernel's open margins.
+// recover replays the instruction WAL and re-settles PnL idempotently. It does
+// NOT reconcile Holds: Holds.Reconcile replaces the whole map, and the perp
+// service shares that map with the spot order book, so reconciling here would
+// drop the spot book's freezes. The caller reconciles the union of both books
+// once (see UnionHolds).
 func (s *PerpOrderBookService) recover() error {
 	ins, err := s.journal.Replay()
 	if err != nil {
@@ -226,18 +229,51 @@ func (s *PerpOrderBookService) recover() error {
 		case "place":
 			res, err := s.engine.Place(*in.Place)
 			if err != nil {
-				continue // deterministically rejected
+				// Every journaled place was validated before it was appended and
+				// the kernel is deterministic, so a failure here means the WAL or
+				// the market configuration diverged. Refuse to start rather than
+				// silently drop a user's order.
+				return fmt.Errorf("services: perp: replay place: %w", err)
 			}
 			if err := s.settlePnL(res.PnL); err != nil {
 				return fmt.Errorf("services: perp: replay settle: %w", err)
 			}
 		case "cancel":
-			if _, err := s.engine.Cancel(in.Cancel.Market, in.Cancel.Account, in.Cancel.OrderID); err != nil {
-				continue
+			// A cancel of an order that is no longer open is harmless to skip.
+			if _, err := s.engine.Cancel(in.Cancel.Market, in.Cancel.Account, in.Cancel.OrderID); err != nil &&
+				!errors.Is(err, perp.ErrOrderNotFound) {
+				return fmt.Errorf("services: perp: replay cancel: %w", err)
 			}
 		}
 	}
-	return s.holds.Reconcile(s.engine.OpenMargins())
+	return nil
+}
+
+// OpenMargins returns the (account, quote asset) → frozen margin map implied by
+// the kernel's final state, covering both open positions and resting orders.
+func (s *PerpOrderBookService) OpenMargins() map[ledger.HoldKey]*uint256.Int {
+	return s.engine.OpenMargins()
+}
+
+// UnionHolds merges two open-hold maps into a fresh map, summing amounts that
+// share a key. Holds.Reconcile replaces the entire map, so the spot and perp
+// books must be reconciled together — reconciling either alone would unfreeze
+// the other's resting orders on restart.
+func UnionHolds(a, b map[ledger.HoldKey]*uint256.Int) map[ledger.HoldKey]*uint256.Int {
+	out := make(map[ledger.HoldKey]*uint256.Int, len(a)+len(b))
+	for _, src := range []map[ledger.HoldKey]*uint256.Int{a, b} {
+		for k, v := range src {
+			if v == nil || v.IsZero() {
+				continue
+			}
+			if cur, ok := out[k]; ok {
+				cur.Add(cur, v)
+			} else {
+				out[k] = new(uint256.Int).Set(v)
+			}
+		}
+	}
+	return out
 }
 
 // ParsePerpMarkets parses the PERP_MARKETS string:

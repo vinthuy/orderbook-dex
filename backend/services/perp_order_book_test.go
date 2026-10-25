@@ -1,6 +1,7 @@
 package services
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 
@@ -295,5 +296,61 @@ func TestPerpCloseCloseSettlesBothSides(t *testing.T) {
 		if _, ok := svc2.Engine().Position(1, a); ok {
 			t.Fatalf("after replay account %s still has a position, want closed", a.Hex())
 		}
+	}
+}
+
+// TestPerpDegradesWhenLossExceedsBalance pins the 6a breach gap: a realized loss
+// larger than the trader's balance makes the WithdrawOp fail, which must latch
+// the fatal error and refuse every later command rather than continuing with a
+// half-settled book.
+func TestPerpDegradesWhenLossExceedsBalance(t *testing.T) {
+	l := ledger.New()
+	holds := ledger.NewHolds(l)
+	bus := NewEventBus()
+
+	// acct1 has 20 quote: enough for the 10 open margin and the 5 closing-order
+	// reserve, but not for the 50 realized loss.
+	l.Apply(ledger.DepositOp{Account: perpAcct(1), Asset: 1, Amount: uint256.NewInt(20), Ref: "d1"})
+	// acct2 provides the opening counterparty; acct3 provides the loss price.
+	for i, amt := range map[byte]uint64{2: 1000, 3: 1000} {
+		l.Apply(ledger.DepositOp{Account: perpAcct(i), Asset: 1, Amount: uint256.NewInt(amt), Ref: fmt.Sprintf("d%d", i)})
+	}
+
+	svc, err := NewPerpOrderBookService(perpMarkets(), l, holds, mustPerpJournal(t, ""), bus)
+	if err != nil {
+		t.Fatalf("NewPerpOrderBookService: %v", err)
+	}
+	defer svc.Close()
+
+	place := func(a byte, side perp.Side, price perp.Price, qty uint64, lev uint32) error {
+		_, err := svc.Place(perp.PlaceRequest{
+			Market: 1, Account: perpAcct(a), Side: side, Type: perp.TypeLimit,
+			TIF: perp.TIFGTC, Price: price, Qty: uint256.NewInt(qty), Leverage: lev,
+		})
+		return err
+	}
+
+	// acct2 rests short 100@100; acct1 opens long 100@100 (margin 10).
+	if err := place(2, perp.SideShort, 100, 100, 10); err != nil {
+		t.Fatalf("rest short: %v", err)
+	}
+	if err := place(1, perp.SideLong, 100, 100, 10); err != nil {
+		t.Fatalf("open long: %v", err)
+	}
+	// acct3 rests long 100@50; acct1 closes its long at 50 -> PnL = 50-100 = -50.
+	if err := place(3, perp.SideLong, 50, 100, 10); err != nil {
+		t.Fatalf("rest long: %v", err)
+	}
+	err = place(1, perp.SideShort, 50, 100, 10)
+	if !errors.Is(err, ErrPerpServiceDegraded) {
+		t.Fatalf("closing loss err = %v, want ErrPerpServiceDegraded", err)
+	}
+
+	// Every later command must be refused with the same sentinel.
+	if err := place(2, perp.SideShort, 90, 10, 10); !errors.Is(err, ErrPerpServiceDegraded) {
+		t.Fatalf("Place after degrade = %v, want ErrPerpServiceDegraded", err)
+	}
+	if _, err := svc.Cancel(1, perpAcct(2), 1); !errors.Is(err, ErrPerpServiceDegraded) {
+		t.Fatalf("Cancel after degrade = %v, want ErrPerpServiceDegraded", err)
 	}
 }

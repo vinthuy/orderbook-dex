@@ -195,17 +195,33 @@ func (m Market) notionalChecked(qty *uint256.Int, p Price, ceil bool) (*uint256.
 }
 
 // marginCeil derives the order-level freeze for a full open of qty base units at
-// the order price with the given leverage: ceil(notional(qty,price) / leverage).
-// It is what RequiredMargin returns and what the service layer pre-freezes.
+// the order price with the given leverage: ceil(notional(qty,price) / leverage),
+// where notional is the floor quote value. It is what RequiredMargin returns and
+// what the service layer pre-freezes. Note this rounds the DIVISION up, not the
+// notional: `floor(ceil(qty*price/scale)/leverage)` would under-freeze by one
+// quote unit (qty 101, price 100, decimals 2, 10x -> 10 instead of 11).
 func (m Market) marginCeil(qty *uint256.Int, price Price, leverage uint32) (*uint256.Int, error) {
 	if leverage < 1 {
 		return nil, fmt.Errorf("%w: leverage must be >= 1", ErrBadRequest)
 	}
-	notional, err := m.notionalChecked(qty, price, true)
+	notional, err := m.notionalChecked(qty, price, false)
 	if err != nil {
 		return nil, err
 	}
-	return new(uint256.Int).Div(notional, uint256.NewInt(uint64(leverage))), nil
+	return divCeil(notional, uint256.NewInt(uint64(leverage)))
+}
+
+// divCeil returns ceil(a/b) for b > 0, with an explicit overflow check so a
+// pathological a can never silently wrap into a tiny freeze.
+func divCeil(a, b *uint256.Int) (*uint256.Int, error) {
+	if b.IsZero() {
+		return nil, fmt.Errorf("%w: division by zero", ErrBadRequest)
+	}
+	sum, overflow := new(uint256.Int).AddOverflow(a, new(uint256.Int).Sub(b, uint256.NewInt(1)))
+	if overflow {
+		return nil, ErrAmountTooLarge
+	}
+	return new(uint256.Int).Div(sum, b), nil
 }
 
 // marginFloor derives the position-level margin transferred for one fill of qty
@@ -232,11 +248,7 @@ func (m Market) marginCeilAmount(quoteAmount *uint256.Int, leverage uint32) (*ui
 	if quoteAmount == nil {
 		return uint256.NewInt(0), nil
 	}
-	q, overflow := new(uint256.Int).AddOverflow(quoteAmount, uint256.NewInt(uint64(leverage-1)))
-	if overflow {
-		return nil, ErrAmountTooLarge
-	}
-	return new(uint256.Int).Div(q, uint256.NewInt(uint64(leverage))), nil
+	return divCeil(quoteAmount, uint256.NewInt(uint64(leverage)))
 }
 
 func pow10(n uint8) *uint256.Int {

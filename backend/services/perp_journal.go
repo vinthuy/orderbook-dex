@@ -35,12 +35,43 @@ func NewPerpJournal(dir string) (*PerpJournal, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(filepath.Join(dir, "perp_orders.wal"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	path := filepath.Join(dir, "perp_orders.wal")
+	// Drop a torn trailing record before opening for append: O_APPEND would
+	// otherwise write the next record onto the partial bytes, turning a
+	// tolerated one-time tear into permanent interior corruption.
+	if err := truncateTornTail(path); err != nil {
+		return nil, err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
 		return nil, err
 	}
 	j.f = f
 	return j, nil
+}
+
+// truncateTornTail cuts the file back to the end of its last newline-terminated
+// record when the trailing bytes are an incomplete record. A file whose last
+// byte is a newline is already clean. Interior corruption is left alone so
+// Replay reports it loudly instead of silently discarding data.
+func truncateTornTail(path string) error {
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) || (err == nil && len(data) == 0) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if data[len(data)-1] == '\n' {
+		return nil
+	}
+	idx := bytes.LastIndexByte(data, '\n')
+	keep := 0
+	if idx >= 0 {
+		keep = idx + 1
+	}
+	log.Printf("perp journal: truncating %d torn trailing byte(s)", len(data)-keep)
+	return os.Truncate(path, int64(keep))
 }
 
 func (j *PerpJournal) Close() error {

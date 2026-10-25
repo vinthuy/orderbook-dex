@@ -49,7 +49,8 @@ func TestOpenMargins(t *testing.T) {
 	place(2, acct(1), SideShort, 100, 100)
 	place(2, acct(3), SideLong, 100, 100)
 	// Account 4 rests a long bid: it has no position, but its order-level
-	// reserved margin (notional ceil = 40, / 10 = 4) stays frozen.
+	// reserved margin stays frozen. notional(50,90) = floor(4500/100) = 45, and
+	// the freeze is ceil(45/10) = 5.
 	res, err := e.Place(PlaceRequest{Market: 1, Account: acct(4), Side: SideLong, Type: TypeLimit, TIF: TIFGTC, Price: 90, Qty: uint256.NewInt(50), Leverage: 10})
 	if err != nil {
 		t.Fatalf("resting place: %v", err)
@@ -63,7 +64,7 @@ func TestOpenMargins(t *testing.T) {
 		{Account: acct(1), Asset: 1}: uint256.NewInt(20), // 10 + 10 across markets
 		{Account: acct(2), Asset: 1}: uint256.NewInt(10),
 		{Account: acct(3), Asset: 1}: uint256.NewInt(10),
-		{Account: acct(4), Asset: 1}: uint256.NewInt(4), // resting order reserved
+		{Account: acct(4), Asset: 1}: uint256.NewInt(5), // resting order reserved
 	}
 	if len(got) != len(want) {
 		t.Fatalf("OpenMargins len = %d, want %d: %+v", len(got), len(want), got)
@@ -134,6 +135,49 @@ func TestPlaceReduceClosesPosition(t *testing.T) {
 	p2, _ := e.Position(1, acct(2))
 	if p2.Size.Uint64() != 50 {
 		t.Fatalf("size = %s, want 50", p2.Size.Dec())
+	}
+}
+
+// TestPartialReduceReleasesMarginProportionally pins the per-account release on
+// a partial close. A global conservation check cannot catch a skipped release
+// (the position simply stays over-margined until the final close), so this
+// asserts the exact amount moved.
+func TestPartialReduceReleasesMarginProportionally(t *testing.T) {
+	e, _ := NewEngine([]Market{mkMarket()})
+	// acct2 rests short 100@100, acct1 crosses long -> acct1 margin = ceil(100/10) = 10.
+	_, _ = e.Place(shortReq(acct(2), 100, 100, 10))
+	res, err := e.Place(longReq(acct(1), 100, 100, 10))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	p1, _ := e.Position(1, acct(1))
+	if p1.Margin.Uint64() != 10 {
+		t.Fatalf("open margin = %s, want 10", p1.Margin.Dec())
+	}
+	_ = res
+	// A resting long gives acct1 a counterparty to close 40 against.
+	_, _ = e.Place(longReq(acct(3), 100, 40, 10))
+	res, err = e.Place(shortReq(acct(1), 100, 40, 10))
+	if err != nil {
+		t.Fatalf("reduce: %v", err)
+	}
+
+	// Two release legs for acct1:
+	//   position: floor(margin*closed/prevSize) = floor(10*40/100) = 4
+	//   order:    the closing order's own reserve, released when it leaves the
+	//             book = ceil(notional(40,100)/10) = 4
+	var released uint64
+	for _, r := range res.Releases {
+		if r.Account == acct(1) {
+			released += r.Amount.Uint64()
+		}
+	}
+	if released != 8 {
+		t.Fatalf("released = %d, want 8 (position 4 + order reserve 4)", released)
+	}
+	p1, _ = e.Position(1, acct(1))
+	if p1.Margin.Uint64() != 6 {
+		t.Fatalf("remaining margin = %s, want 6 (10 - floor(10*40/100))", p1.Margin.Dec())
 	}
 }
 

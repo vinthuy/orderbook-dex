@@ -9,10 +9,12 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/holiman/uint256"
 	"web3-amm-dex-backend/config"
 	"web3-amm-dex-backend/gateway"
 	"web3-amm-dex-backend/handlers"
 	"web3-amm-dex-backend/indexer"
+	"web3-amm-dex-backend/ledger"
 	"web3-amm-dex-backend/services"
 )
 
@@ -101,6 +103,17 @@ func main() {
 		settlement.Registry.Register(perpsvc)
 		if err := perpsvc.Start(); err != nil {
 			log.Fatalf("Failed to start perp order book: %v", err)
+		}
+		// Holds.Reconcile replaces the whole map, and the spot order book has
+		// already reconciled its own reserves during stack assembly. Reconcile
+		// the union once here, or mounting perp would unfreeze every spot
+		// resting order on restart.
+		var spotReserves map[ledger.HoldKey]*uint256.Int
+		if settlement.OrderBook != nil {
+			spotReserves = settlement.OrderBook.Engine().OpenReserves()
+		}
+		if err := settlement.Holds.Reconcile(services.UnionHolds(spotReserves, perpsvc.OpenMargins())); err != nil {
+			log.Fatalf("Failed to reconcile spot+perp holds: %v", err)
 		}
 		log.Printf("perpetual order book mounted (%d markets)", len(perpMarkets))
 	}
