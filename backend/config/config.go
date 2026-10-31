@@ -168,3 +168,86 @@ func LoadPerpConfig() PerpConfig {
         DataDir: os.Getenv("PERP_DATA_DIR"),
     }
 }
+
+// PerpFundingConfig configures mark prices and funding (subproject 6b). It is
+// separate from PerpConfig so 6a deployments keep working unchanged: with no
+// index prices configured the funding subsystem stays off entirely.
+type PerpFundingConfig struct {
+    // IndexPrices is the static index price map, "ID:PRICE;..." (PRICE in quote
+    // minor units per whole base unit). Empty disables marks and funding.
+    IndexPrices string
+    // TickSeconds is the price refresh interval in seconds.
+    TickSeconds int64
+    // FundingIntervalSeconds is the funding period in seconds.
+    FundingIntervalSeconds int64
+    // MaxPriceAgeSeconds is the staleness threshold for an index price.
+    MaxPriceAgeSeconds int64
+    // MaxMarkStalenessSeconds is how long a stale index may reuse the last mark.
+    MaxMarkStalenessSeconds int64
+    // MaxFundingRateE18 is the absolute funding-rate cap, 1e18-scaled.
+    MaxFundingRateE18 string
+    // MarkMaxDeviationE18 is the largest book deviation from the index, 1e18-scaled.
+    MarkMaxDeviationE18 string
+}
+
+// LoadPerpFundingConfig reads 6b settings from the environment. Values that fail
+// to parse fall back to the documented defaults; the caller (main) validates the
+// index-price string at startup and must fail on a malformed one.
+func LoadPerpFundingConfig() PerpFundingConfig {
+    cfg := PerpFundingConfig{
+        IndexPrices:             os.Getenv("PERP_INDEX_PRICES"),
+        TickSeconds:             5,
+        FundingIntervalSeconds:  3600,
+        MaxPriceAgeSeconds:      60,
+        MaxMarkStalenessSeconds: 300,
+        MaxFundingRateE18:       "7500000000000000",    // 0.75% per funding
+        MarkMaxDeviationE18:     "5000000000000000",    // 0.5%
+    }
+    if v := os.Getenv("PERP_TICK_INTERVAL"); v != "" {
+        if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+            cfg.TickSeconds = n
+        }
+    }
+    if v := os.Getenv("PERP_FUNDING_INTERVAL"); v != "" {
+        if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+            cfg.FundingIntervalSeconds = n
+        }
+    }
+    if v := os.Getenv("PERP_MAX_PRICE_AGE"); v != "" {
+        if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+            cfg.MaxPriceAgeSeconds = n
+        }
+    }
+    if v := os.Getenv("PERP_MAX_MARK_STALENESS"); v != "" {
+        if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+            cfg.MaxMarkStalenessSeconds = n
+        }
+    }
+    if v := os.Getenv("PERP_MAX_FUNDING_RATE"); v != "" {
+        cfg.MaxFundingRateE18 = v
+    }
+    if v := os.Getenv("PERP_MARK_MAX_DEVIATION"); v != "" {
+        cfg.MarkMaxDeviationE18 = v
+    }
+    return cfg
+}
+
+// Tick is the price refresh interval.
+func (c PerpFundingConfig) Tick() time.Duration {
+    return time.Duration(c.TickSeconds) * time.Second
+}
+
+// FundingInterval is the funding period.
+func (c PerpFundingConfig) FundingInterval() time.Duration {
+    return time.Duration(c.FundingIntervalSeconds) * time.Second
+}
+
+// MaxPriceAge is the index staleness threshold.
+func (c PerpFundingConfig) MaxPriceAge() time.Duration {
+    return time.Duration(c.MaxPriceAgeSeconds) * time.Second
+}
+
+// MaxMarkStaleness is the mark fallback window.
+func (c PerpFundingConfig) MaxMarkStaleness() time.Duration {
+    return time.Duration(c.MaxMarkStalenessSeconds) * time.Second
+}

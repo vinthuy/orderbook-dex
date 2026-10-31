@@ -127,3 +127,29 @@ func (t *PerpPriceTracker) LastMark(m perp.MarketID) (perp.Price, bool) {
 	}
 	return st.lastMark, true
 }
+
+// IndexPrice returns the last observed index price and whether one is fresh.
+func (t *PerpPriceTracker) IndexPrice(m perp.MarketID) (perp.Price, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	st := t.states[m]
+	if st == nil || !st.hasIndex {
+		return 0, false
+	}
+	return st.index, true
+}
+
+// restore reinstates a journaled mark exactly, bypassing derivation. Replay
+// must reproduce history, not recompute it from whatever the book looks like
+// after the fact.
+func (t *PerpPriceTracker) restore(m perp.MarketID, mark perp.Price, at time.Time) {
+	if mark == 0 {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	st := t.state(m)
+	st.lastMark = mark
+	st.lastMarkAt = at
+	st.hasMark = true
+}

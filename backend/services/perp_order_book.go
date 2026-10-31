@@ -3,6 +3,7 @@ package services
 import (
 	"errors"
 	"fmt"
+	"math/big"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,13 +20,25 @@ const (
 	TopicPerpPosition = "perp.position"
 	TopicPerpDegraded = "perp.degraded"
 
-	// perpRunInterval is the poll interval for the runner. 6a has no periodic
-	// work, so the runner only keeps the restart semantics identical to the
-	// other stack services; the interval is otherwise unused.
-	perpRunInterval = 30 * time.Second
+	// 6b topics: derived mark prices and completed funding rounds.
+	TopicPerpMark    = "perp.mark"
+	TopicPerpFunding = "perp.funding"
+
+	// perpRunInterval is the default poll interval for the runner: one price
+	// refresh per tick (6b). With no PriceSource it is pure overhead, which is
+	// why the interval is configurable.
+	perpRunInterval = 5 * time.Second
 )
 
 var ErrPerpServiceDegraded = errors.New("services: perp order book degraded, restart required")
+
+// MarkUpdate is published on TopicPerpMark whenever a market's mark price moves.
+type MarkUpdate struct {
+	Market perp.MarketID
+	Index  perp.Price
+	Mark   perp.Price
+	At     int64
+}
 
 // PerpOrderBookService hosts the perp kernel: it freezes quote margin, journals
 // instructions, matches, realizes PnL into the ledger, releases margin, and
@@ -37,6 +50,15 @@ type PerpOrderBookService struct {
 	journal *PerpJournal
 	bus     *EventBus
 	markets map[perp.MarketID]perp.Market
+
+	// 6b pricing and funding state. Absent a PriceSource the service behaves
+	// exactly like 6a: no marks, no funding rounds, no extra journal records.
+	prices      perp.PriceSource
+	tracker     *PerpPriceTracker
+	funding     map[perp.MarketID]FundingState
+	debts       map[fundingDebtKey]*uint256.Int
+	fundingOpts FundingOptions
+	lastFunding map[perp.MarketID]int64
 
 	mu       sync.Mutex
 	fatalErr error
@@ -66,6 +88,9 @@ func NewPerpOrderBookService(markets []perp.Market, l *ledger.Ledger, holds *led
 	}
 	s := &PerpOrderBookService{
 		engine: engine, ledger: l, holds: holds, journal: journal, bus: bus, markets: byID,
+		funding:     make(map[perp.MarketID]FundingState),
+		debts:       make(map[fundingDebtKey]*uint256.Int),
+		lastFunding: make(map[perp.MarketID]int64),
 	}
 	if err := s.recover(); err != nil {
 		return nil, err
@@ -78,8 +103,20 @@ func (s *PerpOrderBookService) Name() string { return "PerpOrderBookService" }
 func (s *PerpOrderBookService) Initialize(cfg Config) error { return nil }
 
 func (s *PerpOrderBookService) Start() error {
-	s.run.start(perpRunInterval, func() {})
+	s.run.start(s.tickInterval(), func() {
+		s.tick(time.Now())
+	})
 	return nil
+}
+
+// tickInterval returns the configured price refresh cadence.
+func (s *PerpOrderBookService) tickInterval() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fundingOpts.Tick > 0 {
+		return s.fundingOpts.Tick
+	}
+	return perpRunInterval
 }
 
 func (s *PerpOrderBookService) Stop() error {
@@ -94,6 +131,163 @@ func (s *PerpOrderBookService) Close() error {
 
 func (s *PerpOrderBookService) Engine() *perp.Engine { return s.engine }
 func (s *PerpOrderBookService) Holds() *ledger.Holds { return s.holds }
+
+// SetPriceSource installs the index price source used for mark prices and
+// funding. Without one, the service keeps the 6a behaviour: MarkPrice reports
+// no price and no funding round is ever triggered.
+func (s *PerpOrderBookService) SetPriceSource(p perp.PriceSource, opts PriceOptions) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.prices = p
+	s.tracker = NewPerpPriceTracker(opts.MaxPriceAge, opts.MaxMarkStaleAge)
+}
+
+// SetFundingOptions installs the funding scheduler's cadence and caps. It is
+// separate from SetPriceSource so callers can tune one without the other.
+func (s *PerpOrderBookService) SetFundingOptions(opts FundingOptions) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if opts.Tick <= 0 {
+		opts.Tick = perpRunInterval
+	}
+	s.fundingOpts = opts
+	s.run.setInterval(opts.Tick)
+}
+
+// tick is one scheduler iteration: refresh marks, then run any funding round
+// that is due.
+func (s *PerpOrderBookService) tick(now time.Time) {
+	s.refreshMarks(now)
+
+	s.mu.Lock()
+	opts := s.fundingOpts
+	due := make([]perp.MarketID, 0, len(s.markets))
+	for id := range s.markets {
+		last, ok := s.lastFunding[id]
+		if !ok {
+			// Start the clock at the first tick so a freshly started service
+			// does not settle funding the instant it boots.
+			s.lastFunding[id] = now.Unix()
+			continue
+		}
+		interval := opts.Interval
+		if interval <= 0 {
+			interval = time.Hour
+		}
+		if now.Unix()-last >= int64(interval/time.Second) {
+			due = append(due, id)
+		}
+	}
+	s.mu.Unlock()
+
+	for _, id := range due {
+		interval := opts.Interval
+		if interval <= 0 {
+			interval = time.Hour
+		}
+		// Whether or not the round settles (a market with no mark skips), the
+		// clock advances: otherwise a market that can never price itself would
+		// retry every tick forever.
+		if _, _, err := s.RunFundingRound(id, now, interval, opts.MaxRateE18); err != nil {
+			continue
+		}
+		s.mu.Lock()
+		s.lastFunding[id] = now.Unix()
+		s.mu.Unlock()
+	}
+}
+
+// PriceOptions configures price freshness. Zero durations mean defaults.
+type PriceOptions struct {
+	MaxPriceAge     time.Duration
+	MaxMarkStaleAge time.Duration
+}
+
+// MarkPrice returns the latest derived mark price for a market.
+func (s *PerpOrderBookService) MarkPrice(m perp.MarketID) (perp.Price, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tracker == nil {
+		return 0, false
+	}
+	return s.tracker.LastMark(m)
+}
+
+// UnrealizedPnL returns an account's mark-price unrealized PnL in a market, and
+// false when the account has no position or the market has no mark price.
+func (s *PerpOrderBookService) UnrealizedPnL(m perp.MarketID, a ledger.AccountID) (*big.Int, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	market, ok := s.markets[m]
+	if !ok || s.tracker == nil {
+		return nil, false
+	}
+	mark, ok := s.tracker.LastMark(m)
+	if !ok {
+		return nil, false
+	}
+	pos, ok := s.engine.Position(m, a)
+	if !ok {
+		return new(big.Int), true
+	}
+	pnl, err := market.UnrealizedPnL(pos.Side, pos.Size, pos.EntryPrice, mark)
+	if err != nil {
+		return nil, false
+	}
+	return pnl, true
+}
+
+// refreshMarks pulls one index price per market and derives a mark. It journals
+// a mark record only when the derived mark changed, so an idle market does not
+// grow the WAL every tick.
+//
+// Events are collected under the lock and published after it is released: the
+// EventBus invokes subscribers synchronously, and a subscriber that calls back
+// into this service would self-deadlock if the lock were still held.
+func (s *PerpOrderBookService) refreshMarks(now time.Time) {
+	var updates []MarkUpdate
+	s.mu.Lock()
+	if s.prices == nil || s.tracker == nil || s.fatalErr != nil {
+		s.mu.Unlock()
+		return
+	}
+	var journalErr error
+	for id, market := range s.markets {
+		index, ok := s.prices.Index(id)
+		if !ok || index == 0 {
+			continue
+		}
+		s.tracker.Observe(id, index, now)
+		longs, shorts := s.engine.Book(id, 1)
+		var bestBid, bestAsk perp.Price
+		var hasBid, hasAsk bool
+		if len(longs) > 0 {
+			bestBid, hasBid = longs[0].Price, true
+		}
+		if len(shorts) > 0 {
+			bestAsk, hasAsk = shorts[0].Price, true
+		}
+		before, hadMark := s.tracker.LastMark(id)
+		mark, ok := s.tracker.Mark(market, index, bestBid, bestAsk, hasBid, hasAsk, now)
+		if !ok || (hadMark && mark == before) {
+			continue
+		}
+		if err := s.journal.AppendMark(MarkCmd{Market: id, Index: index, Mark: mark, At: now.Unix()}); err != nil {
+			journalErr = err
+			break
+		}
+		updates = append(updates, MarkUpdate{Market: id, Index: index, Mark: mark, At: now.Unix()})
+	}
+	s.mu.Unlock()
+
+	if journalErr != nil {
+		_ = s.degrade(journalErr)
+		return
+	}
+	for _, u := range updates {
+		_ = s.bus.Publish(Event{Topic: TopicPerpMark, Data: u})
+	}
+}
 
 // Place freezes the order-level margin, journals the instruction, matches,
 // realizes PnL into the ledger, releases margin, and publishes events — in that
@@ -226,6 +420,36 @@ func (s *PerpOrderBookService) recover() error {
 	}
 	for _, in := range ins {
 		switch in.Kind {
+		case "mark":
+			// A replayed mark restores the price history without re-reading an
+			// oracle whose price may have moved (spec §3.5).
+			if s.tracker == nil {
+				s.tracker = NewPerpPriceTracker(0, 0)
+			}
+			s.tracker.Observe(in.Mark.Market, in.Mark.Index, time.Unix(in.Mark.At, 0))
+			s.tracker.restore(in.Mark.Market, in.Mark.Mark, time.Unix(in.Mark.At, 0))
+		case "funding":
+			rate, ok := new(big.Int).SetString(in.Funding.Rate, 10)
+			if !ok {
+				return fmt.Errorf("services: perp: replay funding: bad rate %q", in.Funding.Rate)
+			}
+			for _, l := range in.Funding.Legs {
+				ref := fundingRef(in.Funding.Market, in.Funding.Index, l.Payer, l.Receiver)
+				if s.ledger.WasApplied(ref) {
+					continue
+				}
+				if err := s.ledger.Apply(ledger.TransferOp{
+					From: l.Payer, To: l.Receiver, Asset: s.markets[in.Funding.Market].Quote,
+					Amount: l.Amount, Ref: ref,
+				}); err != nil {
+					// A replay that cannot re-apply a journaled leg means the
+					// ledger snapshot and the WAL diverged: refuse to start.
+					return fmt.Errorf("services: perp: replay funding leg: %w", err)
+				}
+			}
+			if market, ok := s.markets[in.Funding.Market]; ok {
+				s.recordFundingState(market, in.Funding.Index, rate.String(), in.Funding.Mark, in.Funding.At)
+			}
 		case "place":
 			res, err := s.engine.Place(*in.Place)
 			if err != nil {

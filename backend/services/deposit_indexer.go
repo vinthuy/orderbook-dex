@@ -24,10 +24,19 @@ var depositTopic = crypto.Keccak256Hash([]byte("Deposit(address,uint32,uint256,u
 // current channel exactly once and is safe to call before the first start or
 // twice in a row.
 type runner struct {
-	mu      sync.Mutex
-	stopCh  chan struct{}
-	started bool
-	loops   int
+	mu       sync.Mutex
+	stopCh   chan struct{}
+	started  bool
+	loops    int
+	interval time.Duration
+}
+
+// setInterval records the cadence the next start should use. It does not
+// restart a running loop: cadence changes take effect on the next Start.
+func (r *runner) setInterval(d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.interval = d
 }
 
 // start launches poll on a periodic ticker and returns true, or does nothing
