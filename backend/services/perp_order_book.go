@@ -24,6 +24,10 @@ const (
 	TopicPerpMark    = "perp.mark"
 	TopicPerpFunding = "perp.funding"
 
+	// 6c topics: forced liquidations and bad debt absorbed by the insurance fund.
+	TopicPerpLiquidation = "perp.liquidation"
+	TopicPerpBadDebt     = "perp.baddebt"
+
 	// perpRunInterval is the default poll interval for the runner: one price
 	// refresh per tick (6b). With no PriceSource it is pure overhead, which is
 	// why the interval is configurable.
@@ -38,6 +42,27 @@ type MarkUpdate struct {
 	Index  perp.Price
 	Mark   perp.Price
 	At     int64
+}
+
+// LiquidationEvent is published on TopicPerpLiquidation after a forced close.
+type LiquidationEvent struct {
+	Market  perp.MarketID
+	Account ledger.AccountID
+	Size    *uint256.Int
+	Mark    perp.Price
+	Equity  *big.Int
+	Fee     *uint256.Int
+	Partial bool
+	At      int64
+}
+
+// BadDebtEvent is published when a loss exceeds everything the account and the
+// insurance fund could cover.
+type BadDebtEvent struct {
+	Account ledger.AccountID
+	Asset   ledger.AssetID
+	Amount  *uint256.Int
+	At      int64
 }
 
 // PerpOrderBookService hosts the perp kernel: it freezes quote margin, journals
@@ -59,6 +84,10 @@ type PerpOrderBookService struct {
 	debts       map[fundingDebtKey]*uint256.Int
 	fundingOpts FundingOptions
 	lastFunding map[perp.MarketID]int64
+
+	// 6c risk state: the account that absorbs insolvency, and the scan cadence.
+	insuranceFund   ledger.AccountID
+	liquidationOpts LiquidationOptions
 
 	mu       sync.Mutex
 	fatalErr error
@@ -91,6 +120,9 @@ func NewPerpOrderBookService(markets []perp.Market, l *ledger.Ledger, holds *led
 		funding:     make(map[perp.MarketID]FundingState),
 		debts:       make(map[fundingDebtKey]*uint256.Int),
 		lastFunding: make(map[perp.MarketID]int64),
+
+		insuranceFund:   reservedInsuranceAccount,
+		liquidationOpts: LiquidationOptions{Interval: time.Second},
 	}
 	if err := s.recover(); err != nil {
 		return nil, err
@@ -158,6 +190,7 @@ func (s *PerpOrderBookService) SetFundingOptions(opts FundingOptions) {
 // that is due.
 func (s *PerpOrderBookService) tick(now time.Time) {
 	s.refreshMarks(now)
+	s.scanLiquidations(now)
 
 	s.mu.Lock()
 	opts := s.fundingOpts
@@ -382,12 +415,72 @@ func (s *PerpOrderBookService) settlePnL(pnls []perp.PnLSettlement) error {
 			if err := s.ledger.Apply(ledger.DepositOp{Account: p.Account, Asset: quote, Amount: amt, Ref: ref}); err != nil {
 				return err
 			}
-		} else {
-			if err := s.ledger.Apply(ledger.WithdrawOp{Account: p.Account, Asset: quote, Amount: amt, Ref: ref}); err != nil {
-				return err
+			continue
+		}
+		if err := s.ledger.Apply(ledger.WithdrawOp{Account: p.Account, Asset: quote, Amount: amt, Ref: ref}); err != nil {
+			if errors.Is(err, ledger.ErrInsufficientBalance) {
+				// A loss larger than the account's balance is a shortfall, not a
+				// reason to halt the whole book (spec §3.3). Debit what is there
+				// and cover the rest from the insurance fund.
+				if err := s.coverShortfall(p.Account, quote, amt, ref); err != nil {
+					return err
+				}
+				continue
 			}
+			return err
 		}
 	}
+	return nil
+}
+
+// coverShortfall debits whatever the account can pay, then draws the remainder
+// from the insurance fund. The book stays live: a single account's insolvency is
+// that account's problem, never a market-wide halt.
+//
+// The bad-debt amount is reported through TopicPerpBadDebt so operators can see
+// the fund draining rather than discovering it in the totals.
+func (s *PerpOrderBookService) coverShortfall(account ledger.AccountID, asset ledger.AssetID, loss *uint256.Int, ref string) error {
+	balance := s.ledger.Balance(account, asset)
+	payable := new(uint256.Int).Set(loss)
+	if balance.Cmp(payable) < 0 {
+		payable = new(uint256.Int).Set(balance)
+	}
+	if !payable.IsZero() {
+		if err := s.ledger.Apply(ledger.WithdrawOp{
+			Account: account, Asset: asset, Amount: payable, Ref: ref,
+		}); err != nil {
+			return err
+		}
+	}
+	shortfall := new(uint256.Int).Sub(loss, payable)
+	if shortfall.IsZero() {
+		return nil
+	}
+	fundRef := fmt.Sprintf("%s:fund", ref)
+	if !s.ledger.WasApplied(fundRef) {
+		if err := s.ledger.Apply(ledger.DepositOp{
+			Account: account, Asset: asset, Amount: shortfall, Ref: fundRef,
+		}); err != nil {
+			return err
+		}
+	}
+	if err := s.ledger.Apply(ledger.WithdrawOp{
+		Account: s.insuranceFund, Asset: asset, Amount: shortfall,
+		Ref: fmt.Sprintf("%s:drawn", ref),
+	}); err != nil {
+		if errors.Is(err, ledger.ErrInsufficientBalance) {
+			// The fund itself cannot pay. Record the bad debt and keep trading:
+			// an insolvent fund is an accounting fact, not a reason to stop.
+			_ = s.bus.Publish(Event{Topic: TopicPerpBadDebt, Data: BadDebtEvent{
+				Account: account, Asset: asset, Amount: shortfall,
+			}})
+			return nil
+		}
+		return err
+	}
+	_ = s.bus.Publish(Event{Topic: TopicPerpBadDebt, Data: BadDebtEvent{
+		Account: account, Asset: asset, Amount: shortfall,
+	}})
 	return nil
 }
 

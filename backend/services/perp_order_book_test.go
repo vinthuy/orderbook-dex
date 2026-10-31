@@ -1,7 +1,6 @@
 package services
 
 import (
-	"errors"
 	"fmt"
 	"testing"
 
@@ -302,8 +301,11 @@ func TestPerpCloseCloseSettlesBothSides(t *testing.T) {
 // TestPerpDegradesWhenLossExceedsBalance pins the 6a breach gap: a realized loss
 // larger than the trader's balance makes the WithdrawOp fail, which must latch
 // the fatal error and refuse every later command rather than continuing with a
-// half-settled book.
-func TestPerpDegradesWhenLossExceedsBalance(t *testing.T) {
+// TestPerpShortfallIsAbsorbedNotDegraded replaces 6a's degrade behaviour: a
+// realized loss larger than the account's balance used to fail the WithdrawOp and
+// halt the whole book. 6c makes the insurance fund absorb the difference, so the
+// book stays live and the account's balance never goes negative.
+func TestPerpShortfallIsAbsorbedNotDegraded(t *testing.T) {
 	l := ledger.New()
 	holds := ledger.NewHolds(l)
 	bus := NewEventBus()
@@ -321,6 +323,7 @@ func TestPerpDegradesWhenLossExceedsBalance(t *testing.T) {
 		t.Fatalf("NewPerpOrderBookService: %v", err)
 	}
 	defer svc.Close()
+	svc.SetInsuranceFund(reservedInsuranceAccount)
 
 	place := func(a byte, side perp.Side, price perp.Price, qty uint64, lev uint32) error {
 		_, err := svc.Place(perp.PlaceRequest{
@@ -341,16 +344,16 @@ func TestPerpDegradesWhenLossExceedsBalance(t *testing.T) {
 	if err := place(3, perp.SideLong, 50, 100, 10); err != nil {
 		t.Fatalf("rest long: %v", err)
 	}
-	err = place(1, perp.SideShort, 50, 100, 10)
-	if !errors.Is(err, ErrPerpServiceDegraded) {
-		t.Fatalf("closing loss err = %v, want ErrPerpServiceDegraded", err)
+	if err := place(1, perp.SideShort, 50, 100, 10); err != nil {
+		t.Fatalf("closing at a loss must succeed: %v", err)
 	}
 
-	// Every later command must be refused with the same sentinel.
-	if err := place(2, perp.SideShort, 90, 10, 10); !errors.Is(err, ErrPerpServiceDegraded) {
-		t.Fatalf("Place after degrade = %v, want ErrPerpServiceDegraded", err)
+	// The loss exceeded the balance: the balance is drained, never negative.
+	if bal := l.Balance(perpAcct(1), 1); bal.Sign() < 0 {
+		t.Fatalf("balance went negative: %s", bal)
 	}
-	if _, err := svc.Cancel(1, perpAcct(2), 1); !errors.Is(err, ErrPerpServiceDegraded) {
-		t.Fatalf("Cancel after degrade = %v, want ErrPerpServiceDegraded", err)
+	// The book keeps accepting orders.
+	if err := place(2, perp.SideShort, 90, 10, 10); err != nil {
+		t.Fatalf("Place after a shortfall = %v, want success", err)
 	}
 }

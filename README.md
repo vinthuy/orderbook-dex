@@ -304,3 +304,57 @@ with an index price of 2000.
    payers can cover; 6c introduces the insurance fund that absorbs the rest.
 3. **Debts can accumulate.** An account may carry funding debt until it closes,
    at which point the debt is retried. 6c's liquidation engine addresses this.
+
+## Liquidation + Insurance Fund (subproject 6c)
+
+6a's worst failure mode was that one account's insolvency halted the whole
+perpetual book (`WithdrawOp` fails → fatal degrade). 6c removes that.
+
+### Maintenance margin
+
+```
+maintenanceMargin = ceil(notional(size, mark) * maintenanceRate / 1e18)
+equity            = margin + unrealizedPnL(mark)
+liquidatable      = equity < maintenanceMargin
+```
+
+Mark price is the trigger, never the last trade — a single print must not
+liquidate anyone.
+
+### Forced close
+
+Every scan (default 1s) closes each liquidatable position with an opposite-side
+market IOC order. The closing order freezes no new margin: the account has none
+left to freeze. An unfillable position (no counterparty) stays open and is
+retried on the next scan, reported as `partial`.
+
+### Shortfall and the insurance fund
+
+When a realized loss exceeds the account's balance:
+
+1. the account is debited only what it holds (never negative),
+2. the insurance fund's balance covers the difference,
+3. a `perp.baddebt` event reports the amount.
+
+The book stays live throughout. If the fund itself is exhausted the bad debt is
+recorded and trading continues — an insolvent fund is an accounting fact, not a
+reason to stop the market.
+
+### Configuration
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `PERP_MAINTENANCE_MARGIN_RATE` | `5000000000000000` | maintenance margin rate, 1e18-scaled (0.5%) |
+| `PERP_LIQUIDATOR_FEE` | `1000000000000000` | liquidation fee, 1e18-scaled (0.1%) |
+| `PERP_INSURANCE_FUND_ACCOUNT` | built-in reserve account | account that absorbs shortfalls |
+| `PERP_LIQUIDATION_INTERVAL` | `1` | liquidation scan interval (seconds) |
+
+### Residual trust assumptions (6c)
+
+1. **The insurance fund is operator-funded.** If it runs dry, bad debt
+   accumulates; ADL is not implemented.
+2. **Liquidation requires a fresh mark.** With a stale or absent index price the
+   scan skips the market — liquidating on a stale price would punish the wrong
+   people.
+3. **Full close, not partial.** v1 closes the entire position at once.
+4. **No fill guarantee.** Thin books can leave a position partially closed.
