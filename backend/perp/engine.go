@@ -2,6 +2,7 @@ package perp
 
 import (
 	"fmt"
+	"math/big"
 
 	"github.com/holiman/uint256"
 
@@ -505,6 +506,35 @@ func (e *Engine) applyFill(m Market, o *Order, qty *uint256.Int, fillPrice Price
 			qtyPrice:   new(uint256.Int).Mul(remainder, uint256.NewInt(uint64(fillPrice))),
 		}
 	}
+}
+
+// UnrealizedPnL returns the signed quote PnL of a position of size base units
+// at mark price (spec §3.7): a long profits when mark > entry, a short the
+// reverse. It returns a signed big.Int because the value may be negative, and
+// it is a pure function over its arguments (no clock, no I/O).
+//
+// This is the DISPLAY/risk figure. Realized PnL on a close keeps using the
+// fill price (applyFill): a closed trade must settle at the price it actually
+// traded at, never at a mark.
+func (m Market) UnrealizedPnL(side Side, size *uint256.Int, entry, mark Price) (*big.Int, error) {
+	if mark == 0 {
+		return nil, fmt.Errorf("%w: unrealized PnL requires a positive mark price", ErrBadRequest)
+	}
+	if size == nil || size.IsZero() {
+		return new(big.Int), nil
+	}
+	entryNotional, err := m.notionalChecked(size, entry, false)
+	if err != nil {
+		return nil, err
+	}
+	markNotional, err := m.notionalChecked(size, mark, false)
+	if err != nil {
+		return nil, err
+	}
+	if side == SideLong {
+		return new(big.Int).Sub(markNotional.ToBig(), entryNotional.ToBig()), nil
+	}
+	return new(big.Int).Sub(entryNotional.ToBig(), markNotional.ToBig()), nil
 }
 
 // releaseResidual appends a release for an order's remaining reserved margin.
