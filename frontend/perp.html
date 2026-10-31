@@ -1,0 +1,606 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Perpetual Trading · Web3 Orderbook DEX</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+    min-height: 100vh; color: #e8ecf4;
+  }
+  .wrap { max-width: 1440px; margin: 0 auto; padding: 16px; }
+  header { display: flex; align-items: baseline; gap: 16px; padding: 12px 0 20px; }
+  h1 {
+    font-size: 1.6em;
+    background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+  }
+  .muted { color: #7b8aa3; font-size: 0.85em; }
+  .grid { display: grid; grid-template-columns: 320px 1fr 320px; gap: 14px; align-items: start; }
+  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+  .card {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px; padding: 14px;
+  }
+  .card h2 { font-size: 0.82em; text-transform: uppercase; letter-spacing: 0.08em; color: #7b8aa3; margin-bottom: 12px; }
+  label { display: block; font-size: 0.78em; color: #7b8aa3; margin: 10px 0 4px; }
+  input, select {
+    width: 100%; padding: 9px 10px; border-radius: 8px; font-size: 0.9em;
+    background: rgba(0, 0, 0, 0.35); border: 1px solid rgba(255, 255, 255, 0.12); color: #e8ecf4;
+  }
+  input:focus, select:focus { outline: none; border-color: #3a7bd5; }
+  .side-row { display: flex; gap: 8px; margin-top: 10px; }
+  .side-btn {
+    flex: 1; padding: 9px; border-radius: 8px; cursor: pointer; font-weight: 600;
+    background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.12); color: #b7c2d4;
+  }
+  .side-btn.active.long { background: rgba(0, 200, 120, 0.2); border-color: #00c878; color: #4be6a8; }
+  .side-btn.active.short { background: rgba(255, 80, 100, 0.2); border-color: #ff5064; color: #ff8595; }
+  button.primary {
+    width: 100%; margin-top: 16px; padding: 11px; border: none; border-radius: 8px;
+    font-weight: 700; cursor: pointer; color: #fff;
+    background: linear-gradient(90deg, #00a2ff, #3a7bd5);
+  }
+  button.primary:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.primary.long { background: linear-gradient(90deg, #00a86b, #00c878); }
+  button.primary.short { background: linear-gradient(90deg, #e03a52, #ff5064); }
+  table { width: 100%; border-collapse: collapse; font-size: 0.82em; }
+  th { text-align: left; color: #7b8aa3; font-weight: 500; padding: 5px 6px; font-size: 0.92em; }
+  td { padding: 5px 6px; border-top: 1px solid rgba(255, 255, 255, 0.05); font-variant-numeric: tabular-nums; }
+  .ask { color: #ff8595; } .bid { color: #4be6a8; }
+  .depth-bar { height: 3px; border-radius: 2px; margin-top: 3px; }
+  .ask .depth-bar { background: rgba(255, 80, 100, 0.4); }
+  .bid .depth-bar { background: rgba(0, 200, 120, 0.4); }
+  .stat { display: flex; justify-content: space-between; padding: 5px 0; font-size: 0.85em; }
+  .stat span:first-child { color: #7b8aa3; }
+  .pos { display: flex; justify-content: space-between; font-size: 0.85em; padding: 6px 0; }
+  .pill { padding: 1px 7px; border-radius: 10px; font-size: 0.85em; }
+  .pill.long { background: rgba(0, 200, 120, 0.18); color: #4be6a8; }
+  .pill.short { background: rgba(255, 80, 100, 0.18); color: #ff8595; }
+  .danger { color: #ff5064; font-weight: 600; }
+  .ok { color: #4be6a8; }
+  #log { font-family: ui-monospace, Consolas, monospace; font-size: 0.76em; max-height: 150px; overflow-y: auto; line-height: 1.55; }
+  #log .err { color: #ff8595; }
+  .warn {
+    background: rgba(255, 180, 0, 0.1); border: 1px solid rgba(255, 180, 0, 0.3);
+    color: #ffcf6b; padding: 9px 11px; border-radius: 8px; font-size: 0.8em; margin-bottom: 14px;
+  }
+  .row { display: flex; gap: 8px; }
+  .row > * { flex: 1; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Perpetual Trading</h1>
+    <span class="muted">Web3 Orderbook DEX</span>
+    <span class="muted" id="conn">未连接</span>
+  </header>
+
+  <div id="notice" class="warn" style="display:none"></div>
+
+  <div class="grid">
+    <!-- order form -->
+    <section class="card">
+      <h2>下单</h2>
+      <label for="market">市场</label>
+      <select id="market"></select>
+
+      <div class="side-row">
+        <button class="side-btn long active" data-side="long" type="button">做多</button>
+        <button class="side-btn short" data-side="short" type="button">做空</button>
+      </div>
+
+      <label for="orderType">类型</label>
+      <select id="orderType">
+        <option value="limit">限价</option>
+        <option value="market">市价</option>
+      </select>
+
+      <div id="priceRow">
+        <label for="price">价格</label>
+        <input id="price" type="number" min="1" step="1" placeholder="100">
+      </div>
+
+      <label for="qty">数量（base）</label>
+      <input id="qty" type="text" inputmode="numeric" placeholder="1000">
+
+      <label for="leverage">杠杆</label>
+      <input id="leverage" type="number" min="1" max="10" value="10">
+
+      <div id="maxNotionalRow" style="display:none">
+        <label for="maxNotional">最大名义额（quote）</label>
+        <input id="maxNotional" type="text" inputmode="numeric" placeholder="10000">
+      </div>
+
+      <div class="stat" style="margin-top:14px">
+        <span>预计保证金</span><span id="estMargin">—</span>
+      </div>
+
+      <button id="submit" class="primary long" type="button">下单（未连接钱包）</button>
+      <div class="stat"><span id="hint"></span></div>
+    </section>
+
+    <!-- depth + market -->
+    <section class="card">
+      <h2>行情 · <span id="markLabel">—</span></h2>
+      <div class="row" style="margin-bottom:12px">
+        <div class="stat"><span>指数价</span><span id="indexPrice">—</span></div>
+        <div class="stat"><span>资金费率</span><span id="fundingRate">—</span></div>
+        <div class="stat"><span>下次结算</span><span id="nextFunding">—</span></div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+        <div>
+          <h2 style="margin-bottom:6px">卖盘（空头挂单）</h2>
+          <table><thead><tr><th>价格</th><th style="text-align:right">数量</th></tr></thead>
+            <tbody id="asks"></tbody></table>
+        </div>
+        <div>
+          <h2 style="margin-bottom:6px">买盘（多头挂单）</h2>
+          <table><thead><tr><th>价格</th><th style="text-align:right">数量</th></tr></thead>
+            <tbody id="bids"></tbody></table>
+        </div>
+      </div>
+    </section>
+
+    <!-- positions + log -->
+    <section class="card">
+      <h2>我的仓位</h2>
+      <div id="positions" class="muted">连接钱包后显示</div>
+
+      <h2 style="margin-top:18px">事件</h2>
+      <div id="log"></div>
+    </section>
+  </div>
+</div>
+
+<script>
+// ---------------------------------------------------------------------------
+// Minimal EIP-712 signer for the perpetual domain. Injected wallets expose
+// eth_signTypedData_v4; this page uses it directly so the flow matches what a
+// production client would do.
+// ---------------------------------------------------------------------------
+const PERP_DOMAIN = { name: 'Web3 Orderbook DEX Perp', version: '1', chainId: 13700,
+  verifyingContract: '0x0000000000000000000000000000000000000000' };
+
+const PERP_ORDER_TYPES = {
+  EIP712Domain: [
+    { name: 'name', type: 'string' }, { name: 'version', type: 'string' },
+    { name: 'chainId', type: 'uint256' }, { name: 'verifyingContract', type: 'address' },
+  ],
+  PerpOrder: [
+    { name: 'market', type: 'uint32' }, { name: 'side', type: 'uint8' },
+    { name: 'type', type: 'uint8' }, { name: 'tif', type: 'uint8' },
+    { name: 'price', type: 'uint64' }, { name: 'qty', type: 'uint256' },
+    { name: 'maxNotional', type: 'uint256' }, { name: 'leverage', type: 'uint32' },
+    { name: 'nonce', type: 'uint64' }, { name: 'expiry', type: 'uint64' },
+  ],
+};
+
+const PERP_CANCEL_TYPES = {
+  EIP712Domain: PERP_ORDER_TYPES.EIP712Domain,
+  PerpCancel: [
+    { name: 'market', type: 'uint32' }, { name: 'orderId', type: 'uint64' },
+    { name: 'nonce', type: 'uint64' }, { name: 'expiry', type: 'uint64' },
+  ],
+};
+
+const API = '';           // same origin as the page
+const state = {
+  side: 'long',
+  type: 'limit',
+  account: null,
+  markets: [],
+  nonce: 0,
+  ws: null,
+  positions: new Map(),
+};
+
+// --- helpers ---------------------------------------------------------------
+const $ = (id) => document.getElementById(id);
+
+function log(msg, isErr) {
+  const el = document.createElement('div');
+  if (isErr) el.className = 'err';
+  el.textContent = new Date().toLocaleTimeString() + '  ' + msg;
+  const box = $('log');
+  box.prepend(el);
+  while (box.childElementCount > 60) box.lastElementChild.remove();
+}
+
+function notice(msg) {
+  const n = $('notice');
+  if (!msg) { n.style.display = 'none'; return; }
+  n.textContent = msg;
+  n.style.display = 'block';
+}
+
+function fmt(v, digits) {
+  if (v === null || v === undefined || v === '') return '—';
+  const n = Number(v);
+  if (!Number.isFinite(n)) return String(v);
+  return n.toLocaleString('en-US', { maximumFractionDigits: digits === undefined ? 4 : digits });
+}
+
+async function api(method, path, body) {
+  const res = await fetch(API + path, {
+    method,
+    headers: body ? { 'Content-Type': 'application/json' } : undefined,
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = null; }
+  if (!res.ok) {
+    // A non-JSON body means the request never reached the API (static server,
+    // proxy 404, gateway error page). Report that plainly instead of rendering
+    // an HTML page inside a one-line banner.
+    if (data === null) {
+      throw new Error('API 不可达（HTTP ' + res.status + '）');
+    }
+    const detail = data.detail ? data.detail : '';
+    throw new Error((data.error ? data.error : 'request_failed') + (detail ? ': ' + detail : ''));
+  }
+  return data;
+}
+
+// --- wallet ----------------------------------------------------------------
+async function connect() {
+  if (!window.ethereum) {
+    notice('未检测到钱包扩展。安装 MetaMask 后刷新，或通过 curl 直接调用 API。');
+    return;
+  }
+  const accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+  state.account = accounts[0].toLowerCase();
+  $('submit').disabled = false;
+  $('submit').textContent = '下单';
+  notice('');
+  log('钱包已连接：' + state.account);
+  await refreshPositions();
+}
+
+// --- markets ---------------------------------------------------------------
+async function loadMarkets() {
+  try {
+    const markets = await api('GET', '/v1/perp/markets');
+    state.markets = markets;
+    const sel = $('market');
+    sel.innerHTML = '';
+    for (const m of markets) {
+      const opt = document.createElement('option');
+      opt.value = m.id;
+      opt.textContent = m.symbol + '  ' + (m.maxLeverage + 'x');
+      sel.appendChild(opt);
+    }
+    const lev = $('leverage');
+    if (markets.length) lev.max = markets[0].maxLeverage;
+    if (!markets.length) {
+      notice('后端已连接，但没有配置永续市场（设置 PERP_MARKETS 后重启）。');
+    }
+  } catch (e) {
+    if (!state.markets.length) {
+      notice('无法加载市场：' + e.message + '。请确认 Go 后端在 8080 端口运行，且本页与本页同源或通过反向代理访问。');
+    }
+  }
+}
+
+function currentMarket() {
+  const id = Number($('market').value);
+  return state.markets.find((m) => Number(m.id) === id);
+}
+
+// --- depth -----------------------------------------------------------------
+function renderDepth(d) {
+  const asks = $('asks'), bids = $('bids');
+  asks.innerHTML = ''; bids.innerHTML = '';
+  const maxTotal = Math.max(
+    1, ...(d.asks || []).map((l) => Number(l.total)), ...(d.bids || []).map((l) => Number(l.total)));
+
+  // Asks render high-to-low so price rises upward.
+  for (const l of (d.asks || []).slice().reverse()) {
+    const tr = document.createElement('tr');
+    tr.className = 'ask';
+    const pct = Math.max(1, (Number(l.total) / maxTotal) * 100);
+    tr.innerHTML = '<td>' + fmt(l.price) + '</td><td style="text-align:right">' + fmt(l.total) +
+      '<div class="depth-bar" style="width:' + pct + '%"></div></td>';
+    asks.appendChild(tr);
+  }
+  for (const l of (d.bids || [])) {
+    const tr = document.createElement('tr');
+    tr.className = 'bid';
+    const pct = Math.max(1, (Number(l.total) / maxTotal) * 100);
+    tr.innerHTML = '<td>' + fmt(l.price) + '</td><td style="text-align:right">' + fmt(l.total) +
+      '<div class="depth-bar" style="width:' + pct + '%"></div></td>';
+    bids.appendChild(tr);
+  }
+}
+
+async function refreshDepth() {
+  const m = currentMarket();
+  if (!m) return;
+  try {
+    renderDepth(await api('GET', '/v1/perp/book/' + m.id + '?depth=12'));
+  } catch (e) { /* transient */ }
+}
+
+async function refreshMark() {
+  const m = currentMarket();
+  if (!m) return;
+  try {
+    const mark = await api('GET', '/v1/perp/mark/' + m.id);
+    $('markLabel').textContent = '标记价 ' + fmt(mark.markPrice);
+    if (mark.indexPrice !== undefined) $('indexPrice').textContent = fmt(mark.indexPrice);
+  } catch {
+    $('markLabel').textContent = '标记价 —';
+  }
+  try {
+    const f = await api('GET', '/v1/perp/funding/' + m.id);
+    const rate = Number(f.rate) / 1e18;
+    $('fundingRate').textContent = (rate * 100).toFixed(4) + '%';
+    $('nextFunding').textContent = '每小时';
+  } catch {
+    // No funding round has run yet: show the configured cadence rather than a
+    // blank, because "0%" and "not yet" mean different things to a trader.
+    $('fundingRate').textContent = '待首轮';
+    $('nextFunding').textContent = '每小时';
+  }
+}
+
+// --- positions -------------------------------------------------------------
+async function refreshPositions() {
+  if (!state.account) return;
+  try {
+    const ps = await api('GET', '/v1/perp/positions/' + state.account);
+    renderPositions(ps);
+  } catch (e) {
+    log('读取仓位失败：' + e.message, true);
+  }
+}
+
+function renderPositions(ps) {
+  const box = $('positions');
+  if (!ps.length) {
+    box.innerHTML = '<div class="muted">无持仓</div>';
+    return;
+  }
+  box.innerHTML = '';
+  for (const p of ps) {
+    const div = document.createElement('div');
+    div.className = 'pos';
+    const pnl = p.unrealizedPnl === undefined ? '—' : fmt(p.unrealizedPnl, 2);
+    const pnlCls = Number(p.unrealizedPnl) < 0 ? 'danger' : 'ok';
+    div.innerHTML =
+      '<div><span class="pill ' + p.side + '">' + p.side + '</span> ' + fmt(p.size) + ' @ ' + fmt(p.entryPrice) + '</div>' +
+      '<div class="' + pnlCls + '">' + pnl +
+      (p.liquidatable ? ' <span class="danger">可强平</span>' : '') + '</div>';
+    box.appendChild(div);
+  }
+}
+
+// --- margin estimate -------------------------------------------------------
+// Mirrors the kernel: required = ceil(notional(qty, price) / leverage), with
+// notional = floor(qty * price / 10^baseDecimals). Uses BigInt because qty is a
+// decimal string that can exceed 2^53.
+function recalcMargin() {
+  const m = currentMarket();
+  const out = $('estMargin');
+  if (!m) { out.textContent = '—'; return; }
+
+  const qtyStr = $('qty').value.trim();
+  const lev = Number($('leverage').value || 0);
+  const isMarket = state.type === 'market';
+  const priceStr = isMarket ? $('maxNotional').value.trim() : $('price').value.trim();
+
+  if (!qtyStr || !/^\d+$/.test(qtyStr) || lev < 1) { out.textContent = '—'; return; }
+
+  let notional;
+  try {
+    if (isMarket) {
+      if (!priceStr || !/^\d+$/.test(priceStr)) { out.textContent = '—'; return; }
+      notional = BigInt(priceStr);            // MaxNotional IS the quote cap
+    } else {
+      const price = BigInt(priceStr || '0');
+      if (price <= 0n) { out.textContent = '—'; return; }
+      const scale = 10n ** BigInt(m.baseDecimals || 0);
+      notional = (BigInt(qtyStr) * price) / scale;
+    }
+    const levB = BigInt(lev);
+    const required = (notional + levB - 1n) / levB;   // ceil
+    out.textContent = required.toLocaleString('en-US') + ' quote';
+  } catch {
+    out.textContent = '—';
+  }
+}
+
+
+function nextNonce() {
+  state.nonce += 1;
+  return state.nonce;
+}
+
+async function signTypedData(types, primaryType, message) {
+  return window.ethereum.request({
+    method: 'eth_signTypedData_v4',
+    params: [state.account, JSON.stringify({
+      domain: PERP_DOMAIN, types, primaryType, message,
+    })],
+  });
+}
+
+async function submit() {
+  const m = currentMarket();
+  if (!m) { notice('没有可用市场'); return; }
+
+  const qty = $('qty').value.trim();
+  if (!qty || !/^\d+$/.test(qty)) { notice('数量必须是正整数（base 最小单位）'); return; }
+
+  const isMarket = state.type === 'market';
+  const price = isMarket ? 0 : Number($('price').value || 0);
+  if (!isMarket && price <= 0) { notice('限价单需要价格'); return; }
+
+  const maxNotional = $('maxNotional').value.trim();
+  if (isMarket && (!maxNotional || !/^\d+$/.test(maxNotional))) {
+    notice('市价单需要最大名义额');
+    return;
+  }
+
+  const order = {
+    market: Number(m.id),
+    side: state.side === 'long' ? 0 : 1,
+    type: isMarket ? 1 : 0,
+    tif: isMarket ? 1 : 0,        // market orders must be IOC
+    price: price,
+    qty: qty,
+    maxNotional: maxNotional || '0',
+    leverage: Number($('leverage').value || 1),
+    nonce: nextNonce(),
+    expiry: Math.floor(Date.now() / 1000) + 300,
+  };
+
+  let signature;
+  try {
+    signature = await signTypedData(PERP_ORDER_TYPES, 'PerpOrder', order);
+  } catch (e) {
+    log('签名被拒绝：' + (e.message || e), true);
+    return;
+  }
+
+  try {
+    const res = await api('POST', '/v1/perp/orders', { order, signature });
+    log('订单已提交：' + (res.order ? '#' + res.order.id + ' ' + res.order.status : 'ok') +
+      (res.trades && res.trades.length ? '，成交 ' + res.trades.length + ' 笔' : ''));
+    await refreshDepth();
+    await refreshPositions();
+  } catch (e) {
+    log('下单失败：' + e.message, true);
+  }
+}
+
+// --- websocket -------------------------------------------------------------
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(proto + '//' + location.host + '/ws/perp');
+  state.ws = ws;
+
+  ws.onopen = () => {
+    $('conn').textContent = '已连接';
+    subscribe();
+  };
+  ws.onclose = () => {
+    $('conn').textContent = '已断开，重连中…';
+    setTimeout(connectWS, 2000);
+  };
+  ws.onerror = () => { /* onclose handles recovery */ };
+  ws.onmessage = (ev) => {
+    let fr;
+    try { fr = JSON.parse(ev.data); } catch { return; }
+    switch (fr.type) {
+      case 'depth': renderDepth(fr.data); break;
+      case 'mark':
+        $('markLabel').textContent = '标记价 ' + fmt(fr.data.mark);
+        $('indexPrice').textContent = fmt(fr.data.index);
+        break;
+      case 'trade':
+        log('成交 ' + fmt(fr.data.qty) + ' @ ' + fmt(fr.data.price));
+        break;
+      case 'liquidation':
+        log('强平 ' + fr.data.account + '，数量 ' + fmt(fr.data.size), true);
+        break;
+      case 'baddebt':
+        log('坏账 ' + fmt(fr.data.amount) + '（保险基金承担）', true);
+        break;
+      case 'degraded':
+        notice('永续服务已降级，请重启后端。');
+        break;
+      case 'funding':
+        log('资金费结算：费率 ' + (Number(fr.data.rate) / 1e16).toFixed(4) + '%');
+        break;
+    }
+  };
+}
+
+function subscribe() {
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  const m = currentMarket();
+  if (!m) return;
+  const msg = { op: 'subscribe', market: Number(m.id) };
+  if (state.account) msg.account = state.account;
+  state.ws.send(JSON.stringify(msg));
+}
+
+// --- bootstrap -------------------------------------------------------------
+function setSide(side) {
+  state.side = side;
+  document.querySelectorAll('.side-btn').forEach((b) => {
+    b.classList.toggle('active', b.dataset.side === side);
+  });
+  $('submit').classList.remove('long', 'short');
+  $('submit').classList.add(side);
+  recalcMargin();
+}
+
+function setType(type) {
+  state.type = type;
+  const isMarket = type === 'market';
+  $('priceRow').style.display = isMarket ? 'none' : 'block';
+  $('maxNotionalRow').style.display = isMarket ? 'block' : 'none';
+  recalcMargin();
+}
+
+document.querySelectorAll('.side-btn').forEach((b) => {
+  b.addEventListener('click', () => setSide(b.dataset.side));
+});
+$('orderType').addEventListener('change', (e) => setType(e.target.value));
+$('submit').addEventListener('click', submit);
+['qty', 'price', 'leverage', 'maxNotional'].forEach((id) => {
+  $(id).addEventListener('input', recalcMargin);
+});
+$('market').addEventListener('change', () => {
+  subscribe();
+  refreshDepth();
+  refreshMark();
+  recalcMargin();
+});
+
+if (window.ethereum) {
+  window.ethereum.request({ method: 'eth_accounts' }).then((accs) => {
+    if (accs && accs.length) {
+      state.account = accs[0].toLowerCase();
+      $('submit').disabled = false;
+      $('submit').textContent = '下单';
+      refreshPositions();
+    } else {
+      $('submit').textContent = '连接钱包';
+      $('submit').disabled = false;
+      $('submit').onclick = connect;
+    }
+  });
+  window.ethereum.on('accountsChanged', (accs) => {
+    state.account = accs && accs.length ? accs[0].toLowerCase() : null;
+    location.reload();
+  });
+} else {
+  $('submit').textContent = '未检测到钱包';
+  $('submit').disabled = true;
+  notice('未检测到钱包扩展。页面只读可用：行情、深度和历史仓位仍会从 API 加载。');
+}
+
+(async function init() {
+  await loadMarkets();
+  await refreshDepth();
+  await refreshMark();
+  recalcMargin();
+  connectWS();
+  setInterval(refreshDepth, 5000);
+  setInterval(refreshMark, 5000);
+  setInterval(refreshPositions, 3000);
+})();
+
+</script>
+</body>
+</html>
+
