@@ -122,3 +122,26 @@ func TestLoadSettlementConfigOrderBookDefaultsEmpty(t *testing.T) {
         t.Fatalf("order book config should default empty: %+v", cfg)
     }
 }
+
+func TestLoadGatewayConfig(t *testing.T) {
+    t.Setenv("EIP712_DOMAIN_NAME", "Test DEX")
+    t.Setenv("EIP712_DOMAIN_VERSION", "2")
+    t.Setenv("GATEWAY_RATE", "7")
+    t.Setenv("GATEWAY_BURST", "13")
+    t.Setenv("GATEWAY_NONCE_DIR", "/tmp/nonces")
+    t.Setenv("CHAIN_ID", "999")
+
+    cfg := LoadGatewayConfig()
+    if cfg.DomainName != "Test DEX" || cfg.DomainVersion != "2" {
+        t.Fatalf("domain = %q/%q", cfg.DomainName, cfg.DomainVersion)
+    }
+    if cfg.Rate != 7 || cfg.Burst != 13 {
+        t.Fatalf("rate/burst = %v/%v", cfg.Rate, cfg.Burst)
+    }
+    if cfg.NonceDir != "/tmp/nonces" {
+        t.Fatalf("nonceDir = %q", cfg.NonceDir)
+    }
+    if cfg.ChainID != 999 {
+        t.Fatalf("chainID = %d", cfg.ChainID)
+    }
+}

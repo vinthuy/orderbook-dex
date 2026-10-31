@@ -83,3 +83,50 @@ func LoadSettlementConfig() SettlementConfig {
 func (c SettlementConfig) AnchorInterval() time.Duration {
     return time.Duration(c.AnchorIntervalSeconds) * time.Second
 }
+
+// GatewayConfig configures the order-book gateway (subproject 4).
+type GatewayConfig struct {
+    DomainName    string
+    DomainVersion string
+    Rate          float64
+    Burst         float64
+    NonceDir      string
+    ChainID       int64
+}
+
+// LoadGatewayConfig reads gateway settings from the environment. ChainID is
+// shared with the settlement subsystem and defaults to 13700.
+func LoadGatewayConfig() GatewayConfig {
+    cfg := GatewayConfig{
+        DomainName:    "Web3 Orderbook DEX",
+        DomainVersion: "1",
+        Rate:          10,
+        Burst:         20,
+        ChainID:       13700,
+    }
+    if v := os.Getenv("EIP712_DOMAIN_NAME"); v != "" {
+        cfg.DomainName = v
+    }
+    if v := os.Getenv("EIP712_DOMAIN_VERSION"); v != "" {
+        cfg.DomainVersion = v
+    }
+    if v := os.Getenv("GATEWAY_RATE"); v != "" {
+        if n, err := strconv.ParseFloat(v, 64); err == nil && n >= 0 {
+            cfg.Rate = n
+        }
+    }
+    if v := os.Getenv("GATEWAY_BURST"); v != "" {
+        if n, err := strconv.ParseFloat(v, 64); err == nil && n >= 0 {
+            cfg.Burst = n
+        }
+    }
+    if v := os.Getenv("GATEWAY_NONCE_DIR"); v != "" {
+        cfg.NonceDir = v
+    }
+    if v := os.Getenv("CHAIN_ID"); v != "" {
+        if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+            cfg.ChainID = n
+        }
+    }
+    return cfg
+}
