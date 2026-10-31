@@ -1,7 +1,10 @@
 package perp
 
 import (
+	"bytes"
 	"fmt"
+	"math/big"
+	"sort"
 
 	"github.com/holiman/uint256"
 
@@ -130,6 +133,24 @@ func (e *Engine) Position(m MarketID, a ledger.AccountID) (*Position, bool) {
 		return nil, false
 	}
 	return p.clone(), true
+}
+
+// Positions returns copies of every open position in a market, ordered by
+// account so the order is stable across runs (funding settlement and any other
+// per-position loop must be deterministic).
+func (e *Engine) Positions(m MarketID) []Position {
+	byAcct := e.positions[m]
+	if len(byAcct) == 0 {
+		return nil
+	}
+	out := make([]Position, 0, len(byAcct))
+	for _, p := range byAcct {
+		out = append(out, *p.clone())
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i].Account[:], out[j].Account[:]) < 0
+	})
+	return out
 }
 
 // OpenMargins returns the total frozen margin per (account, quote asset) that
@@ -505,6 +526,35 @@ func (e *Engine) applyFill(m Market, o *Order, qty *uint256.Int, fillPrice Price
 			qtyPrice:   new(uint256.Int).Mul(remainder, uint256.NewInt(uint64(fillPrice))),
 		}
 	}
+}
+
+// UnrealizedPnL returns the signed quote PnL of a position of size base units
+// at mark price (spec §3.7): a long profits when mark > entry, a short the
+// reverse. It returns a signed big.Int because the value may be negative, and
+// it is a pure function over its arguments (no clock, no I/O).
+//
+// This is the DISPLAY/risk figure. Realized PnL on a close keeps using the
+// fill price (applyFill): a closed trade must settle at the price it actually
+// traded at, never at a mark.
+func (m Market) UnrealizedPnL(side Side, size *uint256.Int, entry, mark Price) (*big.Int, error) {
+	if mark == 0 {
+		return nil, fmt.Errorf("%w: unrealized PnL requires a positive mark price", ErrBadRequest)
+	}
+	if size == nil || size.IsZero() {
+		return new(big.Int), nil
+	}
+	entryNotional, err := m.notionalChecked(size, entry, false)
+	if err != nil {
+		return nil, err
+	}
+	markNotional, err := m.notionalChecked(size, mark, false)
+	if err != nil {
+		return nil, err
+	}
+	if side == SideLong {
+		return new(big.Int).Sub(markNotional.ToBig(), entryNotional.ToBig()), nil
+	}
+	return new(big.Int).Sub(entryNotional.ToBig(), markNotional.ToBig()), nil
 }
 
 // releaseResidual appends a release for an order's remaining reserved margin.

@@ -115,6 +115,36 @@ func main() {
 		if err := settlement.Holds.Reconcile(services.UnionHolds(spotReserves, perpsvc.OpenMargins())); err != nil {
 			log.Fatalf("Failed to reconcile spot+perp holds: %v", err)
 		}
+
+		// Subproject 6b: mark prices and funding. Without PERP_INDEX_PRICES the
+		// service keeps pure 6a behaviour (PnL at fill price, no funding).
+		fc := config.LoadPerpFundingConfig()
+		if fc.IndexPrices != "" {
+			prices, err := services.ParseIndexPrices(fc.IndexPrices)
+			if err != nil {
+				log.Fatalf("Failed to parse PERP_INDEX_PRICES: %v", err)
+			}
+			maxRate, err := uint256.FromDecimal(fc.MaxFundingRateE18)
+			if err != nil {
+				log.Fatalf("Failed to parse PERP_MAX_FUNDING_RATE: %v", err)
+			}
+			maxDev, err := uint256.FromDecimal(fc.MarkMaxDeviationE18)
+			if err != nil {
+				log.Fatalf("Failed to parse PERP_MARK_MAX_DEVIATION: %v", err)
+			}
+			perpsvc.SetPriceSource(prices, services.PriceOptions{
+				MaxPriceAge:     fc.MaxPriceAge(),
+				MaxMarkStaleAge: fc.MaxMarkStaleness(),
+			})
+			perpsvc.SetFundingOptions(services.FundingOptions{
+				Tick:         fc.Tick(),
+				Interval:     fc.FundingInterval(),
+				MaxRateE18:   maxRate,
+				MaxDeviation: maxDev,
+			})
+			log.Printf("perp mark price + funding enabled (interval %s)", fc.FundingInterval())
+		}
+
 		log.Printf("perpetual order book mounted (%d markets)", len(perpMarkets))
 	}
 

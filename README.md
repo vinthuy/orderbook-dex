@@ -233,7 +233,7 @@ backend/config/config.go  # PERP_* configuration
 ```
 
 ### Known gaps (6a)
-- No mark price or funding rate (6b); PnL uses the trade price.
+- No mark price or funding rate (6b — now implemented, see below); PnL uses the trade price.
 - No liquidation engine (6c): a loss exceeding margin causes a fatal degrade
   rather than forced liquidation.
 
@@ -247,3 +247,60 @@ Example: `PERP_MARKETS=1:ETH-PERP:2:1:18:10:1000000000000000` (market 1, base
 asset 2, quote asset 1, 18 base decimals, 10x max leverage, minimum 0.001 base
 units). A malformed value fails startup instead of silently trading a subset of
 the configured markets.
+
+## Mark Price + Funding (subproject 6b)
+
+Perpetual PnL on close still uses the **fill price** (a closed trade settles at
+the price it traded at). The **mark price** is the pricing reference for
+unrealized PnL and for funding.
+
+### Mark price
+
+```
+mid     = (bestBid + bestAsk) / 2         (one-sided uses that side; empty book -> index)
+clamped = clamp(mid, index*(1-dev), index*(1+dev))
+mark    = (index*wi + clamped*wb) / (wi + wb)
+```
+
+Defaults: `dev = 0.5%`, `wi = wb = 1`. Clamping the book contribution is what
+stops a single large order on a thin book from dragging the mark.
+
+### Funding rate
+
+```
+premium = (mark - index) / index
+rate    = clamp(premium / intervalHours, -maxRate, +maxRate)
+```
+
+Positive rate: longs pay shorts. Each position pays
+`floor(notional(size, mark) * |rate| / 1e18)`. A round is journaled **before**
+any ledger mutation and every transfer's idempotency key carries the round
+index, so replaying the WAL cannot pay a round twice.
+
+A payer without enough **available** balance has the shortfall recorded as a
+debt and retried in a later round. Funding never degrades the book the way a
+failed PnL settlement does.
+
+### Configuration
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `PERP_INDEX_PRICES` | (empty) | `ID:PRICE;...` static index prices. Empty = marks and funding off (pure 6a) |
+| `PERP_TICK_INTERVAL` | `5` | price refresh interval (seconds) |
+| `PERP_FUNDING_INTERVAL` | `3600` | funding period (seconds) |
+| `PERP_MAX_PRICE_AGE` | `60` | index staleness threshold (seconds) |
+| `PERP_MAX_MARK_STALENESS` | `300` | how long a stale index may reuse the last mark (seconds) |
+| `PERP_MAX_FUNDING_RATE` | `7500000000000000` | funding-rate cap, 1e18-scaled (0.75%) |
+| `PERP_MARK_MAX_DEVIATION` | `5000000000000000` | max book deviation from index, 1e18-scaled (0.5%) |
+
+Example: `PERP_INDEX_PRICES=1:2000` enables marks and hourly funding for market 1
+with an index price of 2000.
+
+### Residual trust assumptions (6b)
+
+1. **The oracle is an operator trust point.** v1 uses operator-configured index
+   prices; a median-of-venues source or an on-chain oracle is future work.
+2. **Unbalanced funding is not netted through a fund.** A round only moves what
+   payers can cover; 6c introduces the insurance fund that absorbs the rest.
+3. **Debts can accumulate.** An account may carry funding debt until it closes,
+   at which point the debt is retried. 6c's liquidation engine addresses this.

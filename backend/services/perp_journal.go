@@ -161,9 +161,82 @@ func (j *PerpJournal) append(kind string, payload any) error {
 
 // PerpInstruction is one decoded instruction for replay.
 type PerpInstruction struct {
-	Kind   string // "place" | "cancel"
-	Place  *perp.PlaceRequest
-	Cancel *perpCancelInstruction
+	Kind    string // "place" | "cancel" | "mark" | "funding"
+	Place   *perp.PlaceRequest
+	Cancel  *perpCancelInstruction
+	Mark    *MarkCmd
+	Funding *FundingCmd
+}
+
+// MarkCmd records one observed price observation. It is journaled so a replay
+// rebuilds the exact mark-price history instead of re-reading an oracle whose
+// price may have moved (spec §3.5).
+type MarkCmd struct {
+	Market perp.MarketID
+	Index  perp.Price
+	Mark   perp.Price
+	At     int64
+}
+
+// FundingLeg is one netted funding payment: Payer is debited and Receiver
+// credited, both in Amount of the market's quote asset.
+type FundingLeg struct {
+	Payer    ledger.AccountID
+	Receiver ledger.AccountID
+	Amount   *uint256.Int
+}
+
+// FundingCmd records one funding round. Index identifies the round and is part
+// of every settlement's idempotency key, so replaying the WAL cannot pay twice.
+type FundingCmd struct {
+	Market perp.MarketID
+	Index  uint64
+	Rate   string // signed, 1e18-scaled decimal
+	Mark   perp.Price
+	At     int64
+	Legs   []FundingLeg
+}
+
+type perpMarkJSON struct {
+	Market uint32 `json:"market"`
+	Index  uint64 `json:"index_price"`
+	Mark   uint64 `json:"mark_price"`
+	At     int64  `json:"at"`
+}
+
+type perpFundingLegJSON struct {
+	Payer    string `json:"payer"`
+	Receiver string `json:"receiver"`
+	Amount   string `json:"amount"`
+}
+
+type perpFundingJSON struct {
+	Market uint32               `json:"market"`
+	Index  uint64               `json:"funding_index"`
+	Rate   string               `json:"rate"`
+	Mark   uint64               `json:"mark_price"`
+	At     int64                `json:"at"`
+	Legs   []perpFundingLegJSON `json:"legs"`
+}
+
+// AppendMark records one price observation durably.
+func (j *PerpJournal) AppendMark(c MarkCmd) error {
+	return j.append("mark", perpMarkJSON{
+		Market: uint32(c.Market), Index: uint64(c.Index), Mark: uint64(c.Mark), At: c.At,
+	})
+}
+
+// AppendFunding records one funding round durably, before any ledger mutation.
+func (j *PerpJournal) AppendFunding(c FundingCmd) error {
+	payload := perpFundingJSON{
+		Market: uint32(c.Market), Index: c.Index, Rate: c.Rate, Mark: uint64(c.Mark), At: c.At,
+	}
+	for _, l := range c.Legs {
+		payload.Legs = append(payload.Legs, perpFundingLegJSON{
+			Payer: l.Payer.Hex(), Receiver: l.Receiver.Hex(), Amount: l.Amount.Dec(),
+		})
+	}
+	return j.append("funding", payload)
 }
 
 type perpCancelInstruction struct {
@@ -250,6 +323,40 @@ func (j *PerpJournal) Replay() ([]PerpInstruction, error) {
 			out = append(out, PerpInstruction{Kind: "cancel", Cancel: &perpCancelInstruction{
 				Market: perp.MarketID(c.Market), Account: account, OrderID: perp.OrderID(c.OrderID),
 			}})
+		case "mark":
+			var mk perpMarkJSON
+			if err := json.Unmarshal(ln.Payload, &mk); err != nil {
+				return nil, err
+			}
+			out = append(out, PerpInstruction{Kind: "mark", Mark: &MarkCmd{
+				Market: perp.MarketID(mk.Market), Index: perp.Price(mk.Index),
+				Mark: perp.Price(mk.Mark), At: mk.At,
+			}})
+		case "funding":
+			var fd perpFundingJSON
+			if err := json.Unmarshal(ln.Payload, &fd); err != nil {
+				return nil, err
+			}
+			cmd := FundingCmd{
+				Market: perp.MarketID(fd.Market), Index: fd.Index, Rate: fd.Rate,
+				Mark: perp.Price(fd.Mark), At: fd.At,
+			}
+			for _, l := range fd.Legs {
+				payer, err := ledger.AccountFromHex(l.Payer)
+				if err != nil {
+					return nil, err
+				}
+				receiver, err := ledger.AccountFromHex(l.Receiver)
+				if err != nil {
+					return nil, err
+				}
+				amount, err := uint256.FromDecimal(l.Amount)
+				if err != nil {
+					return nil, fmt.Errorf("services: bad funding amount %q: %w", l.Amount, err)
+				}
+				cmd.Legs = append(cmd.Legs, FundingLeg{Payer: payer, Receiver: receiver, Amount: amount})
+			}
+			out = append(out, PerpInstruction{Kind: "funding", Funding: &cmd})
 		default:
 			return nil, fmt.Errorf("services: unknown perp journal kind %q", ln.Kind)
 		}
