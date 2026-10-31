@@ -251,3 +251,47 @@ func (c PerpFundingConfig) MaxPriceAge() time.Duration {
 func (c PerpFundingConfig) MaxMarkStaleness() time.Duration {
     return time.Duration(c.MaxMarkStalenessSeconds) * time.Second
 }
+
+// PerpRiskConfig configures maintenance margin and forced liquidation
+// (subproject 6c).
+type PerpRiskConfig struct {
+    // MaintenanceMarginRate is the fraction of notional a position must keep as
+    // equity, 1e18-scaled.
+    MaintenanceMarginRate string
+    // LiquidatorFee is the fraction of notional paid to the liquidator, 1e18-scaled.
+    LiquidatorFee string
+    // InsuranceFundAccount is the hex account that absorbs losses beyond a
+    // trader's margin. Empty means the built-in reserve account.
+    InsuranceFundAccount string
+    // LiquidationIntervalSeconds is the pause between liquidation scans.
+    LiquidationIntervalSeconds int64
+}
+
+// LoadPerpRiskConfig reads 6c settings from the environment.
+func LoadPerpRiskConfig() PerpRiskConfig {
+    cfg := PerpRiskConfig{
+        MaintenanceMarginRate:      "5000000000000000", // 0.5%
+        LiquidatorFee:              "1000000000000000", // 0.1%
+        LiquidationIntervalSeconds: 1,
+    }
+    if v := os.Getenv("PERP_MAINTENANCE_MARGIN_RATE"); v != "" {
+        cfg.MaintenanceMarginRate = v
+    }
+    if v := os.Getenv("PERP_LIQUIDATOR_FEE"); v != "" {
+        cfg.LiquidatorFee = v
+    }
+    if v := os.Getenv("PERP_INSURANCE_FUND_ACCOUNT"); v != "" {
+        cfg.InsuranceFundAccount = v
+    }
+    if v := os.Getenv("PERP_LIQUIDATION_INTERVAL"); v != "" {
+        if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+            cfg.LiquidationIntervalSeconds = n
+        }
+    }
+    return cfg
+}
+
+// LiquidationInterval is the scan period.
+func (c PerpRiskConfig) LiquidationInterval() time.Duration {
+    return time.Duration(c.LiquidationIntervalSeconds) * time.Second
+}

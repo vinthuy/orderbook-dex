@@ -557,6 +557,123 @@ func (m Market) UnrealizedPnL(side Side, size *uint256.Int, entry, mark Price) (
 	return new(big.Int).Sub(entryNotional.ToBig(), markNotional.ToBig()), nil
 }
 
+// Liquidate force-closes a position by submitting an opposite-side IOC order
+// without freezing new margin (spec §3.2). The account is already short of
+// equity, so there is nothing left to reserve; the closing leg releases the
+// position's remaining margin proportionally, exactly as a reduce would.
+//
+// An IOC order that cannot fully fill leaves the residual position open; the
+// caller sees that in the returned Order status and may retry next scan.
+func (e *Engine) Liquidate(m MarketID, a ledger.AccountID, maxQty *uint256.Int) (Result, error) {
+	market, ok := e.byID[m]
+	if !ok {
+		return Result{}, ErrUnknownMarket
+	}
+	pos, ok := e.positions[m][a]
+	if !ok || pos.Size == nil || pos.Size.IsZero() {
+		return Result{}, ErrOrderNotFound
+	}
+	qty := cloneInt(pos.Size)
+	if maxQty != nil && maxQty.Cmp(qty) < 0 {
+		qty = cloneInt(maxQty)
+	}
+	if qty.IsZero() {
+		return Result{}, fmt.Errorf("%w: liquidation qty is zero", ErrBadRequest)
+	}
+
+	// The closing side is the opposite of the position.
+	side := SideLong
+	if pos.Side == SideLong {
+		side = SideShort
+	}
+
+	// Build the order by hand: Place would validate leverage and derive a margin
+	// freeze, neither of which applies to a forced close.
+	e.nextID++
+	e.nextSeq++
+	o := &Order{
+		ID:      e.nextID,
+		Seq:     e.nextSeq,
+		Market:  m,
+		Account: a,
+		Side:    side,
+		Type:    TypeMarket,
+		TIF:     TIFIOC,
+		Price:   0,
+		Qty:     qty,
+		// MaxNotional lets the market-order path cap its own spending. It is a
+		// safety bound only: the close is qty-limited, and the reduce branch of
+		// applyFill never consumes order reserve.
+		MaxNotional: nil,
+		Leverage:    pos.Leverage,
+		Filled:      uint256.NewInt(0),
+		Status:      StatusNew,
+		reserved:    uint256.NewInt(0),
+	}
+	e.all[o.ID] = o
+
+	bk := e.books[m]
+	opp := bk.asks
+	if side == SideShort {
+		opp = bk.bids
+	}
+
+	var (
+		trades   []Trade
+		releases []MarginRelease
+		pnl      []PnLSettlement
+	)
+	for o.Remaining().Sign() > 0 {
+		maker := opp.bestOrder()
+		if maker == nil {
+			break
+		}
+		price := maker.Price
+		tradeQty := minUint(o.Remaining(), maker.Remaining())
+		if maker.Account == a {
+			// Self-trade prevention: a liquidator's own resting order is skipped.
+			bk.cancel(maker)
+			maker.Status = StatusCancelled
+			continue
+		}
+
+		e.nextTrade++
+		trades = append(trades, Trade{
+			ID:         e.nextTrade,
+			Market:     m,
+			Price:      price,
+			Qty:        cloneInt(tradeQty),
+			Notional:   cloneInt(market.Notional(tradeQty, price)),
+			MakerOrder: maker.ID,
+			TakerOrder: o.ID,
+			Maker:      maker.Account,
+			Taker:      a,
+			MakerSide:  maker.Side,
+		})
+
+		o.Filled.Add(o.Filled, tradeQty)
+		bk.reduce(maker, tradeQty)
+		if maker.Remaining().IsZero() {
+			maker.Status = StatusFilled
+		} else {
+			maker.Status = StatusPartiallyFilled
+		}
+
+		e.applyFill(market, o, tradeQty, price, e.nextTrade, &releases, &pnl)
+		e.applyFill(market, maker, tradeQty, price, e.nextTrade, &releases, &pnl)
+		if maker.Remaining().IsZero() {
+			e.releaseResidual(maker, &releases)
+		}
+	}
+
+	if o.Remaining().IsZero() {
+		o.Status = StatusFilled
+	} else {
+		o.Status = StatusCancelled
+	}
+	return Result{Order: o.clone(), Trades: trades, Releases: releases, PnL: pnl}, nil
+}
+
 // releaseResidual appends a release for an order's remaining reserved margin.
 func (e *Engine) releaseResidual(o *Order, out *[]MarginRelease) {
 	if o.reserved == nil || o.reserved.Sign() == 0 {

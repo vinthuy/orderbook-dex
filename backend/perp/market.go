@@ -107,6 +107,7 @@ type Market struct {
 	MinQty       *uint256.Int   // optional minimum base quantity
 	MaxQty       *uint256.Int   // optional maximum base quantity (nil = 2^128)
 	MarkConfig   MarkConfig     // mark-price derivation (zero value = defaults)
+	RiskConfig   RiskConfig     // maintenance margin and liquidation fee (zero = defaults)
 }
 
 const maxBaseDecimals = 76

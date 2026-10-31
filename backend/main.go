@@ -15,6 +15,7 @@ import (
 	"web3-amm-dex-backend/handlers"
 	"web3-amm-dex-backend/indexer"
 	"web3-amm-dex-backend/ledger"
+	"web3-amm-dex-backend/perp"
 	"web3-amm-dex-backend/services"
 )
 
@@ -91,6 +92,24 @@ func main() {
 		if err != nil {
 			log.Fatalf("Failed to parse PERP_MARKETS: %v", err)
 		}
+		// 6c risk parameters apply to every configured market. They must be
+		// parsed before the engine is built, since the engine copies the market
+		// configuration at construction.
+		rc := config.LoadPerpRiskConfig()
+		maintenanceRate, err := uint256.FromDecimal(rc.MaintenanceMarginRate)
+		if err != nil {
+			log.Fatalf("Failed to parse PERP_MAINTENANCE_MARGIN_RATE: %v", err)
+		}
+		liquidatorFee, err := uint256.FromDecimal(rc.LiquidatorFee)
+		if err != nil {
+			log.Fatalf("Failed to parse PERP_LIQUIDATOR_FEE: %v", err)
+		}
+		for i := range perpMarkets {
+			perpMarkets[i].RiskConfig = perp.RiskConfig{
+				MaintenanceMarginRateE18: maintenanceRate,
+				LiquidatorFeeE18:         liquidatorFee,
+			}
+		}
 		perpJournal, err := services.NewPerpJournal(pc.DataDir)
 		if err != nil {
 			log.Fatalf("Failed to open perp journal: %v", err)
@@ -144,6 +163,21 @@ func main() {
 			})
 			log.Printf("perp mark price + funding enabled (interval %s)", fc.FundingInterval())
 		}
+
+		// Subproject 6c: forced liquidation. This runs regardless of whether a
+		// price source is configured -- without one the scan is a no-op (it never
+		// liquidates on an absent price), but the shortfall path is always live.
+		if rc.InsuranceFundAccount != "" {
+			fund, err := ledger.AccountFromHex(rc.InsuranceFundAccount)
+			if err != nil {
+				log.Fatalf("Failed to parse PERP_INSURANCE_FUND_ACCOUNT: %v", err)
+			}
+			perpsvc.SetInsuranceFund(fund)
+		}
+		perpsvc.SetLiquidationOptions(services.LiquidationOptions{
+			Interval: rc.LiquidationInterval(),
+		})
+		log.Printf("perp liquidation enabled (interval %s)", rc.LiquidationInterval())
 
 		log.Printf("perpetual order book mounted (%d markets)", len(perpMarkets))
 	}
