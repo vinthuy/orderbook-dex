@@ -403,3 +403,20 @@ per-account nonce log persisted under `GATEWAY_NONCE_DIR/perp`.
    succeeding. Malformed input (bad length, out-of-range or zero `r`/`s`, high-`s`,
    `v ∉ {0,1}`) is rejected early as defence in depth.
 2. **Read endpoints are unauthenticated**, matching the spot gateway.
+
+## Perpetual Trading UI (subproject 7b)
+
+`frontend/perp.html` is a single-file trading client: order entry (limit and
+market, long/short with user leverage), live depth from `/v1/perp/book`, mark and
+index price, funding rate, and positions with unrealized PnL and a liquidatable
+flag. Order submission signs EIP-712 `PerpOrder` via an injected wallet
+(`eth_signTypedData_v4`) and posts to `/v1/perp/orders`.
+
+The margin estimate in the form mirrors the kernel exactly:
+`ceil(floor(qty*price/10^baseDecimals) / leverage)` for limit orders, and
+`ceil(maxNotional / leverage)` for market orders, computed with `BigInt` because
+quantities are decimal strings that can exceed 2^53.
+
+Serve it from the same origin as the API (the Go backend) so the relative `/v1`
+and `/ws` paths resolve. Without a wallet extension the page still works
+read-only: market, depth, mark price, and positions all load from the API.

@@ -251,6 +251,16 @@ func (s *PerpOrderBookService) MarkPrice(m perp.MarketID) (perp.Price, bool) {
 // drives the same path through Start.
 func (s *PerpOrderBookService) TickForTest(now time.Time) { s.tick(now) }
 
+// IndexPrice returns the last observed index price for a market.
+func (s *PerpOrderBookService) IndexPrice(m perp.MarketID) (perp.Price, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.tracker == nil {
+		return 0, false
+	}
+	return s.tracker.IndexPrice(m)
+}
+
 // UnrealizedPnL returns an account's mark-price unrealized PnL in a market, and
 // false when the account has no position or the market has no mark price.
 func (s *PerpOrderBookService) UnrealizedPnL(m perp.MarketID, a ledger.AccountID) (*big.Int, bool) {

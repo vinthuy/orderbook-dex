@@ -239,7 +239,11 @@ func (g *Gateway) markPrice(c *gin.Context) {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "no_mark_price"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"market": uint32(id), "markPrice": uint64(mark)})
+	resp := gin.H{"market": uint32(id), "markPrice": uint64(mark)}
+	if index, ok := g.perp.IndexPrice(id); ok {
+		resp["indexPrice"] = uint64(index)
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // fundingState returns the last funding round's summary for a market.
