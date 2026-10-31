@@ -1,8 +1,10 @@
 package perp
 
 import (
+	"bytes"
 	"fmt"
 	"math/big"
+	"sort"
 
 	"github.com/holiman/uint256"
 
@@ -131,6 +133,24 @@ func (e *Engine) Position(m MarketID, a ledger.AccountID) (*Position, bool) {
 		return nil, false
 	}
 	return p.clone(), true
+}
+
+// Positions returns copies of every open position in a market, ordered by
+// account so the order is stable across runs (funding settlement and any other
+// per-position loop must be deterministic).
+func (e *Engine) Positions(m MarketID) []Position {
+	byAcct := e.positions[m]
+	if len(byAcct) == 0 {
+		return nil
+	}
+	out := make([]Position, 0, len(byAcct))
+	for _, p := range byAcct {
+		out = append(out, *p.clone())
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return bytes.Compare(out[i].Account[:], out[j].Account[:]) < 0
+	})
+	return out
 }
 
 // OpenMargins returns the total frozen margin per (account, quote asset) that
