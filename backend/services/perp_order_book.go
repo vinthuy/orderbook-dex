@@ -246,6 +246,11 @@ func (s *PerpOrderBookService) MarkPrice(m perp.MarketID) (perp.Price, bool) {
 	return s.tracker.LastMark(m)
 }
 
+// TickForTest runs one scheduler iteration. It is exported for tests that
+// exercise the gateway without waiting on the runner's ticker; production code
+// drives the same path through Start.
+func (s *PerpOrderBookService) TickForTest(now time.Time) { s.tick(now) }
+
 // UnrealizedPnL returns an account's mark-price unrealized PnL in a market, and
 // false when the account has no position or the market has no mark price.
 func (s *PerpOrderBookService) UnrealizedPnL(m perp.MarketID, a ledger.AccountID) (*big.Int, bool) {

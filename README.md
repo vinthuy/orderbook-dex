@@ -358,3 +358,48 @@ reason to stop the market.
    people.
 3. **Full close, not partial.** v1 closes the entire position at once.
 4. **No fill guarantee.** Thin books can leave a position partially closed.
+
+## Perpetual Gateway (subproject 7a)
+
+The perpetual book is exposed over HTTP and WebSocket under a **separate
+EIP-712 domain** (`Web3 Orderbook DEX Perp`) and a `/perp` route namespace. A
+signature minted for a spot order recovers a different address on the perp
+domain, so a captured spot signature cannot be replayed as a perpetual order.
+
+### HTTP API
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST   | `/v1/perp/orders` | signed | Submit a perpetual order |
+| DELETE | `/v1/perp/orders/:id` | signed | Cancel a resting order |
+| GET    | `/v1/perp/orders/:id` | none | Order status |
+| GET    | `/v1/perp/markets` | none | Market list |
+| GET    | `/v1/perp/book/:market?depth=N` | none | Depth snapshot |
+| GET    | `/v1/perp/positions/:account` | none | All open positions |
+| GET    | `/v1/perp/positions/:account/:market` | none | One position with mark-price risk figures |
+| GET    | `/v1/perp/accounts/:account/balances` | none | Balance / available / held |
+| GET    | `/v1/perp/mark/:market` | none | Current mark price |
+| GET    | `/v1/perp/funding/:market` | none | Last funding round summary |
+
+### WebSocket
+
+`/ws/perp` — subscribe with `{"op":"subscribe","market":1,"account":"0x..."}`.
+Pushes `order`, `trade`, `depth`, `mark`, `funding`, `liquidation`, `baddebt`,
+and `degraded` frames. A subscribe carrying a market sends an immediate depth
+snapshot so a client is not blind until the next trade.
+
+### Signature format
+
+Orders sign `PerpOrder` (market, side, type, tif, price, qty, maxNotional,
+leverage, nonce, expiry) and cancels sign `PerpCancel` (market, orderId, nonce,
+expiry). Qty and MaxNotional are decimal strings. Replay is blocked by a
+per-account nonce log persisted under `GATEWAY_NONCE_DIR/perp`.
+
+### Residual trust assumptions (7a)
+
+1. **Signature recovery is not authentication.** For any well-formed `(r, s, v)`
+   ECDSA recovers *some* public key. Safety comes from the recovered address
+   owning the funds, the distinct domain, and the nonce log — not from recovery
+   succeeding. Malformed input (bad length, out-of-range or zero `r`/`s`, high-`s`,
+   `v ∉ {0,1}`) is rejected early as defence in depth.
+2. **Read endpoints are unauthenticated**, matching the spot gateway.
