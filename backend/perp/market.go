@@ -106,6 +106,7 @@ type Market struct {
 	MaxLeverage  uint32         // maximum leverage; >= 1
 	MinQty       *uint256.Int   // optional minimum base quantity
 	MaxQty       *uint256.Int   // optional maximum base quantity (nil = 2^128)
+	MarkConfig   MarkConfig     // mark-price derivation (zero value = defaults)
 }
 
 const maxBaseDecimals = 76
