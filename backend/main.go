@@ -10,12 +10,14 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/holiman/uint256"
+	"path/filepath"
 	"web3-amm-dex-backend/config"
 	"web3-amm-dex-backend/gateway"
 	"web3-amm-dex-backend/handlers"
 	"web3-amm-dex-backend/indexer"
 	"web3-amm-dex-backend/ledger"
 	"web3-amm-dex-backend/perp"
+	"web3-amm-dex-backend/perpgateway"
 	"web3-amm-dex-backend/services"
 )
 
@@ -69,6 +71,8 @@ func main() {
 	// order book (ORDERBOOK_MARKETS configured at least one market). It shares
 	// the same gin engine and EventBus as the order book so WS pushes work.
 	var gw *gateway.Gateway
+	// deferredClosers collects handles that must be released at shutdown.
+	var deferredClosers []func() error
 	if settlement != nil && settlement.OrderBook != nil {
 		g, err := gateway.New(settlement.OrderBook, settlement.Bus, gatewayConfigFromEnv())
 		if err != nil {
@@ -179,6 +183,24 @@ func main() {
 		})
 		log.Printf("perp liquidation enabled (interval %s)", rc.LiquidationInterval())
 
+		// Perpetual gateway: the same signed-instruction model as spot, under a
+		// distinct EIP-712 domain and the /perp route namespace.
+		gcfg := config.LoadGatewayConfig()
+		pgw, err := perpgateway.New(perpsvc, settlement.Bus, perpgateway.Config{
+			ChainID:       gcfg.ChainID,
+			DomainName:    gcfg.DomainName + " Perp",
+			DomainVersion: gcfg.DomainVersion,
+			Rate:          gcfg.Rate,
+			Burst:         gcfg.Burst,
+			NonceDir:      perpNonceDir(gcfg.NonceDir),
+		})
+		if err != nil {
+			log.Fatalf("Failed to build perp gateway: %v", err)
+		}
+		pgw.Register(r)
+		deferredClosers = append(deferredClosers, pgw.Close)
+		log.Printf("perp gateway mounted at /v1/perp and /ws/perp")
+
 		log.Printf("perpetual order book mounted (%d markets)", len(perpMarkets))
 	}
 
@@ -237,6 +259,11 @@ func main() {
 	if gw != nil {
 		if err := gw.Close(); err != nil {
 			log.Printf("gateway shutdown error: %v", err)
+		}
+	}
+	for _, close := range deferredClosers {
+		if err := close(); err != nil {
+			log.Printf("shutdown error: %v", err)
 		}
 	}
 	if istore != nil {
@@ -326,4 +353,14 @@ func gatewayConfigFromEnv() gateway.Config {
 		Burst:         gc.Burst,
 		NonceDir:      gc.NonceDir,
 	}
+}
+
+// perpNonceDir keeps the perpetual gateway's nonce log separate from the spot
+// gateway's. Sharing one file would let a spot nonce burn a perp nonce, which is
+// survivable but confusing; separate files keep each domain's sequence legible.
+func perpNonceDir(spotDir string) string {
+	if spotDir == "" {
+		return ""
+	}
+	return filepath.Join(spotDir, "perp")
 }

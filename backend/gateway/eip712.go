@@ -169,6 +169,13 @@ func (v *Verifier) hashCancel(c SignedCancel) ([]byte, error) {
 	return hash, err
 }
 
+// OrderDigest returns the EIP-712 digest a signature must cover for this order.
+// It exists so callers (and tests) can prove domain separation between the spot
+// and perpetual instruction spaces.
+func (v *Verifier) OrderDigest(env SignedOrderEnvelope) ([]byte, error) {
+	return v.hashOrder(env.Order)
+}
+
 // RecoverOrder verifies the order signature and returns the signer address.
 func (v *Verifier) RecoverOrder(env SignedOrderEnvelope) (common.Address, error) {
 	h, err := v.hashOrder(env.Order)
