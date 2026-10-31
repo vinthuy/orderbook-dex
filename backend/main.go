@@ -9,10 +9,12 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/holiman/uint256"
 	"web3-amm-dex-backend/config"
 	"web3-amm-dex-backend/gateway"
 	"web3-amm-dex-backend/handlers"
 	"web3-amm-dex-backend/indexer"
+	"web3-amm-dex-backend/ledger"
 	"web3-amm-dex-backend/services"
 )
 
@@ -76,6 +78,46 @@ func main() {
 		log.Printf("order book gateway mounted at /v1 and /ws")
 	}
 
+	// The perpetual order book is mounted below (when PERP_MARKETS is set); its
+	// handle is kept so shutdown can release the instruction journal.
+	var perpsvc *services.PerpOrderBookService
+
+	// Mount the perpetual order book when PERP_MARKETS is configured. It shares
+	// the settlement stack's ledger, holds, and bus, so perp margin and PnL
+	// contend for the same funds as spot and withdrawals.
+	if settlement != nil && config.LoadPerpConfig().Markets != "" {
+		pc := config.LoadPerpConfig()
+		perpMarkets, err := services.ParsePerpMarkets(pc.Markets)
+		if err != nil {
+			log.Fatalf("Failed to parse PERP_MARKETS: %v", err)
+		}
+		perpJournal, err := services.NewPerpJournal(pc.DataDir)
+		if err != nil {
+			log.Fatalf("Failed to open perp journal: %v", err)
+		}
+		perpsvc, err = services.NewPerpOrderBookService(perpMarkets, settlement.Ledger, settlement.Holds, perpJournal, settlement.Bus)
+		if err != nil {
+			_ = perpJournal.Close()
+			log.Fatalf("Failed to build perp order book: %v", err)
+		}
+		settlement.Registry.Register(perpsvc)
+		if err := perpsvc.Start(); err != nil {
+			log.Fatalf("Failed to start perp order book: %v", err)
+		}
+		// Holds.Reconcile replaces the whole map, and the spot order book has
+		// already reconciled its own reserves during stack assembly. Reconcile
+		// the union once here, or mounting perp would unfreeze every spot
+		// resting order on restart.
+		var spotReserves map[ledger.HoldKey]*uint256.Int
+		if settlement.OrderBook != nil {
+			spotReserves = settlement.OrderBook.Engine().OpenReserves()
+		}
+		if err := settlement.Holds.Reconcile(services.UnionHolds(spotReserves, perpsvc.OpenMargins())); err != nil {
+			log.Fatalf("Failed to reconcile spot+perp holds: %v", err)
+		}
+		log.Printf("perpetual order book mounted (%d markets)", len(perpMarkets))
+	}
+
 	// Mount the history indexer's read-only query routes and reconcile endpoint.
 	if settlement != nil && idxSvc != nil {
 		idxSvc.SetAdapter(settlement.Adapter)
@@ -136,6 +178,14 @@ func main() {
 	if istore != nil {
 		if err := istore.Close(); err != nil {
 			log.Printf("indexer store shutdown error: %v", err)
+		}
+	}
+	// Release the perp instruction journal's file handle. The settlement
+	// stack's StopAll also stops the perp service runner, but only Close
+	// releases the journal; Close is idempotent, so the later Stop is harmless.
+	if perpsvc != nil {
+		if err := perpsvc.Close(); err != nil {
+			log.Printf("perp order book shutdown error: %v", err)
 		}
 	}
 	if settlement != nil {
