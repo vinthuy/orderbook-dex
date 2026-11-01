@@ -628,14 +628,18 @@ func (e *Engine) Liquidate(m MarketID, a ledger.AccountID, maxQty *uint256.Int) 
 		if maker == nil {
 			break
 		}
-		price := maker.Price
-		tradeQty := minUint(o.Remaining(), maker.Remaining())
+		// STP: an account never trades with itself. Mirror Place exactly — cancel
+		// the crossing order AND release its residual margin, or that freeze leaks
+		// forever (the order is gone from the book but Holds still counts it).
 		if maker.Account == a {
-			// Self-trade prevention: a liquidator's own resting order is skipped.
 			bk.cancel(maker)
 			maker.Status = StatusCancelled
+			e.releaseResidual(maker, &releases)
 			continue
 		}
+
+		price := maker.Price
+		tradeQty := minUint(o.Remaining(), maker.Remaining())
 
 		e.nextTrade++
 		trades = append(trades, Trade{
@@ -732,3 +736,4 @@ func levelsOf(s *side, depth int) []LevelView {
 	}
 	return out
 }
+

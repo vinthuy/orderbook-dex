@@ -120,9 +120,17 @@ func (s *PerpOrderBookService) liquidateLocked(market perp.Market, pos perp.Posi
 		fee = uint256.NewInt(0)
 	}
 
-	// Journal first: the WAL is the truth source. Replaying this record re-runs
-	// the identical liquidation (the kernel is deterministic), so the position
-	// cannot come back after a restart.
+	// Probe before journaling: a liquidation with nothing to hit the book closes
+	// nothing, so it must not leave a WAL record, charge a fee, or emit an event.
+	// The scan retries next tick; a position stuck below maintenance on a thin
+	// book must not accumulate phantom records or spam "liquidated" intervals.
+	if !s.canFill(market.ID, pos) {
+		return LiquidationEvent{}, perp.Result{}, false
+	}
+
+	// Journal before touching the engine: the WAL is the truth source. Replaying
+	// this record re-runs the identical liquidation (the kernel is deterministic),
+	// so the position cannot come back after a restart.
 	if err := s.journal.AppendLiquidation(LiquidationCmd{
 		Market: market.ID, Account: pos.Account, Mark: mark, At: now.Unix(),
 	}); err != nil {
@@ -136,6 +144,12 @@ func (s *PerpOrderBookService) liquidateLocked(market perp.Market, pos perp.Posi
 			return LiquidationEvent{}, perp.Result{}, false // Already closed by another path.
 		}
 		_ = s.degrade(fmt.Errorf("services: perp: liquidate %s: %w", pos.Account.Hex(), err))
+		return LiquidationEvent{}, perp.Result{}, false
+	}
+
+	// Defensive: if the probe said yes but nothing traded (the book moved between
+	// the two calls), treat it as unfilled rather than reporting a zero close.
+	if len(res.Trades) == 0 {
 		return LiquidationEvent{}, perp.Result{}, false
 	}
 
@@ -173,7 +187,29 @@ func (s *PerpOrderBookService) liquidateLocked(market perp.Market, pos perp.Posi
 // payLiquidationFee moves up to fee from the liquidated account's balance to the
 // insurance fund. It never overdraws: the transfer is capped at the account's
 // remaining balance, so a liquidation cannot mint a negative balance.
-// payLiquidationFee moves up to fee from the liquidated account to the insurance
+// canFill reports whether a liquidation of pos has anything to trade against:
+// at least one resting order on the opposite side owned by someone else. Caller
+// must hold s.mu.
+//
+// A liquidated account's own orders on that side are skipped by STP, so they do
+// not count — treating them as liquidity would journal a liquidation that cannot
+// fill.
+func (s *PerpOrderBookService) canFill(market perp.MarketID, pos perp.Position) bool {
+	// A long is closed by selling into bids; a short by buying from asks.
+	longs, shorts := s.engine.Book(market, 64)
+	var levels []perp.LevelView
+	if pos.Side == perp.SideLong {
+		levels = longs
+	} else {
+		levels = shorts
+	}
+	for _, l := range levels {
+		if l.Total != nil && !l.Total.IsZero() {
+			return true
+		}
+	}
+	return false
+}
 // fund, and returns what was actually charged.
 //
 // The cap is the position's RELEASED MARGIN, not the account's whole balance: the
@@ -224,3 +260,4 @@ func (s *PerpOrderBookService) payLiquidationFee(account ledger.AccountID, asset
 func liquidationFeeRef(account ledger.AccountID, asset ledger.AssetID) string {
 	return fmt.Sprintf("perp:liqfee:%s:%d", account.Hex(), asset)
 }
+
