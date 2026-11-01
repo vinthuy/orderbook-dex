@@ -154,43 +154,76 @@ func (s *PerpOrderBookService) liquidateLocked(market perp.Market, pos perp.Posi
 
 	// Probe before journaling: a liquidation with nothing to hit the book closes
 	// nothing, so it must not leave a WAL record, charge a fee, or emit an event.
-	// The scan retries next tick; a position stuck below maintenance on a thin
-	// book must not accumulate phantom records or spam "liquidated" intervals.
 	if !s.canFill(market.ID, pos) {
 		return LiquidationEvent{}, perp.Result{}, false
 	}
 
-	// Journal before touching the engine: the WAL is the truth source. Replaying
-	// this record re-runs the identical liquidation (the kernel is deterministic),
-	// so the position cannot come back after a restart.
-	if err := s.journal.AppendLiquidation(LiquidationCmd{
-		Market: market.ID, Account: pos.Account, Mark: mark, At: now.Unix(),
-	}); err != nil {
-		_ = s.degrade(fmt.Errorf("services: perp: journal liquidation: %w", err))
-		return LiquidationEvent{}, perp.Result{}, false
-	}
-
-	res, err := s.engine.Liquidate(market.ID, pos.Account, nil)
-	if err != nil {
-		if errors.Is(err, perp.ErrOrderNotFound) {
-			return LiquidationEvent{}, perp.Result{}, false // Already closed by another path.
+	// The ladder, rung by rung. Each rung is journaled before it runs, because a
+	// replay must reproduce the identical fills: a limit pass and a sweep trade
+	// different counterparties even on the same book.
+	var (
+		results []perp.Result
+		limits  []perp.Price
+	)
+	appendRung := func(limit perp.Price) bool {
+		if err := s.journal.AppendLiquidation(LiquidationCmd{
+			Market: market.ID, Account: pos.Account, Mark: mark, Limit: limit, At: now.Unix(),
+		}); err != nil {
+			_ = s.degrade(fmt.Errorf("services: perp: journal liquidation: %w", err))
+			return false
 		}
-		_ = s.degrade(fmt.Errorf("services: perp: liquidate %s: %w", pos.Account.Hex(), err))
+		var res perp.Result
+		var err error
+		if limit == 0 {
+			res, err = s.engine.Liquidate(market.ID, pos.Account, nil)
+		} else {
+			res, err = s.engine.LiquidateLimit(market.ID, pos.Account, nil, limit)
+		}
+		if err != nil {
+			if errors.Is(err, perp.ErrOrderNotFound) {
+				return false // Already closed by an earlier rung or another path.
+			}
+			_ = s.degrade(fmt.Errorf("services: perp: liquidate %s: %w", pos.Account.Hex(), err))
+			return false
+		}
+		if len(res.Trades) == 0 {
+			return false
+		}
+		results = append(results, res)
+		limits = append(limits, limit)
+		return true
+	}
+
+	// Rung 1: a limit IOC priced off the mark. Closing a long sells, so the floor
+	// is mark*(1-slippage); closing a short buys, so the ceiling is mark*(1+slip).
+	// This is what keeps a liquidation from dumping into a thin book at any price.
+	if limit, ok := s.liquidationLimit(market, pos, mark); ok {
+		appendRung(limit)
+	}
+	// Rung 2: sweep whatever the limit pass left, at any price. Without this a
+	// position could sit liquidatable forever because the top of the book was
+	// better than the limit.
+	if _, stillOpen := s.engine.Position(market.ID, pos.Account); stillOpen {
+		appendRung(0)
+	}
+
+	if len(results) == 0 {
 		return LiquidationEvent{}, perp.Result{}, false
 	}
 
-	// Defensive: if the probe said yes but nothing traded (the book moved between
-	// the two calls), treat it as unfilled rather than reporting a zero close.
-	if len(res.Trades) == 0 {
-		return LiquidationEvent{}, perp.Result{}, false
+	merged := perp.Result{Trades: nil}
+	for _, r := range results {
+		merged.Trades = append(merged.Trades, r.Trades...)
+		merged.Releases = append(merged.Releases, r.Releases...)
+		merged.PnL = append(merged.PnL, r.PnL...)
 	}
 
 	// Realize PnL before releasing margin, exactly as the normal place path does.
-	if err := s.settlePnL(res.PnL); err != nil {
+	if err := s.settlePnL(merged.PnL); err != nil {
 		_ = s.degrade(err)
 		return LiquidationEvent{}, perp.Result{}, false
 	}
-	for _, r := range res.Releases {
+	for _, r := range merged.Releases {
 		if err := s.holds.Release(r.Account, market.Quote, r.Amount); err != nil {
 			_ = s.degrade(err)
 			return LiquidationEvent{}, perp.Result{}, false
@@ -199,26 +232,63 @@ func (s *PerpOrderBookService) liquidateLocked(market perp.Market, pos perp.Posi
 
 	// Pay the liquidator out of the position's released margin, never out of thin
 	// air: the fee is capped by what the close actually freed.
-	fee = s.payLiquidationFee(pos.Account, market.Quote, fee, res.Releases)
+	fee = s.payLiquidationFee(pos.Account, market.Quote, fee, merged.Releases)
 
 	// Report what actually closed, not what was requested.
 	closed := uint256.NewInt(0)
-	for _, t := range res.Trades {
+	for _, t := range merged.Trades {
 		if t.Qty != nil {
 			closed.Add(closed, t.Qty)
 		}
 	}
 	_, stillOpen := s.engine.Position(market.ID, pos.Account)
 
+	_ = limits
 	return LiquidationEvent{
 		Market: market.ID, Account: pos.Account, Size: closed, Mark: mark,
 		Equity: equity, Fee: fee, Partial: stillOpen, At: now.Unix(),
-	}, res, len(res.Trades) > 0
+	}, merged, true
 }
 
-// payLiquidationFee moves up to fee from the liquidated account's balance to the
-// insurance fund. It never overdraws: the transfer is capped at the account's
-// remaining balance, so a liquidation cannot mint a negative balance.
+// liquidationLimit computes the limit-IOC price for the first liquidation rung:
+// the mark moved against the position by the configured slippage. It returns
+// false when the market disables the limit rung.
+//
+// nil SlippageE18 means the default; an explicit zero means "sweep only", which
+// is how an operator opts back into the pre-ladder behaviour.
+func (s *PerpOrderBookService) liquidationLimit(market perp.Market, pos perp.Position, mark perp.Price) (perp.Price, bool) {
+	slip := market.RiskConfig.SlippageE18
+	if slip == nil {
+		slip = perp.DefaultSlippage()
+	}
+	if slip.IsZero() {
+		return 0, false
+	}
+	// bound = mark * (1e18 ± slip) / 1e18, computed in 256 bits.
+	e18 := uint256.NewInt(1_000_000_000_000_000_000)
+	m := uint256.NewInt(uint64(mark))
+	adj := new(uint256.Int).Mul(m, slip)
+	adj.Div(adj, e18)
+	if adj.IsZero() {
+		adj = uint256.NewInt(1)
+	}
+
+	var out *uint256.Int
+	if pos.Side == perp.SideLong {
+		// Selling: accept prices down to mark - adj, but never below 1.
+		if m.Cmp(adj) <= 0 {
+			return 1, true
+		}
+		out = new(uint256.Int).Sub(m, adj)
+	} else {
+		out = new(uint256.Int).Add(m, adj)
+	}
+	if out.IsZero() || !out.IsUint64() {
+		return 0, false
+	}
+	return perp.Price(out.Uint64()), true
+}
+
 // canFill reports whether a liquidation of pos has anything to trade against:
 // at least one resting order on the opposite side owned by someone else. Caller
 // must hold s.mu.
@@ -242,6 +312,8 @@ func (s *PerpOrderBookService) canFill(market perp.MarketID, pos perp.Position) 
 	}
 	return false
 }
+
+// payLiquidationFee moves up to fee from the liquidated account to the insurance
 // fund, and returns what was actually charged.
 //
 // The cap is the position's RELEASED MARGIN, not the account's whole balance: the

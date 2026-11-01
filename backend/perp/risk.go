@@ -13,6 +13,7 @@ import (
 var (
 	defaultMaintenanceRateE18 = uint256.NewInt(5_000_000_000_000_000)  // 0.5%
 	defaultLiquidatorFeeE18   = uint256.NewInt(1_000_000_000_000_000)  // 0.1%
+	defaultSlippageE18        = uint256.NewInt(10_000_000_000_000_000) // 1%
 )
 
 // maintenanceRate returns the configured maintenance margin rate, or the default.
@@ -39,6 +40,21 @@ type RiskConfig struct {
 	// LiquidatorFeeE18 is the fraction of notional paid to the liquidator (the
 	// operator in v1), scaled by 1e18. Zero is a valid "no fee".
 	LiquidatorFeeE18 *uint256.Int
+	// SlippageE18 is how far from the mark the first liquidation rung will trade,
+	// scaled by 1e18 (default 1%). Zero disables the limit rung, leaving only the
+	// market sweep — which is also the pre-ladder behaviour.
+	SlippageE18 *uint256.Int
+}
+
+// DefaultSlippage returns the default first-rung liquidation slippage.
+func DefaultSlippage() *uint256.Int { return new(uint256.Int).Set(defaultSlippageE18) }
+
+// slippage returns the configured first-rung slippage, or the default.
+func (c RiskConfig) slippage() *uint256.Int {
+	if c.SlippageE18 == nil || c.SlippageE18.IsZero() {
+		return new(uint256.Int).Set(defaultSlippageE18)
+	}
+	return c.SlippageE18
 }
 
 // MaintenanceMargin returns ceil(notional(size, mark) * rate / 1e18): the equity

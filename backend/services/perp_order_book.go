@@ -657,10 +657,18 @@ func (s *PerpOrderBookService) recover() error {
 				return fmt.Errorf("services: perp: replay cancel: %w", err)
 			}
 		case "liquidation":
-			// Replay the forced close. Without this the engine would keep the
-			// liquidated position, resurrecting it after a restart even though the
-			// ledger already settled its loss on the first pass.
-			res, err := s.engine.Liquidate(in.Liquidation.Market, in.Liquidation.Account, nil)
+			// Replay the forced close rung exactly as it ran. The Limit field
+			// distinguishes the limit pass from the market sweep, and the two fill
+			// against different counterparties — replaying a sweep when a limit
+			// ran would produce a different book and different PnL.
+			var res perp.Result
+			var err error
+			if in.Liquidation.Limit == 0 {
+				res, err = s.engine.Liquidate(in.Liquidation.Market, in.Liquidation.Account, nil)
+			} else {
+				res, err = s.engine.LiquidateLimit(in.Liquidation.Market, in.Liquidation.Account,
+					nil, in.Liquidation.Limit)
+			}
 			if err != nil {
 				if errors.Is(err, perp.ErrOrderNotFound) {
 					continue // Already closed by an earlier replayed instruction.

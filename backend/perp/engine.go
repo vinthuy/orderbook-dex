@@ -557,14 +557,28 @@ func (m Market) UnrealizedPnL(side Side, size *uint256.Int, entry, mark Price) (
 	return new(big.Int).Sub(entryNotional.ToBig(), markNotional.ToBig()), nil
 }
 
-// Liquidate force-closes a position by submitting an opposite-side IOC order
-// without freezing new margin (spec §3.2). The account is already short of
-// equity, so there is nothing left to reserve; the closing leg releases the
-// position's remaining margin proportionally, exactly as a reduce would.
-//
-// An IOC order that cannot fully fill leaves the residual position open; the
-// caller sees that in the returned Order status and may retry next scan.
+// Liquidate force-closes a position with an opposite-side market IOC order that
+// sweeps the book until the position is gone or liquidity runs out.
 func (e *Engine) Liquidate(m MarketID, a ledger.AccountID, maxQty *uint256.Int) (Result, error) {
+	return e.liquidate(m, a, maxQty, 0)
+}
+
+// LiquidateLimit force-closes a position with an opposite-side LIMIT IOC order:
+// it only trades at prices at least as good as limit and leaves the rest of the
+// position open. It is the first rung of the liquidation ladder — sweeping the
+// book at any price (Liquidate) is the fallback when the limit pass cannot fill.
+//
+// limit must be > 0. For a long being closed (a sell), "at least as good" means
+// price >= limit; for a short being closed (a buy), price <= limit.
+func (e *Engine) LiquidateLimit(m MarketID, a ledger.AccountID, maxQty *uint256.Int, limit Price) (Result, error) {
+	if limit == 0 {
+		return Result{}, fmt.Errorf("%w: a limit liquidation requires price > 0", ErrBadRequest)
+	}
+	return e.liquidate(m, a, maxQty, limit)
+}
+
+// liquidate builds and runs the closing order. A zero limit means "market".
+func (e *Engine) liquidate(m MarketID, a ledger.AccountID, maxQty *uint256.Int, limit Price) (Result, error) {
 	market, ok := e.byID[m]
 	if !ok {
 		return Result{}, ErrUnknownMarket
@@ -589,6 +603,10 @@ func (e *Engine) Liquidate(m MarketID, a ledger.AccountID, maxQty *uint256.Int) 
 
 	// Build the order by hand: Place would validate leverage and derive a margin
 	// freeze, neither of which applies to a forced close.
+	orderType := TypeMarket
+	if limit != 0 {
+		orderType = TypeLimit
+	}
 	e.nextID++
 	e.nextSeq++
 	o := &Order{
@@ -597,9 +615,9 @@ func (e *Engine) Liquidate(m MarketID, a ledger.AccountID, maxQty *uint256.Int) 
 		Market:  m,
 		Account: a,
 		Side:    side,
-		Type:    TypeMarket,
+		Type:    orderType,
 		TIF:     TIFIOC,
-		Price:   0,
+		Price:   limit,
 		Qty:     qty,
 		// MaxNotional lets the market-order path cap its own spending. It is a
 		// safety bound only: the close is qty-limited, and the reduce branch of
@@ -639,6 +657,17 @@ func (e *Engine) Liquidate(m MarketID, a ledger.AccountID, maxQty *uint256.Int) 
 		}
 
 		price := maker.Price
+		// A limit liquidation only trades at acceptable prices: a sell (closing a
+		// long) needs price >= limit, a buy (closing a short) needs price <= limit.
+		// The book is sorted, so the first unacceptable price ends the sweep.
+		if limit != 0 {
+			if side == SideShort && price < limit {
+				break
+			}
+			if side == SideLong && price > limit {
+				break
+			}
+		}
 		tradeQty := minUint(o.Remaining(), maker.Remaining())
 
 		e.nextTrade++

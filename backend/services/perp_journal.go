@@ -265,10 +265,15 @@ func (j *PerpJournal) AppendFunding(c FundingCmd) error {
 // LiquidationCmd records one forced liquidation. Replaying it re-runs the
 // deterministic kernel close, so a liquidated position cannot reappear after a
 // restart with the ledger already having settled its loss.
+//
+// Limit is the price of the limit-IOC rung. Zero means the market sweep rung. It
+// is part of the record because replay must reproduce the identical fills: a
+// limit pass and a sweep trade different counterparties even on the same book.
 type LiquidationCmd struct {
 	Market  perp.MarketID
 	Account ledger.AccountID
 	Mark    perp.Price
+	Limit   perp.Price
 	At      int64
 }
 
@@ -276,13 +281,15 @@ type perpLiquidationJSON struct {
 	Market  uint32 `json:"market"`
 	Account string `json:"account"`
 	Mark    uint64 `json:"mark_price"`
+	Limit   uint64 `json:"limit_price,omitempty"`
 	At      int64  `json:"at"`
 }
 
 // AppendLiquidation records one forced liquidation durably.
 func (j *PerpJournal) AppendLiquidation(c LiquidationCmd) error {
 	return j.append("liquidation", perpLiquidationJSON{
-		Market: uint32(c.Market), Account: c.Account.Hex(), Mark: uint64(c.Mark), At: c.At,
+		Market: uint32(c.Market), Account: c.Account.Hex(), Mark: uint64(c.Mark),
+		Limit: uint64(c.Limit), At: c.At,
 	})
 }
 
@@ -426,7 +433,7 @@ func (j *PerpJournal) Replay() ([]PerpInstruction, error) {
 			}
 			out = append(out, PerpInstruction{Kind: "liquidation", Liquidation: &LiquidationCmd{
 				Market: perp.MarketID(lq.Market), Account: account,
-				Mark: perp.Price(lq.Mark), At: lq.At,
+				Mark: perp.Price(lq.Mark), Limit: perp.Price(lq.Limit), At: lq.At,
 			}})
 		default:
 			return nil, fmt.Errorf("services: unknown perp journal kind %q", ln.Kind)
