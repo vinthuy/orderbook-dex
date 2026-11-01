@@ -89,6 +89,10 @@ type PerpOrderBookService struct {
 	insuranceFund   ledger.AccountID
 	liquidationOpts LiquidationOptions
 
+	// badDebts buffers bad-debt events produced under s.mu; they are published
+	// after the lock is released (see reportDegraded / publish).
+	badDebts []BadDebtEvent
+
 	mu       sync.Mutex
 	fatalErr error
 	run      runner
@@ -340,7 +344,33 @@ func (s *PerpOrderBookService) refreshMarks(now time.Time) {
 // Place freezes the order-level margin, journals the instruction, matches,
 // realizes PnL into the ledger, releases margin, and publishes events — in that
 // order. A validation or funding failure leaves positions untouched.
+//
+// Events are published AFTER s.mu is released. EventBus.Publish invokes
+// subscribers synchronously, so a subscriber that reads service state (for an
+// alert, a depth push, anything) would self-deadlock the matcher if it ran under
+// the lock. See TestPublishDoesNotHoldLock.
 func (s *PerpOrderBookService) Place(req perp.PlaceRequest) (perp.Result, error) {
+	res, err := s.place(req)
+	s.reportDegraded()
+	if err != nil {
+		return perp.Result{}, err
+	}
+	s.publish(res)
+	return res, nil
+}
+
+// reportDegraded publishes the degradation event if the service just degraded.
+// It is called from unlocked contexts only.
+func (s *PerpOrderBookService) reportDegraded() {
+	s.mu.Lock()
+	err := s.fatalErr
+	s.mu.Unlock()
+	if err != nil {
+		_ = s.bus.Publish(Event{Topic: TopicPerpDegraded, Data: err})
+	}
+}
+
+func (s *PerpOrderBookService) place(req perp.PlaceRequest) (perp.Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fatalErr != nil {
@@ -379,14 +409,23 @@ func (s *PerpOrderBookService) Place(req perp.PlaceRequest) (perp.Result, error)
 			return perp.Result{}, s.degrade(err)
 		}
 	}
-
-	s.publish(res)
 	return res, nil
 }
 
 // Cancel journals the instruction, removes the caller's resting order, releases
-// its residual margin, and publishes the position event.
+// its residual margin, and publishes the position event. Like Place, the event
+// is published after the lock is released.
 func (s *PerpOrderBookService) Cancel(m perp.MarketID, a ledger.AccountID, id perp.OrderID) (perp.Result, error) {
+	res, err := s.cancel(m, a, id)
+	s.reportDegraded()
+	if err != nil {
+		return perp.Result{}, err
+	}
+	s.publish(res)
+	return res, nil
+}
+
+func (s *PerpOrderBookService) cancel(m perp.MarketID, a ledger.AccountID, id perp.OrderID) (perp.Result, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fatalErr != nil {
@@ -405,7 +444,6 @@ func (s *PerpOrderBookService) Cancel(m perp.MarketID, a ledger.AccountID, id pe
 			return perp.Result{}, s.degrade(err)
 		}
 	}
-	s.publish(res)
 	return res, nil
 }
 
@@ -437,8 +475,12 @@ func (s *PerpOrderBookService) settlePnL(pnls []perp.PnLSettlement) error {
 				// A loss larger than the account's balance is a shortfall, not a
 				// reason to halt the whole book (spec §3.3). Debit what is there
 				// and cover the rest from the insurance fund.
-				if err := s.coverShortfall(p.Account, quote, amt, ref); err != nil {
+				ev, err := s.coverShortfall(p.Account, quote, amt, ref)
+				if err != nil {
 					return err
+				}
+				if ev != nil {
+					s.badDebts = append(s.badDebts, *ev)
 				}
 				continue
 			}
@@ -452,9 +494,9 @@ func (s *PerpOrderBookService) settlePnL(pnls []perp.PnLSettlement) error {
 // from the insurance fund. The book stays live: a single account's insolvency is
 // that account's problem, never a market-wide halt.
 //
-// The bad-debt amount is reported through TopicPerpBadDebt so operators can see
-// the fund draining rather than discovering it in the totals.
-func (s *PerpOrderBookService) coverShortfall(account ledger.AccountID, asset ledger.AssetID, loss *uint256.Int, ref string) error {
+// It returns the bad-debt event it would like published, or nil. It does NOT
+// publish: every caller holds s.mu, and EventBus subscribers run synchronously.
+func (s *PerpOrderBookService) coverShortfall(account ledger.AccountID, asset ledger.AssetID, loss *uint256.Int, ref string) (*BadDebtEvent, error) {
 	balance := s.ledger.Balance(account, asset)
 	payable := new(uint256.Int).Set(loss)
 	if balance.Cmp(payable) < 0 {
@@ -464,21 +506,22 @@ func (s *PerpOrderBookService) coverShortfall(account ledger.AccountID, asset le
 		if err := s.ledger.Apply(ledger.WithdrawOp{
 			Account: account, Asset: asset, Amount: payable, Ref: ref,
 		}); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	shortfall := new(uint256.Int).Sub(loss, payable)
 	if shortfall.IsZero() {
-		return nil
+		return nil, nil
 	}
 	fundRef := fmt.Sprintf("%s:fund", ref)
 	if !s.ledger.WasApplied(fundRef) {
 		if err := s.ledger.Apply(ledger.DepositOp{
 			Account: account, Asset: asset, Amount: shortfall, Ref: fundRef,
 		}); err != nil {
-			return err
+			return nil, err
 		}
 	}
+	ev := &BadDebtEvent{Account: account, Asset: asset, Amount: shortfall}
 	if err := s.ledger.Apply(ledger.WithdrawOp{
 		Account: s.insuranceFund, Asset: asset, Amount: shortfall,
 		Ref: fmt.Sprintf("%s:drawn", ref),
@@ -486,33 +529,42 @@ func (s *PerpOrderBookService) coverShortfall(account ledger.AccountID, asset le
 		if errors.Is(err, ledger.ErrInsufficientBalance) {
 			// The fund itself cannot pay. Record the bad debt and keep trading:
 			// an insolvent fund is an accounting fact, not a reason to stop.
-			_ = s.bus.Publish(Event{Topic: TopicPerpBadDebt, Data: BadDebtEvent{
-				Account: account, Asset: asset, Amount: shortfall,
-			}})
-			return nil
+			return ev, nil
 		}
-		return err
+		return nil, err
 	}
-	_ = s.bus.Publish(Event{Topic: TopicPerpBadDebt, Data: BadDebtEvent{
-		Account: account, Asset: asset, Amount: shortfall,
-	}})
-	return nil
+	return ev, nil
 }
 
+// degrade marks the service unusable and returns the sentinel error. It does NOT
+// publish: every caller holds s.mu, and publishing under the lock can deadlock
+// against a subscriber. Callers that want the event published must do so after
+// unlocking (see the `pending` buffer in Place/Cancel/liquidate).
 func (s *PerpOrderBookService) degrade(cause error) error {
 	if s.fatalErr == nil {
 		s.fatalErr = fmt.Errorf("%w: %v", ErrPerpServiceDegraded, cause)
 	}
-	_ = s.bus.Publish(Event{Topic: TopicPerpDegraded, Data: cause})
 	return s.fatalErr
 }
 
+// publish emits the result's events plus any bad-debt events buffered while the
+// lock was held. Callers must NOT hold s.mu.
 func (s *PerpOrderBookService) publish(res perp.Result) {
 	if res.Order != nil {
 		_ = s.bus.Publish(Event{Topic: TopicPerpPosition, Data: res.Order})
 	}
 	for _, t := range res.Trades {
 		_ = s.bus.Publish(Event{Topic: TopicPerpTrade, Data: t})
+	}
+
+	// Drain bad debts recorded under the lock. Copy first so a concurrent append
+	// to s.badDebts is not lost.
+	s.mu.Lock()
+	debts := s.badDebts
+	s.badDebts = nil
+	s.mu.Unlock()
+	for _, ev := range debts {
+		_ = s.bus.Publish(Event{Topic: TopicPerpBadDebt, Data: ev})
 	}
 }
 
@@ -558,6 +610,21 @@ func (s *PerpOrderBookService) recover() error {
 			if market, ok := s.markets[in.Funding.Market]; ok {
 				s.recordFundingState(market, in.Funding.Index, rate.String(), in.Funding.Mark, in.Funding.At)
 			}
+			// Rebuild this market's debt state from the record. The round's Debts
+			// list is the complete post-round state for the market, so it replaces
+			// whatever earlier rounds left behind.
+			for k := range s.debts {
+				if k.Market == in.Funding.Market {
+					delete(s.debts, k)
+				}
+			}
+			for _, d := range in.Funding.Debts {
+				if d.Amount == nil || d.Amount.IsZero() {
+					continue
+				}
+				s.debts[fundingDebtKey{Account: d.Account, Market: in.Funding.Market}] =
+					new(uint256.Int).Set(d.Amount)
+			}
 		case "place":
 			res, err := s.engine.Place(*in.Place)
 			if err != nil {
@@ -575,6 +642,21 @@ func (s *PerpOrderBookService) recover() error {
 			if _, err := s.engine.Cancel(in.Cancel.Market, in.Cancel.Account, in.Cancel.OrderID); err != nil &&
 				!errors.Is(err, perp.ErrOrderNotFound) {
 				return fmt.Errorf("services: perp: replay cancel: %w", err)
+			}
+		case "liquidation":
+			// Replay the forced close. Without this the engine would keep the
+			// liquidated position, resurrecting it after a restart even though the
+			// ledger already settled its loss on the first pass.
+			res, err := s.engine.Liquidate(in.Liquidation.Market, in.Liquidation.Account, nil)
+			if err != nil {
+				if errors.Is(err, perp.ErrOrderNotFound) {
+					continue // Already closed by an earlier replayed instruction.
+				}
+				return fmt.Errorf("services: perp: replay liquidation: %w", err)
+			}
+			// PnL is idempotent by trade id + account, so re-applying is safe.
+			if err := s.settlePnL(res.PnL); err != nil {
+				return fmt.Errorf("services: perp: replay liquidation settle: %w", err)
 			}
 		}
 	}
