@@ -48,6 +48,67 @@
 | `/liquidity` | DELETE | Remove liquidity |
 | `/events` | GET | Get recent events |
 
+## Order Book Gateway (subproject 4)
+
+The order-book gateway exposes the matching engine over HTTP/WebSocket.
+
+### HTTP API
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST   | `/v1/orders` | signed | Submit an EIP-712 signed order |
+| DELETE | `/v1/orders/:id` | signed | Cancel an order (signed) |
+| GET    | `/v1/orders/:id` | none | Order status |
+| GET    | `/v1/markets` | none | Market list |
+| GET    | `/v1/book/:market?depth=N` | none | Depth snapshot |
+| GET    | `/v1/accounts/:account/balances` | none | Balance / available / held |
+
+### WebSocket
+
+`/ws` — subscribe with `{"op":"subscribe","market":1,"account":"0x..."}`
+(optional filters). Pushes `order`, `trade`, `depth`, and `degraded` frames.
+
+### Signature format
+
+Orders and cancels are EIP-712 typed data over domain
+`Web3 Orderbook DEX` v1. Qty/MaxNotional are decimal strings; replay is
+blocked by a per-account nonce and an expiry timestamp.
+
+### Residual trust assumptions
+
+Read endpoints are unauthenticated. nonce is a persistent append log; its
+corruption cannot cause fund loss (the ledger's trade-id idempotency keys
+still prevent double settlement). The sequencer is single-process.
+
+## History Indexer (subproject 5)
+
+The indexer persists trades, on-chain funding events, and state roots to bbolt,
+and can rebuild an independent ledger from chain events to reconcile against the
+running ledger.
+
+### Query API (read-only, unauthenticated)
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET    | `/v1/trades?market=&account=&limit=` | Trade history |
+| GET    | `/v1/fund-events?account=&asset=&limit=` | Deposit/withdrawal/exit history |
+| GET    | `/v1/roots?from=&limit=` | State root history |
+| POST   | `/v1/reconcile` | Rebuild from chain and reconcile per-asset totals |
+
+### Configuration
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `INDEXER_DB_PATH` | (required for persistence) | bbolt file path |
+| `INDEXER_POLL_INTERVAL` | 5 | chain-event poll interval (seconds) |
+
+### Residual trust assumptions
+
+Reconciliation compares **per-asset totals** only: matching legs are zero-sum and
+absent from the chain, so per-account balances differ between a rebuilt ledger
+and the running ledger. Per-account reconciliation requires per-trade Merkle
+proofs on-chain (deferred).
+
 ## Quick Start
 
 ### 1. Install dependencies
@@ -148,3 +209,214 @@ D:\code\web3\
 3. Explore Ethermint (Cosmos SDK + EVM compatibility)
 4. Build Go backend services interacting with blockchain
 5. Practice full-stack Web3 development
+
+## Perpetual Futures (subproject 6a)
+
+Perpetual markets trade positions (long/short) with isolated margin and
+user-selected leverage. Margin is frozen in the market's quote asset on both
+sides; PnL is realized into the ledger on close.
+
+The kernel lives in its own `backend/perp` package; the spot `matching` package
+is untouched (no file changed, no semantics shared):
+
+```
+backend/perp/
+  market.go            # market definition, leverage bounds, validation
+  order.go             # positions, orders, margin derivation
+  book.go              # price-level + time-priority book
+  engine.go            # matching loop, position updates, cancels, market discretion
+  invariants_test.go   # kernel invariants and deterministic replay
+backend/services/
+  perp_order_book.go   # service wiring, instruction WAL, degrade, PnL settlement
+  perp_journal.go      # perpetual instruction WAL
+backend/config/config.go  # PERP_* configuration
+```
+
+### Known gaps (6a)
+- No mark price or funding rate (6b — now implemented, see below); PnL uses the trade price.
+- No liquidation engine (6c): a loss exceeding margin causes a fatal degrade
+  rather than forced liquidation.
+
+### Configuration
+| Key | Default | Description |
+|-----|---------|-------------|
+| `PERP_MARKETS` | (empty) | `ID:SYMBOL:BASE:QUOTE:BASE_DECIMALS:MAX_LEVERAGE[:MIN_QTY]`, `;`-separated |
+| `PERP_DATA_DIR` | (empty) | instruction WAL dir (empty = memory-only) |
+
+Example: `PERP_MARKETS=1:ETH-PERP:2:1:18:10:1000000000000000` (market 1, base
+asset 2, quote asset 1, 18 base decimals, 10x max leverage, minimum 0.001 base
+units). A malformed value fails startup instead of silently trading a subset of
+the configured markets.
+
+## Mark Price + Funding (subproject 6b)
+
+Perpetual PnL on close still uses the **fill price** (a closed trade settles at
+the price it traded at). The **mark price** is the pricing reference for
+unrealized PnL and for funding.
+
+### Mark price
+
+```
+mid     = (bestBid + bestAsk) / 2         (one-sided uses that side; empty book -> index)
+clamped = clamp(mid, index*(1-dev), index*(1+dev))
+mark    = (index*wi + clamped*wb) / (wi + wb)
+```
+
+Defaults: `dev = 0.5%`, `wi = wb = 1`. Clamping the book contribution is what
+stops a single large order on a thin book from dragging the mark.
+
+### Funding rate
+
+```
+premium = (mark - index) / index
+rate    = clamp(premium / intervalHours, -maxRate, +maxRate)
+```
+
+Positive rate: longs pay shorts. Each position pays
+`floor(notional(size, mark) * |rate| / 1e18)`. A round is journaled **before**
+any ledger mutation and every transfer's idempotency key carries the round
+index, so replaying the WAL cannot pay a round twice.
+
+A payer without enough **available** balance has the shortfall recorded as a
+debt and retried in a later round. Funding never degrades the book the way a
+failed PnL settlement does.
+
+### Configuration
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `PERP_INDEX_PRICES` | (empty) | `ID:PRICE;...` static index prices. Empty = marks and funding off (pure 6a) |
+| `PERP_TICK_INTERVAL` | `5` | price refresh interval (seconds) |
+| `PERP_FUNDING_INTERVAL` | `3600` | funding period (seconds) |
+| `PERP_MAX_PRICE_AGE` | `60` | index staleness threshold (seconds) |
+| `PERP_MAX_MARK_STALENESS` | `300` | how long a stale index may reuse the last mark (seconds) |
+| `PERP_MAX_FUNDING_RATE` | `7500000000000000` | funding-rate cap, 1e18-scaled (0.75%) |
+| `PERP_MARK_MAX_DEVIATION` | `5000000000000000` | max book deviation from index, 1e18-scaled (0.5%) |
+
+Example: `PERP_INDEX_PRICES=1:2000` enables marks and hourly funding for market 1
+with an index price of 2000.
+
+### Residual trust assumptions (6b)
+
+1. **The oracle is an operator trust point.** v1 uses operator-configured index
+   prices; a median-of-venues source or an on-chain oracle is future work.
+2. **Unbalanced funding is not netted through a fund.** A round only moves what
+   payers can cover; 6c introduces the insurance fund that absorbs the rest.
+3. **Debts can accumulate.** An account may carry funding debt until it closes,
+   at which point the debt is retried. 6c's liquidation engine addresses this.
+
+## Liquidation + Insurance Fund (subproject 6c)
+
+6a's worst failure mode was that one account's insolvency halted the whole
+perpetual book (`WithdrawOp` fails → fatal degrade). 6c removes that.
+
+### Maintenance margin
+
+```
+maintenanceMargin = ceil(notional(size, mark) * maintenanceRate / 1e18)
+equity            = margin + unrealizedPnL(mark)
+liquidatable      = equity < maintenanceMargin
+```
+
+Mark price is the trigger, never the last trade — a single print must not
+liquidate anyone.
+
+### Forced close
+
+Every scan (default 1s) closes each liquidatable position with an opposite-side
+market IOC order. The closing order freezes no new margin: the account has none
+left to freeze. An unfillable position (no counterparty) stays open and is
+retried on the next scan, reported as `partial`.
+
+### Shortfall and the insurance fund
+
+When a realized loss exceeds the account's balance:
+
+1. the account is debited only what it holds (never negative),
+2. the insurance fund's balance covers the difference,
+3. a `perp.baddebt` event reports the amount.
+
+The book stays live throughout. If the fund itself is exhausted the bad debt is
+recorded and trading continues — an insolvent fund is an accounting fact, not a
+reason to stop the market.
+
+### Configuration
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `PERP_MAINTENANCE_MARGIN_RATE` | `5000000000000000` | maintenance margin rate, 1e18-scaled (0.5%) |
+| `PERP_LIQUIDATOR_FEE` | `1000000000000000` | liquidation fee, 1e18-scaled (0.1%) |
+| `PERP_INSURANCE_FUND_ACCOUNT` | built-in reserve account | account that absorbs shortfalls |
+| `PERP_LIQUIDATION_INTERVAL` | `1` | liquidation scan interval (seconds) |
+
+### Residual trust assumptions (6c)
+
+1. **The insurance fund is operator-funded.** If it runs dry, bad debt
+   accumulates; ADL is not implemented.
+2. **Liquidation requires a fresh mark.** With a stale or absent index price the
+   scan skips the market — liquidating on a stale price would punish the wrong
+   people.
+3. **Full close, not partial.** v1 closes the entire position at once.
+4. **No fill guarantee.** Thin books can leave a position partially closed.
+
+## Perpetual Gateway (subproject 7a)
+
+The perpetual book is exposed over HTTP and WebSocket under a **separate
+EIP-712 domain** (`Web3 Orderbook DEX Perp`) and a `/perp` route namespace. A
+signature minted for a spot order recovers a different address on the perp
+domain, so a captured spot signature cannot be replayed as a perpetual order.
+
+### HTTP API
+
+| Method | Path | Auth | Description |
+|--------|------|------|-------------|
+| POST   | `/v1/perp/orders` | signed | Submit a perpetual order |
+| DELETE | `/v1/perp/orders/:id` | signed | Cancel a resting order |
+| GET    | `/v1/perp/orders/:id` | none | Order status |
+| GET    | `/v1/perp/markets` | none | Market list |
+| GET    | `/v1/perp/book/:market?depth=N` | none | Depth snapshot |
+| GET    | `/v1/perp/positions/:account` | none | All open positions |
+| GET    | `/v1/perp/positions/:account/:market` | none | One position with mark-price risk figures |
+| GET    | `/v1/perp/accounts/:account/balances` | none | Balance / available / held |
+| GET    | `/v1/perp/mark/:market` | none | Current mark price |
+| GET    | `/v1/perp/funding/:market` | none | Last funding round summary |
+
+### WebSocket
+
+`/ws/perp` — subscribe with `{"op":"subscribe","market":1,"account":"0x..."}`.
+Pushes `order`, `trade`, `depth`, `mark`, `funding`, `liquidation`, `baddebt`,
+and `degraded` frames. A subscribe carrying a market sends an immediate depth
+snapshot so a client is not blind until the next trade.
+
+### Signature format
+
+Orders sign `PerpOrder` (market, side, type, tif, price, qty, maxNotional,
+leverage, nonce, expiry) and cancels sign `PerpCancel` (market, orderId, nonce,
+expiry). Qty and MaxNotional are decimal strings. Replay is blocked by a
+per-account nonce log persisted under `GATEWAY_NONCE_DIR/perp`.
+
+### Residual trust assumptions (7a)
+
+1. **Signature recovery is not authentication.** For any well-formed `(r, s, v)`
+   ECDSA recovers *some* public key. Safety comes from the recovered address
+   owning the funds, the distinct domain, and the nonce log — not from recovery
+   succeeding. Malformed input (bad length, out-of-range or zero `r`/`s`, high-`s`,
+   `v ∉ {0,1}`) is rejected early as defence in depth.
+2. **Read endpoints are unauthenticated**, matching the spot gateway.
+
+## Perpetual Trading UI (subproject 7b)
+
+`frontend/perp.html` is a single-file trading client: order entry (limit and
+market, long/short with user leverage), live depth from `/v1/perp/book`, mark and
+index price, funding rate, and positions with unrealized PnL and a liquidatable
+flag. Order submission signs EIP-712 `PerpOrder` via an injected wallet
+(`eth_signTypedData_v4`) and posts to `/v1/perp/orders`.
+
+The margin estimate in the form mirrors the kernel exactly:
+`ceil(floor(qty*price/10^baseDecimals) / leverage)` for limit orders, and
+`ceil(maxNotional / leverage)` for market orders, computed with `BigInt` because
+quantities are decimal strings that can exceed 2^53.
+
+Serve it from the same origin as the API (the Go backend) so the relative `/v1`
+and `/ws` paths resolve. Without a wallet extension the page still works
+read-only: market, depth, mark price, and positions all load from the API.

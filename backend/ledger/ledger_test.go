@@ -187,6 +187,16 @@ func TestRootAndVersion(t *testing.T) {
 	}
 }
 
+func TestAssetsSorted(t *testing.T) {
+	l := New()
+	_ = l.Apply(DepositOp{Account: [20]byte{1}, Asset: 3, Amount: uint256.NewInt(1), Ref: "a"})
+	_ = l.Apply(DepositOp{Account: [20]byte{2}, Asset: 1, Amount: uint256.NewInt(1), Ref: "b"})
+	got := l.Assets()
+	if len(got) != 2 || got[0] != 1 || got[1] != 3 {
+		t.Fatalf("Assets = %v, want [1 3]", got)
+	}
+}
+
 // TestWasApplied covers the read-only accessor the settlement service uses to
 // detect a replayed withdrawal ref whose in-memory record is gone: false for an
 // unseen key, true once applied, and still true after a same-key replay.

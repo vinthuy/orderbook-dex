@@ -41,7 +41,7 @@ type SettlementStack struct {
 // rebuilt through the ledger's own recovery path (ledger.Recover, which reads
 // the snapshot plus the full WAL and restores the idempotency-key set) — that
 // path is never reimplemented here.
-func BuildSettlementStack(cfg Config, adapter BlockchainAdapter) (*SettlementStack, error) {
+func BuildSettlementStack(cfg Config, adapter BlockchainAdapter, onTrade ...EventHandler) (*SettlementStack, error) {
 	if cfg.SettlementAddress == "" {
 		return nil, errors.New("settlement stack: SettlementAddress is required")
 	}
@@ -77,6 +77,16 @@ func BuildSettlementStack(cfg Config, adapter BlockchainAdapter) (*SettlementSta
 	// order book publishes into the same bus.
 	holds := ledger.NewHolds(l)
 	bus := NewEventBus()
+
+	// Subscribe trade consumers BEFORE the order book is built: its constructor
+	// replays the instruction WAL and re-emits settled trades, and a subscriber
+	// that attaches later would miss them (EventBus drops events with no
+	// subscribers).
+	for _, h := range onTrade {
+		if h != nil {
+			bus.Subscribe(TopicOrderBookTrade, h)
+		}
+	}
 
 	settlement, err := NewSettlementService(adapter, l, cfg.SettlementAddress)
 	if err != nil {

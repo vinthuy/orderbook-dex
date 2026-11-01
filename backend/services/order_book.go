@@ -325,6 +325,13 @@ func (s *OrderBookService) recover() error {
 			if err := s.settleTrades(res.Trades); err != nil {
 				return fmt.Errorf("services: order book: replay settle: %w", err)
 			}
+			// Re-emit each replayed fill so downstream subscribers (notably the
+			// indexer) observe the trades the crash already settled. The trade
+			// ids are deterministic, so a subscriber's idempotent keys make a
+			// duplicate delivery harmless.
+			for _, t := range res.Trades {
+				_ = s.bus.Publish(Event{Topic: TopicOrderBookTrade, Data: TradeEvent{Trade: t}})
+			}
 		case kindCancel:
 			if e.Cancel == nil {
 				return fmt.Errorf("services: order book: journal cancel entry %d has no payload", e.Seq)

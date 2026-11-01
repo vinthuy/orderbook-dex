@@ -122,3 +122,44 @@ func TestLoadSettlementConfigOrderBookDefaultsEmpty(t *testing.T) {
         t.Fatalf("order book config should default empty: %+v", cfg)
     }
 }
+
+func TestLoadPerpConfig(t *testing.T) {
+    t.Setenv("PERP_MARKETS", "")
+    t.Setenv("PERP_DATA_DIR", "")
+    if cfg := LoadPerpConfig(); cfg.Markets != "" || cfg.DataDir != "" {
+        t.Fatalf("perp config should default empty: %+v", cfg)
+    }
+
+    t.Setenv("PERP_MARKETS", "1:ETH-PERP:2:1:18:10:1000000000000000")
+    t.Setenv("PERP_DATA_DIR", "./perp")
+    cfg := LoadPerpConfig()
+    if cfg.Markets != "1:ETH-PERP:2:1:18:10:1000000000000000" {
+        t.Fatalf("Markets = %q, want the raw PERP_MARKETS string", cfg.Markets)
+    }
+    if cfg.DataDir != "./perp" {
+        t.Fatalf("DataDir = %q, want ./perp", cfg.DataDir)
+    }
+}
+
+func TestLoadGatewayConfig(t *testing.T) {
+    t.Setenv("EIP712_DOMAIN_NAME", "Test DEX")
+    t.Setenv("EIP712_DOMAIN_VERSION", "2")
+    t.Setenv("GATEWAY_RATE", "7")
+    t.Setenv("GATEWAY_BURST", "13")
+    t.Setenv("GATEWAY_NONCE_DIR", "/tmp/nonces")
+    t.Setenv("CHAIN_ID", "999")
+
+    cfg := LoadGatewayConfig()
+    if cfg.DomainName != "Test DEX" || cfg.DomainVersion != "2" {
+        t.Fatalf("domain = %q/%q", cfg.DomainName, cfg.DomainVersion)
+    }
+    if cfg.Rate != 7 || cfg.Burst != 13 {
+        t.Fatalf("rate/burst = %v/%v", cfg.Rate, cfg.Burst)
+    }
+    if cfg.NonceDir != "/tmp/nonces" {
+        t.Fatalf("nonceDir = %q", cfg.NonceDir)
+    }
+    if cfg.ChainID != 999 {
+        t.Fatalf("chainID = %d", cfg.ChainID)
+    }
+}

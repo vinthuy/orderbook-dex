@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 
@@ -103,6 +104,28 @@ func (l *Ledger) TotalBalance(asset AssetID) *uint256.Int {
 		}
 	}
 	return total
+}
+
+// Assets returns the sorted set of asset IDs with a non-zero balance (or that
+// have ever been referenced). It is read-only and used by the indexer's
+// reconciliation to enumerate per-asset totals.
+func (l *Ledger) Assets() []AssetID {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	seen := make(map[AssetID]bool)
+	for _, m := range l.balances {
+		for asset, b := range m {
+			if b != nil && !b.IsZero() {
+				seen[asset] = true
+			}
+		}
+	}
+	out := make([]AssetID, 0, len(seen))
+	for a := range seen {
+		out = append(out, a)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
 }
 
 // WasApplied reports whether an op with the given idempotency key has already

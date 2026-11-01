@@ -83,3 +83,215 @@ func LoadSettlementConfig() SettlementConfig {
 func (c SettlementConfig) AnchorInterval() time.Duration {
     return time.Duration(c.AnchorIntervalSeconds) * time.Second
 }
+
+// IndexerConfig configures the history indexer (subproject 5).
+type IndexerConfig struct {
+    DBPath       string
+    PollInterval int64
+}
+
+// LoadIndexerConfig reads indexer settings from the environment.
+func LoadIndexerConfig() IndexerConfig {
+    cfg := IndexerConfig{PollInterval: 5}
+    if v := os.Getenv("INDEXER_DB_PATH"); v != "" {
+        cfg.DBPath = v
+    }
+    if v := os.Getenv("INDEXER_POLL_INTERVAL"); v != "" {
+        if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+            cfg.PollInterval = n
+        }
+    }
+    return cfg
+}
+
+// GatewayConfig configures the order-book gateway (subproject 4).
+type GatewayConfig struct {
+    DomainName    string
+    DomainVersion string
+    Rate          float64
+    Burst         float64
+    NonceDir      string
+    ChainID       int64
+}
+
+// LoadGatewayConfig reads gateway settings from the environment. ChainID is
+// shared with the settlement subsystem and defaults to 13700.
+func LoadGatewayConfig() GatewayConfig {
+    cfg := GatewayConfig{
+        DomainName:    "Web3 Orderbook DEX",
+        DomainVersion: "1",
+        Rate:          10,
+        Burst:         20,
+        ChainID:       13700,
+    }
+    if v := os.Getenv("EIP712_DOMAIN_NAME"); v != "" {
+        cfg.DomainName = v
+    }
+    if v := os.Getenv("EIP712_DOMAIN_VERSION"); v != "" {
+        cfg.DomainVersion = v
+    }
+    if v := os.Getenv("GATEWAY_RATE"); v != "" {
+        if n, err := strconv.ParseFloat(v, 64); err == nil && n >= 0 {
+            cfg.Rate = n
+        }
+    }
+    if v := os.Getenv("GATEWAY_BURST"); v != "" {
+        if n, err := strconv.ParseFloat(v, 64); err == nil && n >= 0 {
+            cfg.Burst = n
+        }
+    }
+    if v := os.Getenv("GATEWAY_NONCE_DIR"); v != "" {
+        cfg.NonceDir = v
+    }
+    if v := os.Getenv("CHAIN_ID"); v != "" {
+        if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+            cfg.ChainID = n
+        }
+    }
+    return cfg
+}
+
+// PerpConfig configures the perpetual order book (subproject 6a).
+type PerpConfig struct {
+    // Markets is the compact market definition string, parsed by
+    // services.ParsePerpMarkets. Empty disables the perpetual order book.
+    Markets string
+    // DataDir is the perpetual instruction WAL directory. Empty means the
+    // journal is memory-only (no crash recovery).
+    DataDir string
+}
+
+// LoadPerpConfig reads perpetual order book settings from the environment.
+func LoadPerpConfig() PerpConfig {
+    return PerpConfig{
+        Markets: os.Getenv("PERP_MARKETS"),
+        DataDir: os.Getenv("PERP_DATA_DIR"),
+    }
+}
+
+// PerpFundingConfig configures mark prices and funding (subproject 6b). It is
+// separate from PerpConfig so 6a deployments keep working unchanged: with no
+// index prices configured the funding subsystem stays off entirely.
+type PerpFundingConfig struct {
+    // IndexPrices is the static index price map, "ID:PRICE;..." (PRICE in quote
+    // minor units per whole base unit). Empty disables marks and funding.
+    IndexPrices string
+    // TickSeconds is the price refresh interval in seconds.
+    TickSeconds int64
+    // FundingIntervalSeconds is the funding period in seconds.
+    FundingIntervalSeconds int64
+    // MaxPriceAgeSeconds is the staleness threshold for an index price.
+    MaxPriceAgeSeconds int64
+    // MaxMarkStalenessSeconds is how long a stale index may reuse the last mark.
+    MaxMarkStalenessSeconds int64
+    // MaxFundingRateE18 is the absolute funding-rate cap, 1e18-scaled.
+    MaxFundingRateE18 string
+    // MarkMaxDeviationE18 is the largest book deviation from the index, 1e18-scaled.
+    MarkMaxDeviationE18 string
+}
+
+// LoadPerpFundingConfig reads 6b settings from the environment. Values that fail
+// to parse fall back to the documented defaults; the caller (main) validates the
+// index-price string at startup and must fail on a malformed one.
+func LoadPerpFundingConfig() PerpFundingConfig {
+    cfg := PerpFundingConfig{
+        IndexPrices:             os.Getenv("PERP_INDEX_PRICES"),
+        TickSeconds:             5,
+        FundingIntervalSeconds:  3600,
+        MaxPriceAgeSeconds:      60,
+        MaxMarkStalenessSeconds: 300,
+        MaxFundingRateE18:       "7500000000000000",    // 0.75% per funding
+        MarkMaxDeviationE18:     "5000000000000000",    // 0.5%
+    }
+    if v := os.Getenv("PERP_TICK_INTERVAL"); v != "" {
+        if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+            cfg.TickSeconds = n
+        }
+    }
+    if v := os.Getenv("PERP_FUNDING_INTERVAL"); v != "" {
+        if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+            cfg.FundingIntervalSeconds = n
+        }
+    }
+    if v := os.Getenv("PERP_MAX_PRICE_AGE"); v != "" {
+        if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+            cfg.MaxPriceAgeSeconds = n
+        }
+    }
+    if v := os.Getenv("PERP_MAX_MARK_STALENESS"); v != "" {
+        if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+            cfg.MaxMarkStalenessSeconds = n
+        }
+    }
+    if v := os.Getenv("PERP_MAX_FUNDING_RATE"); v != "" {
+        cfg.MaxFundingRateE18 = v
+    }
+    if v := os.Getenv("PERP_MARK_MAX_DEVIATION"); v != "" {
+        cfg.MarkMaxDeviationE18 = v
+    }
+    return cfg
+}
+
+// Tick is the price refresh interval.
+func (c PerpFundingConfig) Tick() time.Duration {
+    return time.Duration(c.TickSeconds) * time.Second
+}
+
+// FundingInterval is the funding period.
+func (c PerpFundingConfig) FundingInterval() time.Duration {
+    return time.Duration(c.FundingIntervalSeconds) * time.Second
+}
+
+// MaxPriceAge is the index staleness threshold.
+func (c PerpFundingConfig) MaxPriceAge() time.Duration {
+    return time.Duration(c.MaxPriceAgeSeconds) * time.Second
+}
+
+// MaxMarkStaleness is the mark fallback window.
+func (c PerpFundingConfig) MaxMarkStaleness() time.Duration {
+    return time.Duration(c.MaxMarkStalenessSeconds) * time.Second
+}
+
+// PerpRiskConfig configures maintenance margin and forced liquidation
+// (subproject 6c).
+type PerpRiskConfig struct {
+    // MaintenanceMarginRate is the fraction of notional a position must keep as
+    // equity, 1e18-scaled.
+    MaintenanceMarginRate string
+    // LiquidatorFee is the fraction of notional paid to the liquidator, 1e18-scaled.
+    LiquidatorFee string
+    // InsuranceFundAccount is the hex account that absorbs losses beyond a
+    // trader's margin. Empty means the built-in reserve account.
+    InsuranceFundAccount string
+    // LiquidationIntervalSeconds is the pause between liquidation scans.
+    LiquidationIntervalSeconds int64
+}
+
+// LoadPerpRiskConfig reads 6c settings from the environment.
+func LoadPerpRiskConfig() PerpRiskConfig {
+    cfg := PerpRiskConfig{
+        MaintenanceMarginRate:      "5000000000000000", // 0.5%
+        LiquidatorFee:              "1000000000000000", // 0.1%
+        LiquidationIntervalSeconds: 1,
+    }
+    if v := os.Getenv("PERP_MAINTENANCE_MARGIN_RATE"); v != "" {
+        cfg.MaintenanceMarginRate = v
+    }
+    if v := os.Getenv("PERP_LIQUIDATOR_FEE"); v != "" {
+        cfg.LiquidatorFee = v
+    }
+    if v := os.Getenv("PERP_INSURANCE_FUND_ACCOUNT"); v != "" {
+        cfg.InsuranceFundAccount = v
+    }
+    if v := os.Getenv("PERP_LIQUIDATION_INTERVAL"); v != "" {
+        if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+            cfg.LiquidationIntervalSeconds = n
+        }
+    }
+    return cfg
+}
+
+// LiquidationInterval is the scan period.
+func (c PerpRiskConfig) LiquidationInterval() time.Duration {
+    return time.Duration(c.LiquidationIntervalSeconds) * time.Second
+}

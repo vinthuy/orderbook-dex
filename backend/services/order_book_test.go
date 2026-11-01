@@ -575,6 +575,53 @@ func TestOrderBookFatalDegradation(t *testing.T) {
 	}
 }
 
+func TestRecoverReemitsTradeEvents(t *testing.T) {
+	dir := t.TempDir()
+	l := ledger.New()
+	holds := ledger.NewHolds(l)
+	journal := mustJournal(t, dir)
+	bus := NewEventBus()
+
+	// Fund two accounts for a crossing pair.
+	deposit := func(a ledger.AccountID, asset ledger.AssetID, n uint64, ref string) {
+		t.Helper()
+		if err := l.Apply(ledger.DepositOp{Account: a, Asset: asset, Amount: uint256.NewInt(n), Ref: ref}); err != nil {
+			t.Fatalf("deposit: %v", err)
+		}
+	}
+	seller := obAcct(1)
+	buyer := obAcct(2)
+	deposit(seller, 2, 100, "d1") // base asset 2
+	deposit(buyer, 1, 100, "d2")  // quote asset 1
+
+	ob := mustNewOrderBook(t, obMarkets(), l, holds, journal, bus)
+	defer ob.Close()
+
+	// Place a sell then a crossing buy so a trade occurs and is journaled.
+	if _, err := ob.Place(limitReq(seller, matching.SideSell, 10, 5)); err != nil {
+		t.Fatalf("place sell: %v", err)
+	}
+	if _, err := ob.Place(limitReq(buyer, matching.SideBuy, 10, 5)); err != nil {
+		t.Fatalf("place buy: %v", err)
+	}
+
+	// Count trade events on a fresh bus while a fresh service replays the WAL.
+	count := 0
+	bus2 := NewEventBus()
+	bus2.Subscribe(TopicOrderBookTrade, func(e Event) error {
+		count++
+		return nil
+	})
+
+	ob2 := mustNewOrderBook(t, obMarkets(), l, holds, mustJournal(t, dir), bus2)
+	defer ob2.Close()
+	_ = ob2 // recovery runs in the constructor
+
+	if count == 0 {
+		t.Fatal("recover should re-emit the journaled trade event")
+	}
+}
+
 // TestSettlementWithdrawCannotTouchFrozenFunds is the fund-safety test for the
 // freeze/withdrawal boundary: a resting order's freeze is not withdrawable, and
 // only the available remainder can leave.
