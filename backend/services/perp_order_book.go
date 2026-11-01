@@ -88,6 +88,8 @@ type PerpOrderBookService struct {
 	// 6c risk state: the account that absorbs insolvency, and the scan cadence.
 	insuranceFund   ledger.AccountID
 	liquidationOpts LiquidationOptions
+	lastLiquidation time.Time
+	liquidationScans int
 
 	// badDebts buffers bad-debt events produced under s.mu; they are published
 	// after the lock is released (see reportDegraded / publish).
@@ -145,14 +147,12 @@ func (s *PerpOrderBookService) Start() error {
 	return nil
 }
 
-// tickInterval returns the configured price refresh cadence.
+// tickInterval returns the runner's wake-up cadence: the shortest interval the
+// scheduler drives.
 func (s *PerpOrderBookService) tickInterval() time.Duration {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.fundingOpts.Tick > 0 {
-		return s.fundingOpts.Tick
-	}
-	return perpRunInterval
+	return s.tickIntervalLocked()
 }
 
 func (s *PerpOrderBookService) Stop() error {
@@ -187,14 +187,27 @@ func (s *PerpOrderBookService) SetFundingOptions(opts FundingOptions) {
 		opts.Tick = perpRunInterval
 	}
 	s.fundingOpts = opts
-	s.run.setInterval(opts.Tick)
+	s.run.setInterval(s.tickIntervalLocked())
 }
 
-// tick is one scheduler iteration: refresh marks, then run any funding round
-// that is due.
+// tick is one scheduler iteration: refresh marks, run the liquidation scan when
+// its own interval is due, then run any funding round that is due.
 func (s *PerpOrderBookService) tick(now time.Time) {
 	s.refreshMarks(now)
-	s.scanLiquidations(now)
+
+	s.mu.Lock()
+	liqDue := s.lastLiquidation.IsZero() ||
+		now.Sub(s.lastLiquidation) >= s.liquidationInterval()
+	if liqDue {
+		s.lastLiquidation = now
+	}
+	s.mu.Unlock()
+	if liqDue {
+		s.mu.Lock()
+		s.liquidationScans++
+		s.mu.Unlock()
+		s.scanLiquidations(now)
+	}
 
 	s.mu.Lock()
 	opts := s.fundingOpts
@@ -746,3 +759,4 @@ func ParsePerpMarkets(s string) ([]perp.Market, error) {
 	}
 	return out, nil
 }
+
