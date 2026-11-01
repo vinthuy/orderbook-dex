@@ -61,6 +61,7 @@ type Result struct {
 	Trades   []Trade
 	Releases []MarginRelease
 	PnL      []PnLSettlement
+	Fees     []FeeSettlement
 }
 
 // LevelView is a price-level snapshot for Book.
@@ -306,6 +307,7 @@ func (e *Engine) Place(req PlaceRequest) (Result, error) {
 		trades   []Trade
 		releases []MarginRelease
 		pnl      []PnLSettlement
+		fees     []FeeSettlement
 		spent    = uint256.NewInt(0) // market-order quote already committed
 	)
 
@@ -377,10 +379,10 @@ func (e *Engine) Place(req PlaceRequest) (Result, error) {
 
 		// Update the taker's position. The taker's own order's reserved margin
 		// covers its opening leg; margin is derived from o.Price/o.Leverage.
-		e.applyFill(m, o, qty, price, e.nextTrade, &releases, &pnl)
+		e.applyFill(m, o, qty, price, e.nextTrade, FeeTaker, &releases, &pnl, &fees)
 		// Update the maker's position. The maker's resting order's reserved
 		// margin covers its opening leg, at its own price/leverage.
-		e.applyFill(m, maker, qty, price, e.nextTrade, &releases, &pnl)
+		e.applyFill(m, maker, qty, price, e.nextTrade, FeeMaker, &releases, &pnl, &fees)
 
 		if maker.Remaining().IsZero() {
 			e.releaseResidual(maker, &releases)
@@ -407,7 +409,7 @@ func (e *Engine) Place(req PlaceRequest) (Result, error) {
 		bk.add(o)
 	}
 
-	return Result{Order: o.clone(), Trades: trades, Releases: releases, PnL: pnl}, nil
+	return Result{Order: o.clone(), Trades: trades, Releases: releases, PnL: pnl, Fees: fees}, nil
 }
 
 // marginPrice is the price used for position-level margin: the order's own
@@ -426,7 +428,21 @@ func marginPrice(o *Order, fillPrice Price) Price {
 // releases margin on closes. The order's leverage and its margin price
 // (o.Price for limit orders, the fill price for market orders) drive margin,
 // per spec §4.4; the fill price drives PnL and the entry price.
-func (e *Engine) applyFill(m Market, o *Order, qty *uint256.Int, fillPrice Price, tradeID TradeID, releases *[]MarginRelease, pnl *[]PnLSettlement) {
+func (e *Engine) applyFill(m Market, o *Order, qty *uint256.Int, fillPrice Price, tradeID TradeID, role FeeRole, releases *[]MarginRelease, pnl *[]PnLSettlement, fees *[]FeeSettlement) {
+	// The fee is charged per account per fill, independent of whether the fill
+	// opens, increases, reduces or flips: it is a cost of trading, not of holding.
+	if m.FeeRates.Enabled() {
+		amt, err := m.Fee(qty, fillPrice, role)
+		if err != nil {
+			panic("perp: applyFill fee: " + err.Error())
+		}
+		if !amt.IsZero() {
+			*fees = append(*fees, FeeSettlement{
+				Market: m.ID, TradeID: tradeID, Account: o.Account, Role: role, Amount: amt,
+			})
+		}
+	}
+
 	byAcct := e.positions[m.ID]
 	pos := byAcct[o.Account]
 
@@ -640,6 +656,7 @@ func (e *Engine) liquidate(m MarketID, a ledger.AccountID, maxQty *uint256.Int, 
 		trades   []Trade
 		releases []MarginRelease
 		pnl      []PnLSettlement
+		fees     []FeeSettlement
 	)
 	for o.Remaining().Sign() > 0 {
 		maker := opp.bestOrder()
@@ -692,8 +709,8 @@ func (e *Engine) liquidate(m MarketID, a ledger.AccountID, maxQty *uint256.Int, 
 			maker.Status = StatusPartiallyFilled
 		}
 
-		e.applyFill(market, o, tradeQty, price, e.nextTrade, &releases, &pnl)
-		e.applyFill(market, maker, tradeQty, price, e.nextTrade, &releases, &pnl)
+		e.applyFill(market, o, tradeQty, price, e.nextTrade, FeeTaker, &releases, &pnl, &fees)
+		e.applyFill(market, maker, tradeQty, price, e.nextTrade, FeeMaker, &releases, &pnl, &fees)
 		if maker.Remaining().IsZero() {
 			e.releaseResidual(maker, &releases)
 		}
@@ -704,7 +721,7 @@ func (e *Engine) liquidate(m MarketID, a ledger.AccountID, maxQty *uint256.Int, 
 	} else {
 		o.Status = StatusCancelled
 	}
-	return Result{Order: o.clone(), Trades: trades, Releases: releases, PnL: pnl}, nil
+	return Result{Order: o.clone(), Trades: trades, Releases: releases, PnL: pnl, Fees: fees}, nil
 }
 
 // AutoDeleverage forcibly reduces a profitable position at the mark to cover a
@@ -848,4 +865,6 @@ func levelsOf(s *side, depth int) []LevelView {
 	}
 	return out
 }
+
+
 

@@ -268,6 +268,80 @@ func (g *Gateway) fundingState(c *gin.Context) {
 	})
 }
 
+// candles returns OHLCV bars for a market. Query: interval (default 1m), limit
+// (default 200, capped at 1000 so one request cannot pull the whole retained
+// series).
+func (g *Gateway) candles(c *gin.Context) {
+	market, err := strconv.ParseUint(c.Param("market"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request"})
+		return
+	}
+	iv := services.Interval1m
+	if v := c.Query("interval"); v != "" {
+		parsed, err := services.ParseInterval(v)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "bad_interval", "detail": err.Error()})
+			return
+		}
+		iv = parsed
+	}
+	limit := 200
+	if v := c.Query("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+
+	series := g.perp.Candles().Series(perp.MarketID(market), iv, limit)
+	out := make([]gin.H, 0, len(series))
+	for _, cd := range series {
+		out = append(out, gin.H{
+			"t": cd.OpenTime,
+			"o": uint64(cd.Open),
+			"h": uint64(cd.High),
+			"l": uint64(cd.Low),
+			"c": uint64(cd.Close),
+			"v": uintString(cd.Volume),
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"market": uint32(market), "interval": iv.String(), "candles": out,
+	})
+}
+
+// collateralBalances reports an account's pledgeable margin assets for a market,
+// with the quote value each would credit after its haircut.
+func (g *Gateway) collateralBalances(c *gin.Context) {
+	account, err := ledger.AccountFromHex(c.Param("account"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request"})
+		return
+	}
+	market, err := strconv.ParseUint(c.Param("market"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request"})
+		return
+	}
+	rows, err := g.perp.CollateralBalances(perp.MarketID(market), account)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request", "detail": err.Error()})
+		return
+	}
+	out := make([]gin.H, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, gin.H{
+			"asset": uint32(r.Asset), "balance": uintString(r.Balance),
+			"haircut": uintString(r.HaircutE18), "price": uint64(r.Price),
+			"value": uintString(r.Value),
+		})
+	}
+	c.JSON(http.StatusOK, out)
+}
+
 // --- views ----------------------------------------------------------------
 
 type orderView struct {

@@ -416,6 +416,74 @@ The default is `isolated`, which keeps the 6a semantics exactly.
 2. **Cross margin pools only per quote asset.** Positions in a different quote
    asset are judged separately; a full multi-asset risk engine is not implemented.
 
+## Fees, on-chain oracle, candles, and multi-asset margin
+
+### Trading fees
+
+Per fill, by role: `floor(notional(qty, price) * rate / 1e18)`. Set per market via
+`FeeRates{MakerE18, TakerE18}`; the zero value is no fees, so nothing changes for
+an existing deployment.
+
+A fee is a **transfer** to the fee account (default: the insurance fund, so fees
+strengthen the buffer that absorbs bad debt), never a burn or a mint. The
+idempotency key carries trade id, account and role.
+
+A fee larger than the balance is charged only up to the balance. Charging further
+would go negative on an account that is already being liquidated; the remainder is
+dropped, because a fee is never a claim on future funds.
+
+### On-chain oracle
+
+`contracts/PriceOracle.sol` publishes an operator-signed index price per market.
+It is an **operator-trusted** feed — the value of putting it on-chain is that the
+price becomes a public, timestamped, immutable record the matcher cannot silently
+rewrite, not that it is manipulation-proof.
+
+- `setPrice` is bounded by `maxDeviationBps` against the previous price, so one
+  compromised operator transaction cannot jump the feed arbitrarily.
+- Every write emits the previous value, so the feed's history is reconstructible
+  without trusting an indexer.
+- `getFreshPrice` reports staleness explicitly. `ChainPriceSource` treats a stale
+  or zero price as **no price**, which makes the matcher skip liquidation rather
+  than liquidate everyone at a value the operator stopped maintaining.
+
+### Candles
+
+`CandleStore` folds the `perp.trade` stream into OHLCV bars at 1m/5m/15m/1h/4h/1d.
+It reads the same events the WebSocket hub serves, so a chart can never disagree
+with the trade tape. Bars are aligned on unix seconds; a late trade inside the
+current bar folds in rather than creating a duplicate.
+
+`GET /v1/perp/candles/:market?interval=1h&limit=200` returns
+`{t,o,h,l,c,v}` rows. `frontend/perp.html` renders them as an SVG candle chart —
+no charting library, since the page is single-file with no build step.
+
+### Multi-asset margin
+
+A market can accept non-quote assets as margin through `Collateral`, each with a
+`haircutE18` discount and a price in the quote asset.
+
+**Assets are converted, not frozen natively.** `Pledge` debits the collateral and
+credits the market's quote asset at the haircut-adjusted value, so margin remains
+denominated in exactly one asset per market. The alternative — teaching the kernel
+to freeze several assets — would touch the order-level `ceil` freeze, the
+position-level `floor` accounting, the conservation invariant and every liquidation
+release, for a benefit the conversion already provides.
+
+The haircut discount is credited nowhere: the ledger total does not grow, the
+account simply has less margin than the collateral's face value. That is the point
+of a haircut.
+
+`GET /v1/perp/collateral/:market/:account` lists each accepted asset, its balance,
+haircut, price, and the quote value it would credit.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `PERP_FEE_MAKER` | `0` | maker fee, 1e18-scaled |
+| `PERP_FEE_TAKER` | `0` | taker fee, 1e18-scaled |
+| `PERP_ORACLE_ADDRESS` | (empty) | `PriceOracle` address; empty keeps static prices |
+| `PERP_ORACLE_MAX_AGE` | `60` | staleness bound passed to the oracle (seconds) |
+
 ## Perpetual Gateway (subproject 7a)
 
 The perpetual book is exposed over HTTP and WebSocket under a **separate

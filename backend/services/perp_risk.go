@@ -26,11 +26,29 @@ type LiquidationOptions struct {
 }
 
 // SetInsuranceFund sets the account that absorbs losses exceeding a liquidated
-// trader's margin.
+// trader's margin. It also becomes the fee recipient unless SetFeeAccount was
+// called, so fees strengthen the buffer that pays bad debt.
 func (s *PerpOrderBookService) SetInsuranceFund(a ledger.AccountID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.insuranceFund = a
+	if s.feeAccount == reservedInsuranceAccount {
+		s.feeAccount = a
+	}
+}
+
+// SetFeeAccount sets where trading fees are credited.
+func (s *PerpOrderBookService) SetFeeAccount(a ledger.AccountID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.feeAccount = a
+}
+
+// FeeAccount returns the account trading fees are credited to.
+func (s *PerpOrderBookService) FeeAccount() ledger.AccountID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.feeAccount
 }
 
 // InsuranceFund returns the configured insurance fund account.
@@ -270,10 +288,17 @@ func (s *PerpOrderBookService) liquidateLocked(market perp.Market, pos perp.Posi
 		merged.Trades = append(merged.Trades, r.Trades...)
 		merged.Releases = append(merged.Releases, r.Releases...)
 		merged.PnL = append(merged.PnL, r.PnL...)
+		merged.Fees = append(merged.Fees, r.Fees...)
 	}
 
 	// Realize PnL before releasing margin, exactly as the normal place path does.
 	if err := s.settlePnL(merged.PnL); err != nil {
+		_ = s.degrade(err)
+		return LiquidationEvent{}, perp.Result{}, false
+	}
+	// A forced close pays its fee like any other trade: the liquidated account is
+	// not exempt, and the fee is capped by its remaining balance.
+	if err := s.settleFees(merged.Fees); err != nil {
 		_ = s.degrade(err)
 		return LiquidationEvent{}, perp.Result{}, false
 	}

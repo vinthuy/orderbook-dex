@@ -122,6 +122,32 @@ func main() {
 				perpMarkets[i].RiskConfig.SlippageE18 = slip
 			}
 		}
+
+		// Fees are opt-in: an unset variable means no fee, so an existing
+		// deployment is unchanged.
+		ex := config.LoadPerpMarketExtras()
+		if ex.MakerFeeE18 != "" || ex.TakerFeeE18 != "" {
+			maker := uint256.NewInt(0)
+			taker := uint256.NewInt(0)
+			if ex.MakerFeeE18 != "" {
+				v, err := uint256.FromDecimal(ex.MakerFeeE18)
+				if err != nil {
+					log.Fatalf("Failed to parse PERP_FEE_MAKER: %v", err)
+				}
+				maker = v
+			}
+			if ex.TakerFeeE18 != "" {
+				v, err := uint256.FromDecimal(ex.TakerFeeE18)
+				if err != nil {
+					log.Fatalf("Failed to parse PERP_FEE_TAKER: %v", err)
+				}
+				taker = v
+			}
+			for i := range perpMarkets {
+				perpMarkets[i].FeeRates = perp.FeeRates{MakerE18: maker, TakerE18: taker}
+			}
+			log.Printf("perp fees: maker=%s taker=%s (1e18)", maker, taker)
+		}
 		perpJournal, err := services.NewPerpJournal(pc.DataDir)
 		if err != nil {
 			log.Fatalf("Failed to open perp journal: %v", err)

@@ -239,3 +239,92 @@ func (m Market) Liquidatable(p *Position, mark Price) (bool, error) {
 	}
 	return eq.Cmp(req.ToBig()) < 0, nil
 }
+
+// FeeRates configures per-fill fees, both 1e18-scaled fractions of notional.
+// The zero value means no fees, so an existing deployment is unchanged.
+type FeeRates struct {
+	MakerE18 *uint256.Int
+	TakerE18 *uint256.Int
+}
+
+// fee returns the rate for a role, treating nil as zero.
+func (f FeeRates) fee(role FeeRole) *uint256.Int {
+	r := f.TakerE18
+	if role == FeeMaker {
+		r = f.MakerE18
+	}
+	if r == nil {
+		return uint256.NewInt(0)
+	}
+	return r
+}
+
+// Enabled reports whether any fee is configured.
+func (f FeeRates) Enabled() bool {
+	return (f.MakerE18 != nil && !f.MakerE18.IsZero()) || (f.TakerE18 != nil && !f.TakerE18.IsZero())
+}
+
+// Fee returns floor(notional(qty, price) * rate / 1e18) for one fill. Flooring
+// keeps a dust fill from owing more than it is worth.
+func (m Market) Fee(qty *uint256.Int, price Price, role FeeRole) (*uint256.Int, error) {
+	rate := m.FeeRates.fee(role)
+	if rate.IsZero() || qty == nil || qty.IsZero() || price == 0 {
+		return uint256.NewInt(0), nil
+	}
+	notional, err := m.notionalChecked(qty, price, false)
+	if err != nil {
+		return nil, err
+	}
+	prod, overflow := new(uint256.Int).MulOverflow(notional, rate)
+	if overflow {
+		return nil, ErrAmountTooLarge
+	}
+	return prod.Div(prod, uint256.NewInt(scaleE18)), nil
+}
+
+// CollateralAsset is one non-quote asset accepted as margin, with the rate at
+// which it is valued in the market's quote asset.
+//
+// The haircut is not optional: a collateral asset that is not the settlement
+// asset carries price and liquidity risk the market does not control, so it is
+// credited at a discount (haircutE18 = 0.9 means 90% of market value). A haircut of
+// zero would credit nothing, which is a valid way to temporarily disable an asset.
+type CollateralAsset struct {
+	Asset    ledger.AssetID
+	// HaircutE18 scales the asset's quote value, 1e18 = no haircut.
+	HaircutE18 *uint256.Int
+	// Price is the asset's price in the market's quote asset, in quote minor
+	// units per whole unit of collateral. Must be > 0 to be usable.
+	Price Price
+}
+
+// CollateralValue returns floor(amount * price * haircut / 1e18 / scale), the
+// quote value credited for `amount` units of this collateral.
+func (c CollateralAsset) CollateralValue(amount *uint256.Int) (*uint256.Int, error) {
+	if amount == nil || amount.IsZero() || c.Price == 0 {
+		return uint256.NewInt(0), nil
+	}
+	if c.HaircutE18 == nil || c.HaircutE18.IsZero() {
+		return uint256.NewInt(0), nil
+	}
+	// product = amount * price * haircut, then / 1e18.
+	prod, overflow := new(uint256.Int).MulOverflow(amount, uint256.NewInt(uint64(c.Price)))
+	if overflow {
+		return nil, ErrAmountTooLarge
+	}
+	prod, overflow = new(uint256.Int).MulOverflow(prod, c.HaircutE18)
+	if overflow {
+		return nil, ErrAmountTooLarge
+	}
+	return prod.Div(prod, uint256.NewInt(scaleE18)), nil
+}
+
+// CollateralFor returns the configured collateral entry for an asset.
+func (m Market) CollateralFor(asset ledger.AssetID) (CollateralAsset, bool) {
+	for _, c := range m.Collateral {
+		if c.Asset == asset {
+			return c, true
+		}
+	}
+	return CollateralAsset{}, false
+}

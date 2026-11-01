@@ -311,5 +311,39 @@ func (c PerpRiskConfig) LiquidationInterval() time.Duration {
     return time.Duration(c.LiquidationIntervalSeconds) * time.Second
 }
 
+// PerpMarketExtras configures per-market fees, collateral, and the on-chain price
+// feed. Kept separate from PerpRiskConfig so a deployment can adopt them one at a
+// time.
+type PerpMarketExtras struct {
+    // MakerFeeE18 / TakerFeeE18 are per-fill fees, 1e18-scaled. Empty or "0" is
+    // no fee.
+    MakerFeeE18 string
+    TakerFeeE18 string
+    // OracleAddress is the PriceOracle contract. Empty keeps static index prices.
+    OracleAddress string
+    // OracleMaxAgeSeconds is the staleness bound handed to the oracle.
+    OracleMaxAgeSeconds uint64
+}
+
+// LoadPerpMarketExtras reads the fee and oracle settings.
+func LoadPerpMarketExtras() PerpMarketExtras {
+    cfg := PerpMarketExtras{OracleMaxAgeSeconds: 60}
+    if v := os.Getenv("PERP_FEE_MAKER"); v != "" {
+        cfg.MakerFeeE18 = v
+    }
+    if v := os.Getenv("PERP_FEE_TAKER"); v != "" {
+        cfg.TakerFeeE18 = v
+    }
+    if v := os.Getenv("PERP_ORACLE_ADDRESS"); v != "" {
+        cfg.OracleAddress = v
+    }
+    if v := os.Getenv("PERP_ORACLE_MAX_AGE"); v != "" {
+        if n, err := strconv.ParseUint(v, 10, 64); err == nil && n > 0 {
+            cfg.OracleMaxAgeSeconds = n
+        }
+    }
+    return cfg
+}
+
 // CrossMargin reports whether cross-margin judgement is enabled.
 func (c PerpRiskConfig) CrossMargin() bool { return c.MarginMode == "cross" }

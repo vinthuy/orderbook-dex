@@ -108,6 +108,10 @@ type Market struct {
 	MaxQty       *uint256.Int   // optional maximum base quantity (nil = 2^128)
 	MarkConfig   MarkConfig     // mark-price derivation (zero value = defaults)
 	RiskConfig   RiskConfig     // maintenance margin and liquidation fee (zero = defaults)
+	FeeRates     FeeRates       // per-fill maker/taker fees (zero = no fees)
+	// Collateral lists non-quote assets accepted as margin for this market.
+	// Empty means quote-asset-only, which is the pre-feature behaviour.
+	Collateral []CollateralAsset
 }
 
 const maxBaseDecimals = 76
