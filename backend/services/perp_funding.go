@@ -189,9 +189,36 @@ func (s *PerpOrderBookService) planFunding(market perp.Market, index uint64, mar
 		}
 	}
 
-	// Journal before mutating: the WAL is the truth source for replay.
+	// Compute the market's resulting debt state BEFORE journaling: legs do not say
+	// what a broke payer still owes, and without it a restart forgives every debt.
+	finalDebts := make(map[fundingDebtKey]*uint256.Int)
+	for k, v := range s.debts {
+		if k.Market == market.ID && v != nil && !v.IsZero() {
+			finalDebts[k] = new(uint256.Int).Set(v)
+		}
+	}
+	for k, v := range newDebts {
+		if v == nil || v.IsZero() {
+			delete(finalDebts, k)
+			continue
+		}
+		finalDebts[k] = new(uint256.Int).Set(v)
+	}
+	debtKeys := make([]fundingDebtKey, 0, len(finalDebts))
+	for k := range finalDebts {
+		debtKeys = append(debtKeys, k)
+	}
+	sort.Slice(debtKeys, func(i, j int) bool {
+		return bytes.Compare(debtKeys[i].Account[:], debtKeys[j].Account[:]) < 0
+	})
+	debts := make([]FundingDebt, 0, len(debtKeys))
+	for _, k := range debtKeys {
+		debts = append(debts, FundingDebt{Account: k.Account, Amount: finalDebts[k]})
+	}
+
 	if err := s.journal.AppendFunding(FundingCmd{
-		Market: market.ID, Index: index, Rate: rateScaled.String(), Mark: mark, At: at, Legs: legs,
+		Market: market.ID, Index: index, Rate: rateScaled.String(), Mark: mark, At: at,
+		Legs: legs, Debts: debts,
 	}); err != nil {
 		return nil, nil, fmt.Errorf("services: perp: journal funding: %w", err)
 	}

@@ -161,11 +161,12 @@ func (j *PerpJournal) append(kind string, payload any) error {
 
 // PerpInstruction is one decoded instruction for replay.
 type PerpInstruction struct {
-	Kind    string // "place" | "cancel" | "mark" | "funding"
-	Place   *perp.PlaceRequest
-	Cancel  *perpCancelInstruction
-	Mark    *MarkCmd
-	Funding *FundingCmd
+	Kind        string // "place" | "cancel" | "mark" | "funding" | "liquidation"
+	Place       *perp.PlaceRequest
+	Cancel      *perpCancelInstruction
+	Mark        *MarkCmd
+	Funding     *FundingCmd
+	Liquidation *LiquidationCmd
 }
 
 // MarkCmd records one observed price observation. It is journaled so a replay
@@ -195,6 +196,16 @@ type FundingCmd struct {
 	Mark   perp.Price
 	At     int64
 	Legs   []FundingLeg
+	// Debts is the full debt state for this market AFTER the round. Without it a
+	// restart would forgive every unpaid funding debt, because legs alone do not
+	// record what a broke payer still owes.
+	Debts []FundingDebt
+}
+
+// FundingDebt is one account's unpaid funding in one market.
+type FundingDebt struct {
+	Account ledger.AccountID
+	Amount  *uint256.Int
 }
 
 type perpMarkJSON struct {
@@ -217,6 +228,13 @@ type perpFundingJSON struct {
 	Mark   uint64               `json:"mark_price"`
 	At     int64                `json:"at"`
 	Legs   []perpFundingLegJSON `json:"legs"`
+	Debts  []perpFundingDebtJSON `json:"debts,omitempty"`
+}
+
+// perpFundingDebtJSON is one persisted unpaid funding amount.
+type perpFundingDebtJSON struct {
+	Account string `json:"account"`
+	Amount  string `json:"amount"`
 }
 
 // AppendMark records one price observation durably.
@@ -236,7 +254,36 @@ func (j *PerpJournal) AppendFunding(c FundingCmd) error {
 			Payer: l.Payer.Hex(), Receiver: l.Receiver.Hex(), Amount: l.Amount.Dec(),
 		})
 	}
+	for _, d := range c.Debts {
+		payload.Debts = append(payload.Debts, perpFundingDebtJSON{
+			Account: d.Account.Hex(), Amount: d.Amount.Dec(),
+		})
+	}
 	return j.append("funding", payload)
+}
+
+// LiquidationCmd records one forced liquidation. Replaying it re-runs the
+// deterministic kernel close, so a liquidated position cannot reappear after a
+// restart with the ledger already having settled its loss.
+type LiquidationCmd struct {
+	Market  perp.MarketID
+	Account ledger.AccountID
+	Mark    perp.Price
+	At      int64
+}
+
+type perpLiquidationJSON struct {
+	Market  uint32 `json:"market"`
+	Account string `json:"account"`
+	Mark    uint64 `json:"mark_price"`
+	At      int64  `json:"at"`
+}
+
+// AppendLiquidation records one forced liquidation durably.
+func (j *PerpJournal) AppendLiquidation(c LiquidationCmd) error {
+	return j.append("liquidation", perpLiquidationJSON{
+		Market: uint32(c.Market), Account: c.Account.Hex(), Mark: uint64(c.Mark), At: c.At,
+	})
 }
 
 type perpCancelInstruction struct {
@@ -356,7 +403,31 @@ func (j *PerpJournal) Replay() ([]PerpInstruction, error) {
 				}
 				cmd.Legs = append(cmd.Legs, FundingLeg{Payer: payer, Receiver: receiver, Amount: amount})
 			}
+			for _, d := range fd.Debts {
+				acct, err := ledger.AccountFromHex(d.Account)
+				if err != nil {
+					return nil, err
+				}
+				amount, err := uint256.FromDecimal(d.Amount)
+				if err != nil {
+					return nil, fmt.Errorf("services: bad funding debt %q: %w", d.Amount, err)
+				}
+				cmd.Debts = append(cmd.Debts, FundingDebt{Account: acct, Amount: amount})
+			}
 			out = append(out, PerpInstruction{Kind: "funding", Funding: &cmd})
+		case "liquidation":
+			var lq perpLiquidationJSON
+			if err := json.Unmarshal(ln.Payload, &lq); err != nil {
+				return nil, err
+			}
+			account, err := ledger.AccountFromHex(lq.Account)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, PerpInstruction{Kind: "liquidation", Liquidation: &LiquidationCmd{
+				Market: perp.MarketID(lq.Market), Account: account,
+				Mark: perp.Price(lq.Mark), At: lq.At,
+			}})
 		default:
 			return nil, fmt.Errorf("services: unknown perp journal kind %q", ln.Kind)
 		}

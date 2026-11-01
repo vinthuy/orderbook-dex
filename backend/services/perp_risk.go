@@ -90,82 +90,137 @@ func (s *PerpOrderBookService) scanLiquidations(now time.Time) {
 }
 
 // liquidate force-closes one position and reports it.
+//
+// The instruction is journaled BEFORE the engine is touched, so a restart replays
+// the same liquidation instead of resurrecting a position whose loss the ledger
+// already settled. Events are published after the lock is released, for the same
+// re-entrancy reason as Place.
 func (s *PerpOrderBookService) liquidate(market perp.Market, pos perp.Position, mark perp.Price, now time.Time) {
+	ev, res, ok := s.liquidateLocked(market, pos, mark, now)
+	if !ok {
+		return
+	}
+	s.publish(res)
+	_ = s.bus.Publish(Event{Topic: TopicPerpLiquidation, Data: ev})
+}
+
+func (s *PerpOrderBookService) liquidateLocked(market perp.Market, pos perp.Position, mark perp.Price, now time.Time) (LiquidationEvent, perp.Result, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fatalErr != nil {
-		return
+		return LiquidationEvent{}, perp.Result{}, false
 	}
 
 	equity, err := market.Equity(pos.Side, pos.Size, pos.EntryPrice, mark, pos.Margin)
 	if err != nil {
-		return
+		return LiquidationEvent{}, perp.Result{}, false
 	}
 	fee, err := market.LiquidatorFee(pos.Size, mark)
 	if err != nil {
 		fee = uint256.NewInt(0)
 	}
 
+	// Journal first: the WAL is the truth source. Replaying this record re-runs
+	// the identical liquidation (the kernel is deterministic), so the position
+	// cannot come back after a restart.
+	if err := s.journal.AppendLiquidation(LiquidationCmd{
+		Market: market.ID, Account: pos.Account, Mark: mark, At: now.Unix(),
+	}); err != nil {
+		_ = s.degrade(fmt.Errorf("services: perp: journal liquidation: %w", err))
+		return LiquidationEvent{}, perp.Result{}, false
+	}
+
 	res, err := s.engine.Liquidate(market.ID, pos.Account, nil)
 	if err != nil {
 		if errors.Is(err, perp.ErrOrderNotFound) {
-			return // Already closed by another path.
+			return LiquidationEvent{}, perp.Result{}, false // Already closed by another path.
 		}
 		_ = s.degrade(fmt.Errorf("services: perp: liquidate %s: %w", pos.Account.Hex(), err))
-		return
+		return LiquidationEvent{}, perp.Result{}, false
 	}
 
 	// Realize PnL before releasing margin, exactly as the normal place path does.
 	if err := s.settlePnL(res.PnL); err != nil {
 		_ = s.degrade(err)
-		return
+		return LiquidationEvent{}, perp.Result{}, false
 	}
 	for _, r := range res.Releases {
 		if err := s.holds.Release(r.Account, market.Quote, r.Amount); err != nil {
 			_ = s.degrade(err)
-			return
+			return LiquidationEvent{}, perp.Result{}, false
 		}
 	}
 
-	// Pay the liquidator (the operator in v1) out of the position's released
-	// margin, never out of thin air: if the margin is exhausted the fee is capped.
-	if !fee.IsZero() {
-		s.payLiquidationFee(pos.Account, market.Quote, fee, res.Trades)
-	}
+	// Pay the liquidator out of the position's released margin, never out of thin
+	// air: the fee is capped by what the close actually freed.
+	fee = s.payLiquidationFee(pos.Account, market.Quote, fee, res.Releases)
 
-	remaining, stillOpen := s.engine.Position(market.ID, pos.Account)
-	_ = remaining
-	s.publish(res)
-	_ = s.bus.Publish(Event{Topic: TopicPerpLiquidation, Data: LiquidationEvent{
-		Market: market.ID, Account: pos.Account, Size: pos.Size, Mark: mark,
+	// Report what actually closed, not what was requested.
+	closed := uint256.NewInt(0)
+	for _, t := range res.Trades {
+		if t.Qty != nil {
+			closed.Add(closed, t.Qty)
+		}
+	}
+	_, stillOpen := s.engine.Position(market.ID, pos.Account)
+
+	return LiquidationEvent{
+		Market: market.ID, Account: pos.Account, Size: closed, Mark: mark,
 		Equity: equity, Fee: fee, Partial: stillOpen, At: now.Unix(),
-	}})
+	}, res, len(res.Trades) > 0
 }
 
 // payLiquidationFee moves up to fee from the liquidated account's balance to the
 // insurance fund. It never overdraws: the transfer is capped at the account's
 // remaining balance, so a liquidation cannot mint a negative balance.
-func (s *PerpOrderBookService) payLiquidationFee(account ledger.AccountID, asset ledger.AssetID, fee *uint256.Int, trades []perp.Trade) {
-	if fee.IsZero() || len(trades) == 0 {
-		return
+// payLiquidationFee moves up to fee from the liquidated account to the insurance
+// fund, and returns what was actually charged.
+//
+// The cap is the position's RELEASED MARGIN, not the account's whole balance: the
+// fee is a liquidation cost paid out of the margin that was backing this position,
+// and charging from the full balance would reach funds belonging to other
+// positions in the same quote asset (margin is isolated per market, but the asset
+// is shared).
+func (s *PerpOrderBookService) payLiquidationFee(account ledger.AccountID, asset ledger.AssetID, fee *uint256.Int, releases []perp.MarginRelease) *uint256.Int {
+	if fee.IsZero() {
+		return uint256.NewInt(0)
 	}
-	balance := s.ledger.Balance(account, asset)
+	// Sum what this close released for the account.
+	released := uint256.NewInt(0)
+	for _, r := range releases {
+		if r.Account == account && r.Amount != nil {
+			released.Add(released, r.Amount)
+		}
+	}
 	payable := new(uint256.Int).Set(fee)
-	if balance.Cmp(payable) < 0 {
-		payable = new(uint256.Int).Set(balance)
+	if released.Cmp(payable) < 0 {
+		payable = new(uint256.Int).Set(released)
+	}
+	// The account may still have spent the released margin on its loss; never
+	// overdraw what it holds right now.
+	if bal := s.ledger.Balance(account, asset); bal.Cmp(payable) < 0 {
+		payable = new(uint256.Int).Set(bal)
 	}
 	if payable.IsZero() {
-		return
+		return uint256.NewInt(0)
 	}
-	ref := fmt.Sprintf("perp:liqfee:%d:%s", trades[len(trades)-1].ID, account.Hex())
-	if s.ledger.WasApplied(ref) {
-		return
+
+	ref := liquidationFeeRef(account, asset)
+	if !s.ledger.WasApplied(ref) {
+		if err := s.ledger.Apply(ledger.TransferOp{
+			From: account, To: s.insuranceFund, Asset: asset, Amount: payable, Ref: ref,
+		}); err != nil {
+			// A fee failure must never block a liquidation that already closed the
+			// position; the trade is the important part.
+			return uint256.NewInt(0)
+		}
 	}
-	if err := s.ledger.Apply(ledger.TransferOp{
-		From: account, To: s.insuranceFund, Asset: asset, Amount: payable, Ref: ref,
-	}); err != nil {
-		// A fee failure must never block a liquidation that already closed the
-		// position; the trade is the important part.
-		return
-	}
+	return payable
+}
+
+// liquidationFeeRef keys the fee transfer on the account and asset only. The fee
+// is charged at most once per account per asset, so a partial liquidation followed
+// by a full one in the same scan cannot charge twice.
+func liquidationFeeRef(account ledger.AccountID, asset ledger.AssetID) string {
+	return fmt.Sprintf("perp:liqfee:%s:%d", account.Hex(), asset)
 }
