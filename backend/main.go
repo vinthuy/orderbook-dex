@@ -112,6 +112,14 @@ func main() {
 			perpMarkets[i].RiskConfig = perp.RiskConfig{
 				MaintenanceMarginRateE18: maintenanceRate,
 				LiquidatorFeeE18:         liquidatorFee,
+				Mode:                     riskMode(rc),
+			}
+			if rc.SlippageE18 != "" {
+				slip, err := uint256.FromDecimal(rc.SlippageE18)
+				if err != nil {
+					log.Fatalf("Failed to parse PERP_LIQUIDATION_SLIPPAGE: %v", err)
+				}
+				perpMarkets[i].RiskConfig.SlippageE18 = slip
 			}
 		}
 		perpJournal, err := services.NewPerpJournal(pc.DataDir)
@@ -352,6 +360,21 @@ func gatewayConfigFromEnv() gateway.Config {
 		Rate:          gc.Rate,
 		Burst:         gc.Burst,
 		NonceDir:      gc.NonceDir,
+	}
+}
+
+// riskMode maps the configured margin mode onto the kernel's enum. An unknown
+// value fails startup rather than silently falling back to isolated: the two modes
+// decide when real money is taken from a user, so a typo must not be guessed.
+func riskMode(rc config.PerpRiskConfig) perp.MarginMode {
+	switch rc.MarginMode {
+	case "", "isolated":
+		return perp.MarginIsolated
+	case "cross":
+		return perp.MarginCross
+	default:
+		log.Fatalf("PERP_MARGIN_MODE %q: want \"isolated\" or \"cross\"", rc.MarginMode)
+		return perp.MarginIsolated
 	}
 }
 

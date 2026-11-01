@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +28,8 @@ const (
 	// 6c topics: forced liquidations and bad debt absorbed by the insurance fund.
 	TopicPerpLiquidation = "perp.liquidation"
 	TopicPerpBadDebt     = "perp.baddebt"
+	// TopicPerpADL reports auto-deleveraging of a profitable position.
+	TopicPerpADL = "perp.adl"
 
 	// perpRunInterval is the default poll interval for the runner: one price
 	// refresh per tick (6b). With no PriceSource it is pure overhead, which is
@@ -65,6 +68,16 @@ type BadDebtEvent struct {
 	At      int64
 }
 
+// ADLEvent is published when a profitable position is force-reduced to cover a
+// shortfall the insurance fund could not pay.
+type ADLEvent struct {
+	Market  perp.MarketID
+	Account ledger.AccountID
+	Qty     *uint256.Int
+	Mark    perp.Price
+	Ref     string
+}
+
 // PerpOrderBookService hosts the perp kernel: it freezes quote margin, journals
 // instructions, matches, realizes PnL into the ledger, releases margin, and
 // publishes events — in that order.
@@ -94,6 +107,8 @@ type PerpOrderBookService struct {
 	// badDebts buffers bad-debt events produced under s.mu; they are published
 	// after the lock is released (see reportDegraded / publish).
 	badDebts []BadDebtEvent
+	// adlEvents buffers auto-deleverage events for the same reason.
+	adlEvents []ADLEvent
 
 	mu       sync.Mutex
 	fatalErr error
@@ -535,6 +550,18 @@ func (s *PerpOrderBookService) coverShortfall(account ledger.AccountID, asset le
 		}
 	}
 	ev := &BadDebtEvent{Account: account, Asset: asset, Amount: shortfall}
+	// Try to cover the shortfall by de-leveraging profitable positions first. ADL
+	// is the last resort before bad debt: it takes profit from winners rather
+	// than minting the shortfall out of nothing.
+	if covered, adlErr := s.autoDeleverage(asset, shortfall, account); adlErr == nil && covered.Sign() > 0 {
+		remaining := new(uint256.Int).Sub(shortfall, covered)
+		if remaining.IsZero() {
+			return nil, nil // fully covered; no bad debt
+		}
+		shortfall = remaining
+		ev.Amount = shortfall
+	}
+
 	if err := s.ledger.Apply(ledger.WithdrawOp{
 		Account: s.insuranceFund, Asset: asset, Amount: shortfall,
 		Ref: fmt.Sprintf("%s:drawn", ref),
@@ -547,6 +574,121 @@ func (s *PerpOrderBookService) coverShortfall(account ledger.AccountID, asset le
 		return nil, err
 	}
 	return ev, nil
+}
+
+// autoDeleverage reduces profitable positions to cover up to `need`, returning
+// the amount actually raised. Caller must hold s.mu.
+//
+// Selection is by unrealized profit, largest first: ADL must remove the least
+// size to cover the gap, and the biggest winner is the one carrying the most
+// unrealized gain to give back. Positions are reduced at the mark, so the winner
+// keeps the profit it had earned up to that price.
+func (s *PerpOrderBookService) autoDeleverage(asset ledger.AssetID, need *uint256.Int, deficient ledger.AccountID) (*uint256.Int, error) {
+	raised := uint256.NewInt(0)
+	if need.IsZero() {
+		return raised, nil
+	}
+
+	type candidate struct {
+		market perp.Market
+		pos    perp.Position
+		mark   perp.Price
+		profit *big.Int
+	}
+	var cands []candidate
+	// Caller holds s.mu, so the fields are read directly.
+	if s.tracker == nil {
+		return raised, nil // no prices, no way to judge profit
+	}
+	for id, market := range s.markets {
+		if market.Quote != asset {
+			continue
+		}
+		mark, ok := s.tracker.LastMark(id)
+		if !ok {
+			continue // never de-leverage on a missing price
+		}
+		for _, p := range s.engine.Positions(id) {
+			pnl, err := market.UnrealizedPnL(p.Side, p.Size, p.EntryPrice, mark)
+			if err != nil || pnl.Sign() <= 0 {
+				continue // only profitable positions are eligible
+			}
+			cands = append(cands, candidate{market: market, pos: p, mark: mark, profit: pnl})
+		}
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		if c := cands[i].profit.Cmp(cands[j].profit); c != 0 {
+			return c > 0
+		}
+		return cands[i].pos.Account.Hex() < cands[j].pos.Account.Hex()
+	})
+
+	for _, c := range cands {
+		if raised.Cmp(need) >= 0 {
+			break
+		}
+		// How much of this position covers the remaining need: at the mark, a
+		// unit of size yields notional/leverage-independent profit proportional
+		// to the price move. Reduce at most the whole position.
+		qty := new(uint256.Int).Set(c.pos.Size)
+		avail := new(big.Int).Set(c.profit)
+		remainingNeed := new(big.Int).Sub(need.ToBig(), raised.ToBig())
+		if avail.Cmp(remainingNeed) > 0 {
+			// Only part of the position is needed: scale qty by need/profit.
+			scaled := new(big.Int).Mul(qty.ToBig(), remainingNeed)
+			scaled.Div(scaled, avail)
+			if scaled.Sign() <= 0 {
+				continue
+			}
+			q := uint256.MustFromBig(scaled)
+			if q.Cmp(qty) > 0 {
+				q = qty
+			}
+			qty = q
+		}
+
+		res, err := s.engine.AutoDeleverage(c.market.ID, c.pos.Account, qty, c.mark)
+		if err != nil {
+			if errors.Is(err, perp.ErrOrderNotFound) {
+				continue
+			}
+			return raised, err
+		}
+		for _, r := range res.Releases {
+			if err := s.holds.Release(r.Account, asset, r.Amount); err != nil {
+				return raised, err
+			}
+		}
+
+		// The profit realized by this reduction pays the shortfall. It is MOVED,
+		// not created: a single TransferOp takes it from the de-leveraged winner
+		// and credits the insolvent account, so the ledger total is unchanged.
+		// settlePnL is deliberately not used — it would deposit the profit without
+		// debiting anything, minting the money ADL exists to avoid minting.
+		for _, p := range res.PnL {
+			if p.Profit.Sign() <= 0 {
+				continue
+			}
+			transferRef := fmt.Sprintf("perp:adl:%d:%s", p.TradeID, p.Account.Hex())
+			if !s.ledger.WasApplied(transferRef) {
+				if err := s.ledger.Apply(ledger.TransferOp{
+					From: p.Account, To: deficient, Asset: asset,
+					Amount: p.Profit, Ref: transferRef,
+				}); err != nil {
+					return raised, err
+				}
+			}
+			raised.Add(raised, p.Profit)
+		}
+		s.adlEvents = append(s.adlEvents, ADLEvent{
+			Account: c.pos.Account, Market: c.market.ID,
+			Qty: new(uint256.Int).Set(qty), Mark: c.mark, Ref: deficient.Hex(),
+		})
+	}
+	if raised.Cmp(need) > 0 {
+		raised = new(uint256.Int).Set(need)
+	}
+	return raised, nil
 }
 
 // degrade marks the service unusable and returns the sentinel error. It does NOT
@@ -575,9 +717,14 @@ func (s *PerpOrderBookService) publish(res perp.Result) {
 	s.mu.Lock()
 	debts := s.badDebts
 	s.badDebts = nil
+	adls := s.adlEvents
+	s.adlEvents = nil
 	s.mu.Unlock()
 	for _, ev := range debts {
 		_ = s.bus.Publish(Event{Topic: TopicPerpBadDebt, Data: ev})
+	}
+	for _, ev := range adls {
+		_ = s.bus.Publish(Event{Topic: TopicPerpADL, Data: ev})
 	}
 }
 
@@ -657,10 +804,18 @@ func (s *PerpOrderBookService) recover() error {
 				return fmt.Errorf("services: perp: replay cancel: %w", err)
 			}
 		case "liquidation":
-			// Replay the forced close. Without this the engine would keep the
-			// liquidated position, resurrecting it after a restart even though the
-			// ledger already settled its loss on the first pass.
-			res, err := s.engine.Liquidate(in.Liquidation.Market, in.Liquidation.Account, nil)
+			// Replay the forced close rung exactly as it ran. The Limit field
+			// distinguishes the limit pass from the market sweep, and the two fill
+			// against different counterparties — replaying a sweep when a limit
+			// ran would produce a different book and different PnL.
+			var res perp.Result
+			var err error
+			if in.Liquidation.Limit == 0 {
+				res, err = s.engine.Liquidate(in.Liquidation.Market, in.Liquidation.Account, nil)
+			} else {
+				res, err = s.engine.LiquidateLimit(in.Liquidation.Market, in.Liquidation.Account,
+					nil, in.Liquidation.Limit)
+			}
 			if err != nil {
 				if errors.Is(err, perp.ErrOrderNotFound) {
 					continue // Already closed by an earlier replayed instruction.
@@ -759,4 +914,5 @@ func ParsePerpMarkets(s string) ([]perp.Market, error) {
 	}
 	return out, nil
 }
+
 

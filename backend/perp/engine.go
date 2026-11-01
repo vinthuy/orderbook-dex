@@ -557,14 +557,28 @@ func (m Market) UnrealizedPnL(side Side, size *uint256.Int, entry, mark Price) (
 	return new(big.Int).Sub(entryNotional.ToBig(), markNotional.ToBig()), nil
 }
 
-// Liquidate force-closes a position by submitting an opposite-side IOC order
-// without freezing new margin (spec §3.2). The account is already short of
-// equity, so there is nothing left to reserve; the closing leg releases the
-// position's remaining margin proportionally, exactly as a reduce would.
-//
-// An IOC order that cannot fully fill leaves the residual position open; the
-// caller sees that in the returned Order status and may retry next scan.
+// Liquidate force-closes a position with an opposite-side market IOC order that
+// sweeps the book until the position is gone or liquidity runs out.
 func (e *Engine) Liquidate(m MarketID, a ledger.AccountID, maxQty *uint256.Int) (Result, error) {
+	return e.liquidate(m, a, maxQty, 0)
+}
+
+// LiquidateLimit force-closes a position with an opposite-side LIMIT IOC order:
+// it only trades at prices at least as good as limit and leaves the rest of the
+// position open. It is the first rung of the liquidation ladder — sweeping the
+// book at any price (Liquidate) is the fallback when the limit pass cannot fill.
+//
+// limit must be > 0. For a long being closed (a sell), "at least as good" means
+// price >= limit; for a short being closed (a buy), price <= limit.
+func (e *Engine) LiquidateLimit(m MarketID, a ledger.AccountID, maxQty *uint256.Int, limit Price) (Result, error) {
+	if limit == 0 {
+		return Result{}, fmt.Errorf("%w: a limit liquidation requires price > 0", ErrBadRequest)
+	}
+	return e.liquidate(m, a, maxQty, limit)
+}
+
+// liquidate builds and runs the closing order. A zero limit means "market".
+func (e *Engine) liquidate(m MarketID, a ledger.AccountID, maxQty *uint256.Int, limit Price) (Result, error) {
 	market, ok := e.byID[m]
 	if !ok {
 		return Result{}, ErrUnknownMarket
@@ -589,6 +603,10 @@ func (e *Engine) Liquidate(m MarketID, a ledger.AccountID, maxQty *uint256.Int) 
 
 	// Build the order by hand: Place would validate leverage and derive a margin
 	// freeze, neither of which applies to a forced close.
+	orderType := TypeMarket
+	if limit != 0 {
+		orderType = TypeLimit
+	}
 	e.nextID++
 	e.nextSeq++
 	o := &Order{
@@ -597,9 +615,9 @@ func (e *Engine) Liquidate(m MarketID, a ledger.AccountID, maxQty *uint256.Int) 
 		Market:  m,
 		Account: a,
 		Side:    side,
-		Type:    TypeMarket,
+		Type:    orderType,
 		TIF:     TIFIOC,
-		Price:   0,
+		Price:   limit,
 		Qty:     qty,
 		// MaxNotional lets the market-order path cap its own spending. It is a
 		// safety bound only: the close is qty-limited, and the reduce branch of
@@ -639,6 +657,17 @@ func (e *Engine) Liquidate(m MarketID, a ledger.AccountID, maxQty *uint256.Int) 
 		}
 
 		price := maker.Price
+		// A limit liquidation only trades at acceptable prices: a sell (closing a
+		// long) needs price >= limit, a buy (closing a short) needs price <= limit.
+		// The book is sorted, so the first unacceptable price ends the sweep.
+		if limit != 0 {
+			if side == SideShort && price < limit {
+				break
+			}
+			if side == SideLong && price > limit {
+				break
+			}
+		}
 		tradeQty := minUint(o.Remaining(), maker.Remaining())
 
 		e.nextTrade++
@@ -678,6 +707,89 @@ func (e *Engine) Liquidate(m MarketID, a ledger.AccountID, maxQty *uint256.Int) 
 	return Result{Order: o.clone(), Trades: trades, Releases: releases, PnL: pnl}, nil
 }
 
+// AutoDeleverage forcibly reduces a profitable position at the mark to cover a
+// shortfall the insurance fund cannot pay. Unlike Liquidate it does not trade
+// against the book: it settles the reduced size at mark directly against the
+// position, which is the defining property of ADL — the counterparty's profit is
+// crystallised at the oracle price, not at whatever liquidity exists.
+//
+// It returns the realized PnL for the deleveraged account (always a credit, since
+// only profitable positions are eligible) and the released margin.
+func (e *Engine) AutoDeleverage(m MarketID, a ledger.AccountID, qty *uint256.Int, mark Price) (Result, error) {
+	market, ok := e.byID[m]
+	if !ok {
+		return Result{}, ErrUnknownMarket
+	}
+	pos, ok := e.positions[m][a]
+	if !ok || pos.Size == nil || pos.Size.IsZero() {
+		return Result{}, ErrOrderNotFound
+	}
+	if mark == 0 {
+		return Result{}, fmt.Errorf("%w: auto-deleverage requires a positive mark", ErrBadRequest)
+	}
+	if qty == nil || qty.Sign() == 0 {
+		return Result{}, fmt.Errorf("%w: auto-deleverage qty must be > 0", ErrBadRequest)
+	}
+	reduce := cloneInt(qty)
+	if reduce.Cmp(pos.Size) > 0 {
+		reduce = cloneInt(pos.Size)
+	}
+
+	e.nextTrade++
+	tradeID := e.nextTrade
+
+	prevSize := cloneInt(pos.Size)
+	closed := reduce
+
+	// Realize PnL at the mark, signed the same way applyFill does.
+	entryNotional, err := market.notionalChecked(closed, pos.EntryPrice, false)
+	if err != nil {
+		return Result{}, err
+	}
+	markNotional, err := market.notionalChecked(closed, mark, false)
+	if err != nil {
+		return Result{}, err
+	}
+	var profit *uint256.Int
+	if pos.Side == SideLong {
+		profit = new(uint256.Int).Sub(markNotional, entryNotional)
+	} else {
+		profit = new(uint256.Int).Sub(entryNotional, markNotional)
+	}
+	pnl := []PnLSettlement{{Market: m, TradeID: tradeID, Account: a, Profit: profit}}
+
+	// Release margin proportionally to the reduced size.
+	release := new(uint256.Int).Mul(pos.Margin, closed)
+	release.Div(release, prevSize)
+	var releases []MarginRelease
+	if !release.IsZero() {
+		releases = append(releases, MarginRelease{Account: a, Amount: cloneInt(release)})
+	}
+
+	// Keep EntryPrice consistent for a later increase.
+	pos.qtyPrice.Sub(pos.qtyPrice, new(uint256.Int).Mul(closed, uint256.NewInt(uint64(pos.EntryPrice))))
+	pos.Margin.Sub(pos.Margin, release)
+	pos.Size.Sub(pos.Size, closed)
+	if pos.Size.IsZero() {
+		delete(e.positions[m], a)
+	}
+
+	// An ADL trade has no counterparty order; record it as a self-describing
+	// Trade so events and the indexer see the de-leveraged quantity.
+	trade := Trade{
+		ID:         tradeID,
+		Market:     m,
+		Price:      mark,
+		Qty:        cloneInt(closed),
+		Notional:   cloneInt(markNotional),
+		Maker:      a,
+		Taker:      a,
+		MakerSide:  pos.Side,
+		MakerOrder: 0,
+		TakerOrder: 0,
+	}
+	return Result{Trades: []Trade{trade}, Releases: releases, PnL: pnl}, nil
+}
 // releaseResidual appends a release for an order's remaining reserved margin.
 func (e *Engine) releaseResidual(o *Order, out *[]MarginRelease) {
 	if o.reserved == nil || o.reserved.Sign() == 0 {

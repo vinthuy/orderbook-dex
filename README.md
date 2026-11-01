@@ -359,6 +359,63 @@ reason to stop the market.
 3. **Full close, not partial.** v1 closes the entire position at once.
 4. **No fill guarantee.** Thin books can leave a position partially closed.
 
+## Liquidation ladder, ADL, and cross margin
+
+### Ladder
+
+A liquidation runs in two rungs, journaled separately because they fill against
+different counterparties:
+
+1. **Limit IOC** at `mark ± slippage` (default 1%). A long is closed by selling, so
+   the floor is `mark*(1-slippage)`; a short by buying, so the ceiling is
+   `mark*(1+slippage)`. This keeps a liquidation from dumping into a thin book.
+2. **Market sweep** of whatever the limit pass left. Without it a position could
+   sit liquidatable forever because the top of the book was better than the limit.
+
+`PERP_LIQUIDATION_SLIPPAGE=0` disables the limit rung (sweep-only, the old
+behaviour).
+
+### ADL
+
+When a liquidation shortfall exceeds the insurance fund, profitable positions are
+force-reduced at the mark — not against the book — largest unrealized profit
+first, reducing only as much size as the gap needs.
+
+The realized profit is **moved** to the insolvent account with a single
+`TransferOp`, not deposited. Depositing it would mint the money ADL exists to
+avoid minting. The ledger total is asserted unchanged across that path.
+
+Only positions with positive mark-price PnL are eligible: ADL never takes from
+someone already losing.
+
+### Cross margin (opt-in)
+
+`PERP_MARGIN_MODE=cross` judges an account's positions that share a quote asset
+together:
+
+```
+accountEquity = Σ(position margin + unrealized PnL)
+liquidatable  = accountEquity < Σ(maintenance margin)
+```
+
+A winning leg therefore backs a losing one, so a losing position is not closed
+while profits that would have covered it sit unused. The worst leg is closed
+first, one per scan; the next scan re-evaluates the aggregate.
+
+The default is `isolated`, which keeps the 6a semantics exactly.
+
+| Key | Default | Description |
+|-----|---------|-------------|
+| `PERP_LIQUIDATION_SLIPPAGE` | `10000000000000000` | first-rung slippage, 1e18-scaled (1%). `0` = sweep only |
+| `PERP_MARGIN_MODE` | `isolated` | `isolated` or `cross`; anything else fails startup |
+
+### Residual trust assumptions
+
+1. **ADL takes from winners.** That is the point, but it means a profitable trader
+   can be force-reduced at the mark even though the book would have paid better.
+2. **Cross margin pools only per quote asset.** Positions in a different quote
+   asset are judged separately; a full multi-asset risk engine is not implemented.
+
 ## Perpetual Gateway (subproject 7a)
 
 The perpetual book is exposed over HTTP and WebSocket under a **separate
