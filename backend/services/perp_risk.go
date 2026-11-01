@@ -48,6 +48,38 @@ func (s *PerpOrderBookService) SetLiquidationOptions(opts LiquidationOptions) {
 		opts.Interval = time.Second
 	}
 	s.liquidationOpts = opts
+	s.run.setInterval(s.tickIntervalLocked())
+}
+
+// liquidationInterval returns the configured scan period, defaulting to one
+// second. Caller must hold s.mu.
+
+// LiquidationScans reports how many times the liquidation scan has run. It exists
+// so the scheduler's cadence is observable without inferring it from side effects.
+func (s *PerpOrderBookService) LiquidationScans() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.liquidationScans
+}
+func (s *PerpOrderBookService) liquidationInterval() time.Duration {
+	if s.liquidationOpts.Interval <= 0 {
+		return time.Second
+	}
+	return s.liquidationOpts.Interval
+}
+
+// tickIntervalLocked returns how often the runner must wake: the shortest of the
+// intervals it drives. Without this a 1s liquidation cadence would still only be
+// honoured at the price-refresh interval. Caller must hold s.mu.
+func (s *PerpOrderBookService) tickIntervalLocked() time.Duration {
+	out := perpRunInterval
+	if s.fundingOpts.Tick > 0 && s.fundingOpts.Tick < out {
+		out = s.fundingOpts.Tick
+	}
+	if li := s.liquidationInterval(); li < out {
+		out = li
+	}
+	return out
 }
 
 // scanLiquidations closes every position whose equity has fallen below its
