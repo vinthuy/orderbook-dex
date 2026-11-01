@@ -707,6 +707,89 @@ func (e *Engine) liquidate(m MarketID, a ledger.AccountID, maxQty *uint256.Int, 
 	return Result{Order: o.clone(), Trades: trades, Releases: releases, PnL: pnl}, nil
 }
 
+// AutoDeleverage forcibly reduces a profitable position at the mark to cover a
+// shortfall the insurance fund cannot pay. Unlike Liquidate it does not trade
+// against the book: it settles the reduced size at mark directly against the
+// position, which is the defining property of ADL — the counterparty's profit is
+// crystallised at the oracle price, not at whatever liquidity exists.
+//
+// It returns the realized PnL for the deleveraged account (always a credit, since
+// only profitable positions are eligible) and the released margin.
+func (e *Engine) AutoDeleverage(m MarketID, a ledger.AccountID, qty *uint256.Int, mark Price) (Result, error) {
+	market, ok := e.byID[m]
+	if !ok {
+		return Result{}, ErrUnknownMarket
+	}
+	pos, ok := e.positions[m][a]
+	if !ok || pos.Size == nil || pos.Size.IsZero() {
+		return Result{}, ErrOrderNotFound
+	}
+	if mark == 0 {
+		return Result{}, fmt.Errorf("%w: auto-deleverage requires a positive mark", ErrBadRequest)
+	}
+	if qty == nil || qty.Sign() == 0 {
+		return Result{}, fmt.Errorf("%w: auto-deleverage qty must be > 0", ErrBadRequest)
+	}
+	reduce := cloneInt(qty)
+	if reduce.Cmp(pos.Size) > 0 {
+		reduce = cloneInt(pos.Size)
+	}
+
+	e.nextTrade++
+	tradeID := e.nextTrade
+
+	prevSize := cloneInt(pos.Size)
+	closed := reduce
+
+	// Realize PnL at the mark, signed the same way applyFill does.
+	entryNotional, err := market.notionalChecked(closed, pos.EntryPrice, false)
+	if err != nil {
+		return Result{}, err
+	}
+	markNotional, err := market.notionalChecked(closed, mark, false)
+	if err != nil {
+		return Result{}, err
+	}
+	var profit *uint256.Int
+	if pos.Side == SideLong {
+		profit = new(uint256.Int).Sub(markNotional, entryNotional)
+	} else {
+		profit = new(uint256.Int).Sub(entryNotional, markNotional)
+	}
+	pnl := []PnLSettlement{{Market: m, TradeID: tradeID, Account: a, Profit: profit}}
+
+	// Release margin proportionally to the reduced size.
+	release := new(uint256.Int).Mul(pos.Margin, closed)
+	release.Div(release, prevSize)
+	var releases []MarginRelease
+	if !release.IsZero() {
+		releases = append(releases, MarginRelease{Account: a, Amount: cloneInt(release)})
+	}
+
+	// Keep EntryPrice consistent for a later increase.
+	pos.qtyPrice.Sub(pos.qtyPrice, new(uint256.Int).Mul(closed, uint256.NewInt(uint64(pos.EntryPrice))))
+	pos.Margin.Sub(pos.Margin, release)
+	pos.Size.Sub(pos.Size, closed)
+	if pos.Size.IsZero() {
+		delete(e.positions[m], a)
+	}
+
+	// An ADL trade has no counterparty order; record it as a self-describing
+	// Trade so events and the indexer see the de-leveraged quantity.
+	trade := Trade{
+		ID:         tradeID,
+		Market:     m,
+		Price:      mark,
+		Qty:        cloneInt(closed),
+		Notional:   cloneInt(markNotional),
+		Maker:      a,
+		Taker:      a,
+		MakerSide:  pos.Side,
+		MakerOrder: 0,
+		TakerOrder: 0,
+	}
+	return Result{Trades: []Trade{trade}, Releases: releases, PnL: pnl}, nil
+}
 // releaseResidual appends a release for an order's remaining reserved margin.
 func (e *Engine) releaseResidual(o *Order, out *[]MarginRelease) {
 	if o.reserved == nil || o.reserved.Sign() == 0 {
