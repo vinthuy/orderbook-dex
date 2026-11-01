@@ -263,8 +263,15 @@ type PerpRiskConfig struct {
     // InsuranceFundAccount is the hex account that absorbs losses beyond a
     // trader's margin. Empty means the built-in reserve account.
     InsuranceFundAccount string
-    // LiquidationIntervalSeconds is the pause between liquidation scans.
+        // LiquidationIntervalSeconds is the pause between liquidation scans.
     LiquidationIntervalSeconds int64
+    // SlippageE18 is how far from the mark the first liquidation rung trades,
+    // 1e18-scaled. Empty means the default (1%); an explicit "0" disables the
+    // limit rung, leaving only the market sweep.
+    SlippageE18 string
+    // MarginMode is "isolated" (default) or "cross". Cross pools an account's
+    // positions that share a quote asset when judging liquidation.
+    MarginMode string
 }
 
 // LoadPerpRiskConfig reads 6c settings from the environment.
@@ -273,6 +280,8 @@ func LoadPerpRiskConfig() PerpRiskConfig {
         MaintenanceMarginRate:      "5000000000000000", // 0.5%
         LiquidatorFee:              "1000000000000000", // 0.1%
         LiquidationIntervalSeconds: 1,
+        SlippageE18:                "", // default 1%
+        MarginMode:                 "isolated",
     }
     if v := os.Getenv("PERP_MAINTENANCE_MARGIN_RATE"); v != "" {
         cfg.MaintenanceMarginRate = v
@@ -288,6 +297,12 @@ func LoadPerpRiskConfig() PerpRiskConfig {
             cfg.LiquidationIntervalSeconds = n
         }
     }
+    if v := os.Getenv("PERP_LIQUIDATION_SLIPPAGE"); v != "" {
+        cfg.SlippageE18 = v
+    }
+    if v := os.Getenv("PERP_MARGIN_MODE"); v != "" {
+        cfg.MarginMode = v
+    }
     return cfg
 }
 
@@ -295,3 +310,6 @@ func LoadPerpRiskConfig() PerpRiskConfig {
 func (c PerpRiskConfig) LiquidationInterval() time.Duration {
     return time.Duration(c.LiquidationIntervalSeconds) * time.Second
 }
+
+// CrossMargin reports whether cross-margin judgement is enabled.
+func (c PerpRiskConfig) CrossMargin() bool { return c.MarginMode == "cross" }

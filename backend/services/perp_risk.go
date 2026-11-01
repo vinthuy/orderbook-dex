@@ -97,21 +97,57 @@ func (s *PerpOrderBookService) scanLiquidations(now time.Time) {
 		pos    perp.Position
 	}
 	var candidates []target
-	for id, market := range s.markets {
+
+	// Fresh marks per market, shared by both the isolated and cross judgements.
+	marks := make(map[perp.MarketID]perp.Price)
+	for id := range s.markets {
 		mark, ok := s.tracker.LastMark(id)
-		if !ok {
-			continue
-		}
-		if s.tracker.Stale(id, now) {
+		if !ok || s.tracker.Stale(id, now) {
 			// A stale index means the mark is a fallback, not a live view.
 			continue
 		}
-		for _, p := range s.engine.Positions(id) {
-			bad, err := market.Liquidatable(&p, mark)
-			if err != nil || !bad {
+		marks[id] = mark
+	}
+
+	for id, market := range s.markets {
+		mark, ok := marks[id]
+		if !ok {
+			continue
+		}
+		positions := s.engine.Positions(id)
+
+		if market.RiskConfig.Mode != perp.MarginCross {
+			for _, p := range positions {
+				bad, err := market.Liquidatable(&p, mark)
+				if err != nil || !bad {
+					continue
+				}
+				candidates = append(candidates, target{market: market, mark: mark, pos: p})
+			}
+			continue
+		}
+
+		// Cross margin: judge every position in this quote asset together, so a
+		// winning leg can back a losing one. Only the worst leg is closed per
+		// scan; the next scan re-evaluates the aggregate.
+		byAccount := make(map[ledger.AccountID][]perp.Position)
+		for _, p := range positions {
+			byAccount[p.Account] = append(byAccount[p.Account], p)
+		}
+		for acct := range byAccount {
+			all := s.crossPositions(acct, market.Quote, marks)
+			risk, err := perp.AccountRiskFor(acct, all, s.markets, marks)
+			if err != nil || !risk.Liquidatable || risk.WorstMarket == 0 {
 				continue
 			}
-			candidates = append(candidates, target{market: market, mark: mark, pos: p})
+			for _, p := range all {
+				if p.Market == risk.WorstMarket {
+					candidates = append(candidates, target{
+						market: s.markets[p.Market], mark: marks[p.Market], pos: p,
+					})
+					break
+				}
+			}
 		}
 	}
 	s.mu.Unlock()
@@ -119,6 +155,24 @@ func (s *PerpOrderBookService) scanLiquidations(now time.Time) {
 	for _, c := range candidates {
 		s.liquidate(c.market, c.pos, c.mark, now)
 	}
+}
+
+// crossPositions collects every position an account holds in markets sharing the
+// given quote asset — the margin scope for cross judgement. Caller must hold s.mu.
+func (s *PerpOrderBookService) crossPositions(account ledger.AccountID, asset ledger.AssetID, marks map[perp.MarketID]perp.Price) []perp.Position {
+	var out []perp.Position
+	for id, market := range s.markets {
+		if market.Quote != asset || market.RiskConfig.Mode != perp.MarginCross {
+			continue
+		}
+		if _, ok := marks[id]; !ok {
+			continue // no price, not part of the risk picture
+		}
+		if p, ok := s.engine.Position(id, account); ok {
+			out = append(out, *p)
+		}
+	}
+	return out
 }
 
 // liquidate force-closes one position and reports it.

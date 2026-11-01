@@ -4,6 +4,8 @@ import (
 	"math/big"
 
 	"github.com/holiman/uint256"
+
+	"web3-amm-dex-backend/ledger"
 )
 
 // Default risk parameters (spec §3.1). The maintenance rate is deliberately far
@@ -32,6 +34,27 @@ func (c RiskConfig) liquidatorFee() *uint256.Int {
 	return c.LiquidatorFeeE18
 }
 
+// MarginMode selects how equity is pooled when judging whether an account is
+// liquidatable.
+type MarginMode uint8
+
+const (
+	// MarginIsolated judges each position on its own margin (the 6a default).
+	MarginIsolated MarginMode = iota
+	// MarginCross judges all of an account's positions in markets of the same
+	// margin scope together: one position's profit can back another's loss, so a
+	// losing leg does not get closed while a winning leg sits on gains that would
+	// have covered it.
+	MarginCross
+)
+
+func (m MarginMode) String() string {
+	if m == MarginCross {
+		return "cross"
+	}
+	return "isolated"
+}
+
 // RiskConfig holds a market's risk parameters. The zero value means defaults.
 type RiskConfig struct {
 	// MaintenanceMarginRateE18 is the fraction of notional a position must keep
@@ -44,6 +67,9 @@ type RiskConfig struct {
 	// scaled by 1e18 (default 1%). Zero disables the limit rung, leaving only the
 	// market sweep — which is also the pre-ladder behaviour.
 	SlippageE18 *uint256.Int
+	// Mode selects isolated or cross judgement. Isolated keeps the 6a semantics
+	// exactly; cross is opt-in per market.
+	Mode MarginMode
 }
 
 // DefaultSlippage returns the default first-rung liquidation slippage.
@@ -115,9 +141,90 @@ func (m Market) Equity(side Side, size *uint256.Int, entry, mark Price, margin *
 	return eq, nil
 }
 
+// AccountRisk is an account's aggregate risk exposure in one margin scope: every
+// position in markets that share the same quote asset.
+type AccountRisk struct {
+	Account            ledger.AccountID
+	Asset              ledger.AssetID
+	Equity             *big.Int     // Σ margin + Σ unrealized PnL (signed)
+	MaintenanceMargin  *uint256.Int // Σ per-position maintenance requirement
+	Liquidatable       bool
+	// Worst is the position with the largest shortfall against its own
+	// maintenance requirement, used to pick the first leg to close.
+	WorstMarket MarketID
+}
+
+// AccountRiskFor aggregates every position the account holds in markets of the
+// given margin scope. marks must contain a fresh mark for each market; a market
+// without one is skipped, because judging risk on a missing price would
+// mis-liquidate.
+//
+// In isolated mode each position is judged on its own margin, so the aggregate is
+// only informative; callers that need the isolated verdict use Liquidatable.
+func AccountRiskFor(account ledger.AccountID, positions []Position, markets map[MarketID]Market, marks map[MarketID]Price) (AccountRisk, error) {
+	var (
+		asset    ledger.AssetID
+		equity   = new(big.Int)
+		maint    = uint256.NewInt(0)
+		worst    MarketID
+		worstGap = new(big.Int)
+		seen     bool
+	)
+	for _, p := range positions {
+		market, ok := markets[p.Market]
+		if !ok {
+			continue
+		}
+		mark, ok := marks[p.Market]
+		if !ok || mark == 0 {
+			continue
+		}
+		seen = true
+		asset = market.Quote
+
+		eq, err := market.Equity(p.Side, p.Size, p.EntryPrice, mark, p.Margin)
+		if err != nil {
+			return AccountRisk{}, err
+		}
+		equity.Add(equity, eq)
+
+		req, err := market.MaintenanceMargin(p.Size, mark)
+		if err != nil {
+			return AccountRisk{}, err
+		}
+		maint.Add(maint, req)
+
+		// Per-position shortfall picks the worst leg.
+		legEq, err := market.Equity(p.Side, p.Size, p.EntryPrice, mark, p.Margin)
+		if err != nil {
+			return AccountRisk{}, err
+		}
+		gap := new(big.Int).Sub(req.ToBig(), legEq)
+		if gap.Cmp(worstGap) > 0 {
+			worstGap = gap
+			worst = p.Market
+		}
+	}
+	if !seen {
+		return AccountRisk{}, nil
+	}
+	return AccountRisk{
+		Account:           account,
+		Asset:             asset,
+		Equity:            equity,
+		MaintenanceMargin: maint,
+		Liquidatable:      equity.Cmp(maint.ToBig()) < 0,
+		WorstMarket:       worst,
+	}, nil
+}
+
 // Liquidatable reports whether a position's equity has fallen below its
 // maintenance margin (spec §3.1). It requires a mark price; without one the
 // caller must not liquidate (a stale or missing price would misjudge the risk).
+//
+// This is the ISOLATED verdict. A cross-margin market must use AccountRiskFor
+// instead, or a losing leg would be closed while a winning leg's profit sits
+// unused.
 func (m Market) Liquidatable(p *Position, mark Price) (bool, error) {
 	if p == nil || p.Size == nil || p.Size.IsZero() {
 		return false, nil
