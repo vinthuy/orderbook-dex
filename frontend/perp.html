@@ -71,6 +71,12 @@
   }
   .row { display: flex; gap: 8px; }
   .row > * { flex: 1; }
+  .tf {
+    flex: 0 0 auto; padding: 3px 9px; border-radius: 6px; cursor: pointer; font-size: 0.75em;
+    background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.12); color: #b7c2d4;
+  }
+  .tf.active { background: rgba(58, 123, 213, 0.3); border-color: #3a7bd5; color: #cfe3ff; }
+  #chart { display: block; background: rgba(0, 0, 0, 0.2); border-radius: 8px; }
 </style>
 </head>
 <body>
@@ -133,6 +139,20 @@
         <div class="stat"><span>资金费率</span><span id="fundingRate">—</span></div>
         <div class="stat"><span>下次结算</span><span id="nextFunding">—</span></div>
       </div>
+
+      <div id="chartWrap" style="margin-bottom:14px">
+        <div class="row" style="margin-bottom:8px;gap:6px">
+          <button class="tf" data-iv="1m" type="button">1m</button>
+          <button class="tf" data-iv="5m" type="button">5m</button>
+          <button class="tf" data-iv="15m" type="button">15m</button>
+          <button class="tf active" data-iv="1h" type="button">1h</button>
+          <button class="tf" data-iv="4h" type="button">4h</button>
+          <button class="tf" data-iv="1d" type="button">1d</button>
+        </div>
+        <svg id="chart" width="100%" height="180" viewBox="0 0 600 180" preserveAspectRatio="none"></svg>
+        <div class="muted" id="chartNote" style="font-size:0.75em;margin-top:4px">等待成交…</div>
+      </div>
+
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
         <div>
           <h2 style="margin-bottom:6px">卖盘（空头挂单）</h2>
@@ -381,6 +401,97 @@ function renderPositions(ps) {
   }
 }
 
+// --- candlestick chart -----------------------------------------------------
+// Hand-drawn SVG rather than a charting library: the page is a single file with no
+// build step, and a candle chart is a few dozen rects and lines.
+const CHART = { w: 600, h: 180, padTop: 8, padBottom: 18, padRight: 48 };
+state.candleInterval = '1h';
+
+function drawCandles(candles) {
+  const svg = $('chart');
+  svg.innerHTML = '';
+  const note = $('chartNote');
+
+  if (!candles || !candles.length) {
+    note.textContent = '还没有成交，图表将在第一笔成交后出现。';
+    return;
+  }
+
+  const highs = candles.map((c) => c.h);
+  const lows = candles.map((c) => c.l);
+  let hi = Math.max(...highs);
+  let lo = Math.min(...lows);
+  if (hi === lo) { hi += 1; lo -= 1; }
+
+  const plotW = CHART.w - CHART.padRight;
+  const plotH = CHART.h - CHART.padTop - CHART.padBottom;
+  const y = (p) => CHART.padTop + (hi - p) / (hi - lo) * plotH;
+  const slot = plotW / candles.length;
+  const bodyW = Math.max(1, Math.min(slot * 0.7, 12));
+
+  // Horizontal gridlines with price labels on the right.
+  for (let i = 0; i <= 4; i++) {
+    const p = lo + (hi - lo) * (i / 4);
+    const py = y(p);
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    line.setAttribute('x1', 0);
+    line.setAttribute('x2', plotW);
+    line.setAttribute('y1', py);
+    line.setAttribute('y2', py);
+    line.setAttribute('stroke', 'rgba(255,255,255,0.07)');
+    svg.appendChild(line);
+
+    const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+    label.setAttribute('x', plotW + 4);
+    label.setAttribute('y', py + 3);
+    label.setAttribute('fill', '#7b8aa3');
+    label.setAttribute('font-size', '9');
+    label.textContent = Math.round(p);
+    svg.appendChild(label);
+  }
+
+  candles.forEach((c, i) => {
+    const cx = slot * i + slot / 2;
+    const up = c.c >= c.o;
+    const colour = up ? '#4be6a8' : '#ff8595';
+
+    const wick = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    wick.setAttribute('x1', cx);
+    wick.setAttribute('x2', cx);
+    wick.setAttribute('y1', y(c.h));
+    wick.setAttribute('y2', y(c.l));
+    wick.setAttribute('stroke', colour);
+    wick.setAttribute('stroke-width', '1');
+    svg.appendChild(wick);
+
+    const bodyY = Math.min(y(c.o), y(c.c));
+    const bodyH = Math.max(1, Math.abs(y(c.o) - y(c.c)));
+    const body = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+    body.setAttribute('x', cx - bodyW / 2);
+    body.setAttribute('y', bodyY);
+    body.setAttribute('width', bodyW);
+    body.setAttribute('height', bodyH);
+    body.setAttribute('fill', up ? 'rgba(75,230,168,0.65)' : 'rgba(255,133,149,0.65)');
+    body.setAttribute('stroke', colour);
+    svg.appendChild(body);
+  });
+
+  const first = candles[0];
+  const last = candles[candles.length - 1];
+  note.textContent = candles.length + ' 根 ' + state.candleInterval + ' K 线 · 最新收盘 ' + last.c;
+}
+
+async function refreshCandles() {
+  const m = currentMarket();
+  if (!m) return;
+  try {
+    const out = await api('GET', '/v1/perp/candles/' + m.id + '?interval=' + state.candleInterval + '&limit=120');
+    drawCandles(out.candles || []);
+  } catch {
+    $('chartNote').textContent = 'K 线暂不可用';
+  }
+}
+
 // --- margin estimate -------------------------------------------------------
 // Mirrors the kernel: required = ceil(notional(qty, price) / leverage), with
 // notional = floor(qty * price / 10^baseDecimals). Uses BigInt because qty is a
@@ -563,7 +674,17 @@ $('market').addEventListener('change', () => {
   subscribe();
   refreshDepth();
   refreshMark();
+  refreshCandles();
   recalcMargin();
+});
+
+document.querySelectorAll('.tf').forEach((b) => {
+  b.addEventListener('click', () => {
+    document.querySelectorAll('.tf').forEach((x) => x.classList.remove('active'));
+    b.classList.add('active');
+    state.candleInterval = b.dataset.iv;
+    refreshCandles();
+  });
 });
 
 if (window.ethereum) {
@@ -593,10 +714,12 @@ if (window.ethereum) {
   await loadMarkets();
   await refreshDepth();
   await refreshMark();
+  await refreshCandles();
   recalcMargin();
   connectWS();
   setInterval(refreshDepth, 5000);
   setInterval(refreshMark, 5000);
+  setInterval(refreshCandles, 10000);
   setInterval(refreshPositions, 3000);
 })();
 

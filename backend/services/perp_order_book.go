@@ -100,6 +100,9 @@ type PerpOrderBookService struct {
 
 	// 6c risk state: the account that absorbs insolvency, and the scan cadence.
 	insuranceFund   ledger.AccountID
+	// feeAccount receives trading fees. Defaults to the insurance fund so fees
+	// strengthen the buffer that absorbs bad debt.
+	feeAccount      ledger.AccountID
 	liquidationOpts LiquidationOptions
 	lastLiquidation time.Time
 	liquidationScans int
@@ -109,6 +112,8 @@ type PerpOrderBookService struct {
 	badDebts []BadDebtEvent
 	// adlEvents buffers auto-deleverage events for the same reason.
 	adlEvents []ADLEvent
+	// candles aggregates OHLCV bars from the trade stream.
+	candles *CandleStore
 
 	mu       sync.Mutex
 	fatalErr error
@@ -143,8 +148,14 @@ func NewPerpOrderBookService(markets []perp.Market, l *ledger.Ledger, holds *led
 		lastFunding: make(map[perp.MarketID]int64),
 
 		insuranceFund:   reservedInsuranceAccount,
+		feeAccount:      reservedInsuranceAccount,
 		liquidationOpts: LiquidationOptions{Interval: time.Second},
+
+		candles: NewCandleStore(),
 	}
+	// Feed candles from the same trade stream clients subscribe to, so a chart is
+	// always derived from the exact trades the WebSocket served.
+	s.candles.Subscribe(bus)
 	if err := s.recover(); err != nil {
 		return nil, err
 	}
@@ -266,6 +277,13 @@ func (s *PerpOrderBookService) tick(now time.Time) {
 type PriceOptions struct {
 	MaxPriceAge     time.Duration
 	MaxMarkStaleAge time.Duration
+}
+
+// Candles returns the OHLCV store for chart endpoints.
+func (s *PerpOrderBookService) Candles() *CandleStore {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.candles
 }
 
 // MarkPrice returns the latest derived mark price for a market.
@@ -432,6 +450,11 @@ func (s *PerpOrderBookService) place(req perp.PlaceRequest) (perp.Result, error)
 	if err := s.settlePnL(res.PnL); err != nil {
 		return perp.Result{}, s.degrade(err)
 	}
+	// Fees are collected after PnL, so a losing close pays its loss first and the
+	// fee is capped by whatever remains rather than driving the balance negative.
+	if err := s.settleFees(res.Fees); err != nil {
+		return perp.Result{}, s.degrade(err)
+	}
 	for _, r := range res.Releases {
 		if err := s.holds.Release(r.Account, quote, r.Amount); err != nil {
 			return perp.Result{}, s.degrade(err)
@@ -518,8 +541,46 @@ func (s *PerpOrderBookService) settlePnL(pnls []perp.PnLSettlement) error {
 	return nil
 }
 
-// coverShortfall debits whatever the account can pay, then draws the remainder
-// from the insurance fund. The book stays live: a single account's insolvency is
+// settleFees moves each fill's fee from the trading account to the fee account.
+//
+// A fee is a transfer, not a burn and not a mint: the ledger total is unchanged.
+// The idempotency key carries trade id, account and role, so replay cannot charge
+// twice and the two sides of one trade are distinct keys.
+//
+// A fee that exceeds the account's balance is charged only up to that balance.
+// Charging more would go negative on an account already being liquidated; the
+// remainder is dropped rather than recorded as debt, because a fee is never a
+// claim on future funds.
+func (s *PerpOrderBookService) settleFees(fees []perp.FeeSettlement) error {
+	for _, f := range fees {
+		if f.Amount == nil || f.Amount.IsZero() {
+			continue
+		}
+		quote := s.markets[f.Market].Quote
+		ref := fmt.Sprintf("perp:fee:%d:%s:%s", f.TradeID, f.Account.Hex(), f.Role)
+		if s.ledger.WasApplied(ref) {
+			continue
+		}
+		amount := new(uint256.Int).Set(f.Amount)
+		if bal := s.ledger.Balance(f.Account, quote); bal.Cmp(amount) < 0 {
+			amount = new(uint256.Int).Set(bal)
+		}
+		if amount.IsZero() {
+			continue
+		}
+		if err := s.ledger.Apply(ledger.TransferOp{
+			From: f.Account, To: s.feeAccount, Asset: quote, Amount: amount, Ref: ref,
+		}); err != nil {
+			if errors.Is(err, ledger.ErrInsufficientBalance) {
+				continue // nothing to take; a fee must not halt the book
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+// coverShortfall debits whatever the account can pay, then draws the remainder// from the insurance fund. The book stays live: a single account's insolvency is
 // that account's problem, never a market-wide halt.
 //
 // It returns the bad-debt event it would like published, or nil. It does NOT
@@ -796,6 +857,9 @@ func (s *PerpOrderBookService) recover() error {
 			}
 			if err := s.settlePnL(res.PnL); err != nil {
 				return fmt.Errorf("services: perp: replay settle: %w", err)
+			}
+			if err := s.settleFees(res.Fees); err != nil {
+				return fmt.Errorf("services: perp: replay fees: %w", err)
 			}
 		case "cancel":
 			// A cancel of an order that is no longer open is harmless to skip.

@@ -77,3 +77,31 @@ func (o *Order) clone() *Order {
 	c.elem = nil
 	return &c
 }
+
+// FeeRole says which side of a fill paid which rate. The maker's order was
+// resting; the taker's crossed it. Fees are charged per account per fill, so a
+// single Trade produces two settlements.
+type FeeRole uint8
+
+const (
+	FeeMaker FeeRole = iota
+	FeeTaker
+)
+
+func (r FeeRole) String() string {
+	if r == FeeMaker {
+		return "maker"
+	}
+	return "taker"
+}
+
+// FeeSettlement is the fee owed by one account for one fill, in the market's
+// quote asset. Amount is floored, so a dust-sized fill can owe zero rather than
+// rounding up into a charge the trade never generated.
+type FeeSettlement struct {
+	Market  MarketID
+	TradeID TradeID
+	Account ledger.AccountID
+	Role    FeeRole
+	Amount  *uint256.Int
+}
