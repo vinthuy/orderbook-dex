@@ -1,16 +1,21 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/gin-gonic/gin"
 	"github.com/holiman/uint256"
-	"path/filepath"
+
 	"web3-amm-dex-backend/config"
 	"web3-amm-dex-backend/gateway"
 	"web3-amm-dex-backend/handlers"
@@ -242,6 +247,71 @@ func main() {
 		log.Printf("perp gateway mounted at /v1/perp and /ws/perp")
 
 		log.Printf("perpetual order book mounted (%d markets)", len(perpMarkets))
+	}
+
+	// Withdrawal proofs: the endpoint that makes the self-custody guarantee
+	// actionable. A user can fetch (balance, proof, rootIndex) for an anchored
+	// version and call Settlement.withdraw without the operator's help.
+	if settlement != nil && settlement.Anchor != nil {
+		r.GET("/v1/proof/:account/:asset", func(c *gin.Context) {
+			acct, err := ledger.AccountFromHex(c.Param("account"))
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request"})
+				return
+			}
+			assetID, err := strconv.ParseUint(c.Param("asset"), 10, 32)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request"})
+				return
+			}
+			// version=0 means "the newest anchored state I can prove against".
+			var version uint64
+			if v := c.Query("version"); v != "" {
+				version, err = strconv.ParseUint(v, 10, 64)
+				if err != nil {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request"})
+					return
+				}
+			} else {
+				versions := settlement.Anchor.AnchoredVersions()
+				if len(versions) == 0 {
+					c.JSON(http.StatusNotFound, gin.H{"error": "no_anchored_root"})
+					return
+				}
+				version = versions[0]
+			}
+
+			p, err := settlement.Anchor.ProofAt(acct, ledger.AssetID(assetID), version)
+			if err != nil {
+				if errors.Is(err, ledger.ErrNoRootAtVersion) {
+					c.JSON(http.StatusNotFound, gin.H{"error": "no_root_at_version"})
+					return
+				}
+				if errors.Is(err, ledger.ErrNoLeaf) {
+					c.JSON(http.StatusNotFound, gin.H{"error": "no_balance_at_that_version"})
+					return
+				}
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+				return
+			}
+
+			proofHex := make([]string, len(p.Proof))
+			for i, n := range p.Proof {
+				proofHex[i] = hexutil.Encode(n[:])
+			}
+			c.JSON(http.StatusOK, gin.H{
+				"account":   p.Account.Hex(),
+				"asset":     uint32(p.Asset),
+				"balance":   p.Balance.Dec(),
+				"root":      hexutil.Encode(p.Root[:]),
+				"rootIndex": p.RootIndex,
+				"version":   p.Version,
+				"proof":     proofHex,
+			})
+		})
+		r.GET("/v1/proof/versions", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"versions": settlement.Anchor.AnchoredVersions()})
+		})
 	}
 
 	// Mount the history indexer's read-only query routes and reconcile endpoint.

@@ -154,3 +154,10 @@ func (l *Ledger) Proof(a AccountID, asset AssetID) ([][32]byte, *uint256.Int, er
 	}
 	return merkleProof(leaves, idx), new(uint256.Int).Set(entries[idx].balance), nil
 }
+
+// VerifyProofForTest exposes proof verification to packages outside ledger. It
+// wraps the internal rule so a test can confirm a proof verifies without
+// duplicating the hashing logic (which would make the test assert its own copy).
+func VerifyProofForTest(proof [][32]byte, root [32]byte, a AccountID, asset AssetID, bal *uint256.Int) bool {
+	return verifyProof(proof, root, leafHash(a, asset, bal))
+}

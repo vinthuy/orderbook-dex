@@ -106,8 +106,11 @@ running ledger.
 
 Reconciliation compares **per-asset totals** only: matching legs are zero-sum and
 absent from the chain, so per-account balances differ between a rebuilt ledger
-and the running ledger. Per-account reconciliation requires per-trade Merkle
-proofs on-chain (deferred).
+and the running ledger.
+
+> **Per-account self-verification is now available** through withdrawal proofs —
+> see the section below. What reconcile still cannot do is rebuild a *per-account*
+> ledger from chain events alone; that would need per-trade Merkle proofs on-chain.
 
 ## Quick Start
 
@@ -483,6 +486,48 @@ haircut, price, and the quote value it would credit.
 | `PERP_FEE_TAKER` | `0` | taker fee, 1e18-scaled |
 | `PERP_ORACLE_ADDRESS` | (empty) | `PriceOracle` address; empty keeps static prices |
 | `PERP_ORACLE_MAX_AGE` | `60` | staleness bound passed to the oracle (seconds) |
+
+## Withdrawal proofs (per-account self-verification)
+
+`Ledger.Proof` could already build a Merkle proof, and `MerkleLib` verifies it
+on-chain — but only ever for the **current** state. Once the operator anchored a
+newer root, a user's old proof stopped matching anything on-chain, and the exit
+path silently depended on the operator anchoring again at the right moment.
+
+`ledger.RootHistory` retains the leaf set of each anchored version (bounded to 64
+records). `StateAnchorService.ProofAt` turns that into the triple
+`Settlement.withdraw` actually needs:
+
+```json
+{
+  "account": "0x…",
+  "asset": 1,
+  "balance": "1000",
+  "root": "0x…",
+  "rootIndex": 3,
+  "version": 42,
+  "proof": ["0x…", "0x…"]
+}
+```
+
+`GET /v1/proof/:account/:asset?version=N` — omit `version` for the newest anchored
+state.
+`GET /v1/proof/versions` — the retained anchored versions, newest first.
+
+A proof is only produced for a version that was **both** snapshotted and
+committed: a proof against a root the contract does not know would verify locally
+and revert on-chain, wasting the user's gas.
+
+### What this does and does not fix
+
+**Fixes:** a user can prove their balance in any anchored state still retained, and
+call `withdraw` on-chain without asking the operator for anything. That is the
+self-custody guarantee made actionable.
+
+**Does not fix:** an operator who anchors a *deliberately wrong* root (one that
+understates a balance) is still only deterred by the anchor being public, the exit
+delay, and auditability. Closing that needs validity proofs — the honest boundary
+of a non-ZK design, stated here rather than implied away.
 
 ## Health and metrics
 
