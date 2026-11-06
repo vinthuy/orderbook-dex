@@ -480,6 +480,21 @@ of a haircut.
 `GET /v1/perp/collateral/:market/:account` lists each accepted asset, its balance,
 haircut, price, and the quote value it would credit.
 
+**Redeem** is the inverse: `POST /v1/perp/collateral/:market/:account/:asset/redeem`
+with `{"quoteAmount":"1800"}` converts quote margin back into the collateral asset
+at the **current** haircut and price.
+
+Two guards:
+
+- only **free** quote may be spent (`Holds.Available`), so margin backing an open
+  position or a resting order can never be converted out from under it;
+- a redemption that rounds to zero collateral is rejected rather than silently
+  burning the quote.
+
+Redeeming after a haircut moves returns collateral at the new rate. That is the
+honest semantics — the market values the asset as it is now, not as it was when
+the pledge was made.
+
 | Key | Default | Description |
 |-----|---------|-------------|
 | `PERP_FEE_MAKER` | `0` | maker fee, 1e18-scaled |

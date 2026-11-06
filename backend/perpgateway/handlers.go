@@ -383,6 +383,59 @@ func (g *Gateway) perpMetrics(c *gin.Context) {
 	c.String(http.StatusOK, mon.Snapshot(time.Now()).MetricsText())
 }
 
+// redeemCollateral converts quote margin back into a collateral asset. POST body:
+// {"quoteAmount":"1800"}.
+//
+// This is the inverse of a pledge, and it is the only way a user gets a
+// non-quote margin asset back — before this the pledge was a one-way door.
+func (g *Gateway) redeemCollateral(c *gin.Context) {
+	var body struct {
+		QuoteAmount string `json:"quoteAmount"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request", "detail": err.Error()})
+		return
+	}
+	account, err := ledger.AccountFromHex(c.Param("account"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request"})
+		return
+	}
+	market, err := strconv.ParseUint(c.Param("market"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request"})
+		return
+	}
+	assetID, err := strconv.ParseUint(c.Param("asset"), 10, 32)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request"})
+		return
+	}
+	amount, err := uint256.FromDecimal(body.QuoteAmount)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_amount"})
+		return
+	}
+
+	out, err := g.perp.Redeem(perp.MarketID(market), account, ledger.AssetID(assetID), amount)
+	if err != nil {
+		if errors.Is(err, ledger.ErrInsufficientBalance) {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "insufficient_available_quote"})
+			return
+		}
+		if errors.Is(err, services.ErrNoCollateral) {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "not_collateral", "detail": err.Error()})
+			return
+		}
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "redemption_rejected", "detail": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"asset": uint32(assetID), "collateralReceived": uintString(out),
+		"quoteSpent": body.QuoteAmount,
+	})
+}
+
 // --- views ----------------------------------------------------------------
 
 type orderView struct {
