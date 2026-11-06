@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/holiman/uint256"
@@ -340,6 +341,46 @@ func (g *Gateway) collateralBalances(c *gin.Context) {
 		})
 	}
 	c.JSON(http.StatusOK, out)
+}
+
+// perpHealth returns the perpetual stack's health, or 503 when it is degraded.
+// The status code is the machine-readable signal; the body carries the reasons.
+func (g *Gateway) perpHealth(c *gin.Context) {
+	mon := g.perp.Monitor()
+	if mon == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "monitor_disabled"})
+		return
+	}
+	h := mon.Snapshot(time.Now())
+	code := http.StatusOK
+	if h.Status != services.HealthOK {
+		code = http.StatusServiceUnavailable
+	}
+	c.JSON(code, gin.H{
+		"status":              string(h.Status),
+		"problems":            h.Problems,
+		"degraded":            h.Degraded,
+		"totalBadDebt":        uintString(h.TotalBadDebt),
+		"liquidationScans":    h.LiquidationScans,
+		"liquidations":        h.Liquidations,
+		"liquidationsPartial": h.LiquidationsPartial,
+		"adl":                 h.ADLCount,
+		"badDebtEvents":       h.BadDebtEvents,
+		"fundingRounds":       h.FundingRounds,
+		"lastEventAt":         h.LastEventAt,
+		"now":                 h.Now,
+		"markets":             h.Markets,
+	})
+}
+
+// perpMetrics renders the same snapshot in Prometheus exposition format.
+func (g *Gateway) perpMetrics(c *gin.Context) {
+	mon := g.perp.Monitor()
+	if mon == nil {
+		c.String(http.StatusServiceUnavailable, "# monitor disabled\n")
+		return
+	}
+	c.String(http.StatusOK, mon.Snapshot(time.Now()).MetricsText())
 }
 
 // --- views ----------------------------------------------------------------

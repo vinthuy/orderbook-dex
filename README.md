@@ -484,6 +484,39 @@ haircut, price, and the quote value it would credit.
 | `PERP_ORACLE_ADDRESS` | (empty) | `PriceOracle` address; empty keeps static prices |
 | `PERP_ORACLE_MAX_AGE` | `60` | staleness bound passed to the oracle (seconds) |
 
+## Health and metrics
+
+The perpetual stack emits `perp.degraded`, `perp.baddebt`, `perp.adl`,
+`perp.liquidation`, and `perp.funding` events. Before this, **nothing consumed
+them**, and the existing `/health` returned a hard-coded `{"status":"ok"}` — it
+reported healthy even when the perp service had taken its fatal error.
+
+`PerpMonitor` subscribes to those topics and serves:
+
+- **`GET /v1/perp/health`** — `200` when ok, `503` otherwise, with a `problems`
+  list explaining every reason.
+- **`GET /v1/perp/metrics`** — the same snapshot in Prometheus exposition format.
+
+### What counts as unhealthy
+
+| Condition | Verdict |
+|---|---|
+| Service took its fatal error | `degraded` |
+| Open positions but no usable price | `degraded` |
+| Open positions, no risk event for 10 min | `stalled` |
+| Stale price on an idle market | reported, not a failure |
+| No price source on an idle market | reported, not a failure |
+
+The second row is the one the old endpoint could not see: the scanner skips
+unpriced markets, so positions sit unmanageable and nobody is liquidated who
+should be — while `/health` said `ok`.
+
+Metric names: `perp_health_status`, `perp_degraded`, `perp_liquidation_scans_total`,
+`perp_liquidations_total`, `perp_liquidations_partial_total`, `perp_adl_total`,
+`perp_bad_debt_total`, `perp_bad_debt_amount_total`, `perp_funding_rounds_total`,
+and per-market `perp_open_positions`, `perp_price_stale`, `perp_unpriced`,
+`perp_mark_price`, `perp_frozen_margin`.
+
 ## Perpetual Gateway (subproject 7a)
 
 The perpetual book is exposed over HTTP and WebSocket under a **separate
