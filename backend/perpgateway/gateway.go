@@ -131,6 +131,8 @@ func (g *Gateway) Register(r gin.IRouter) {
 	v1.GET("/funding/:market", g.fundingState)
 	v1.GET("/candles/:market", g.candles)
 	v1.GET("/collateral/:market/:account", g.collateralBalances)
+	r.GET("/v1/perp/health", g.perpHealth)
+	r.GET("/v1/perp/metrics", g.perpMetrics)
 	r.GET("/ws/perp", g.serveWS)
 }
 

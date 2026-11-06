@@ -114,6 +114,8 @@ type PerpOrderBookService struct {
 	adlEvents []ADLEvent
 	// candles aggregates OHLCV bars from the trade stream.
 	candles *CandleStore
+	// monitor is the registered health reporter, if any.
+	monitor *PerpMonitor
 
 	mu       sync.Mutex
 	fatalErr error

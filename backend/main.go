@@ -217,6 +217,12 @@ func main() {
 		})
 		log.Printf("perp liquidation enabled (interval %s)", rc.LiquidationInterval())
 
+		// Health reporting subscribes to every risk topic. Without it the stack
+		// emits degraded/baddebt/ADL events that nobody consumes.
+		perpsvcMonitor := services.NewPerpMonitor(perpsvc)
+		perpsvcMonitor.Subscribe(settlement.Bus)
+		log.Printf("perp health reporting mounted at /v1/perp/health and /v1/perp/metrics")
+
 		// Perpetual gateway: the same signed-instruction model as spot, under a
 		// distinct EIP-712 domain and the /perp route namespace.
 		gcfg := config.LoadGatewayConfig()
