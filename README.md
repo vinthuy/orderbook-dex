@@ -480,6 +480,26 @@ of a haircut.
 `GET /v1/perp/collateral/:market/:account` lists each accepted asset, its balance,
 haircut, price, and the quote value it would credit.
 
+### Account history
+
+`GET /v1/perp/history/:account?kind=trades|funding|liquidations|adl&limit=50`
+serves one account's perpetual records: fills (with the fee actually charged and
+the PnL actually realized), funding payments with their direction, forced closes,
+and auto-deleveraging.
+
+The records are folded from the same `perp.*` events the WebSocket hub serves, so a
+history row cannot disagree with a frame a client received. Fills are recorded
+*before* fees and PnL settle, then enriched with what the ledger accepted — a row
+never claims money that did not move.
+
+History is in memory and bounded per account. The durable record remains the
+instruction WAL and the on-chain ledger; a second persistent copy here would be a
+second source of truth for the same facts.
+
+**Read-only view:** `frontend/perp.html?account=0x…` shows that account's positions
+and history without a wallet. It cannot trade — every order path requires a
+signature.
+
 **Redeem** is the inverse: `POST /v1/perp/collateral/:market/:account/:asset/redeem`
 with `{"quoteAmount":"1800"}` converts quote margin back into the collateral asset
 at the **current** haircut and price.
@@ -598,6 +618,12 @@ domain, so a captured spot signature cannot be replayed as a perpetual order.
 | GET    | `/v1/perp/accounts/:account/balances` | none | Balance / available / held |
 | GET    | `/v1/perp/mark/:market` | none | Current mark price |
 | GET    | `/v1/perp/funding/:market` | none | Last funding round summary |
+| GET    | `/v1/perp/candles/:market` | none | OHLCV bars (`interval`, `limit`) |
+| GET    | `/v1/perp/collateral/:market/:account` | none | Pledgeable margin assets |
+| POST   | `/v1/perp/collateral/:market/:account/:asset/redeem` | none | Convert quote back to collateral |
+| GET    | `/v1/perp/history/:account` | none | Account history (`kind` = trades / funding / liquidations / adl) |
+| GET    | `/v1/perp/health` | none | Health verdict, `503` when degraded |
+| GET    | `/v1/perp/metrics` | none | Prometheus exposition |
 
 ### WebSocket
 

@@ -76,6 +76,14 @@
     background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.12); color: #b7c2d4;
   }
   .tf.active { background: rgba(58, 123, 213, 0.3); border-color: #3a7bd5; color: #cfe3ff; }
+  .hist-tab {
+    flex: 0 0 auto; padding: 3px 8px; border-radius: 6px; cursor: pointer; font-size: 0.72em;
+    background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(255, 255, 255, 0.12); color: #b7c2d4;
+  }
+  .hist-tab.active { background: rgba(58, 123, 213, 0.3); border-color: #3a7bd5; color: #cfe3ff; }
+  #history { max-height: 200px; overflow-y: auto; font-size: 0.78em; }
+  #history table { font-size: 0.95em; }
+  #history td { padding: 3px 4px; }
   #chart { display: block; background: rgba(0, 0, 0, 0.2); border-radius: 8px; }
 </style>
 </head>
@@ -171,6 +179,15 @@
     <section class="card">
       <h2>我的仓位</h2>
       <div id="positions" class="muted">连接钱包后显示</div>
+
+      <h2 style="margin-top:18px">历史</h2>
+      <div class="row" style="margin-bottom:8px;gap:5px">
+        <button class="hist-tab active" data-kind="trades" type="button">成交</button>
+        <button class="hist-tab" data-kind="funding" type="button">资金费</button>
+        <button class="hist-tab" data-kind="liquidations" type="button">强平</button>
+        <button class="hist-tab" data-kind="adl" type="button">ADL</button>
+      </div>
+      <div id="history" class="muted">连接钱包后显示</div>
 
       <h2 style="margin-top:18px">事件</h2>
       <div id="log"></div>
@@ -281,6 +298,7 @@ async function connect() {
   notice('');
   log('钱包已连接：' + state.account);
   await refreshPositions();
+  await refreshHistory();
 }
 
 // --- markets ---------------------------------------------------------------
@@ -492,6 +510,79 @@ async function refreshCandles() {
   }
 }
 
+// --- history ---------------------------------------------------------------
+state.historyKind = 'trades';
+
+async function refreshHistory() {
+  if (!state.account) {
+    $('history').textContent = '连接钱包后显示';
+    return;
+  }
+  try {
+    const out = await api('GET', '/v1/perp/history/' + state.account +
+      '?kind=' + state.historyKind + '&limit=50');
+    renderHistory(out.rows || []);
+  } catch (e) {
+    $('history').innerHTML = '<span class="muted">历史暂不可用</span>';
+  }
+}
+
+function renderHistory(rows) {
+  const box = $('history');
+  if (!rows.length) {
+    box.innerHTML = '<span class="muted">暂无记录</span>';
+    return;
+  }
+  const time = (t) => new Date(t * 1000).toLocaleString('zh-CN', { hour12: false });
+
+  let head, cells;
+  switch (state.historyKind) {
+    case 'trades':
+      head = ['时间', '方向', '价格', '数量', '手续费', '已实现盈亏'];
+      cells = (r) => [
+        time(r.at),
+        '<span class="pill ' + (r.side === 'long' ? 'long' : 'short') + '">' + r.side + '</span>' +
+          ' <span class="muted">' + r.role + '</span>',
+        fmt(r.price), fmt(r.qty),
+        r.fee === undefined ? '—' : fmt(r.fee),
+        r.realizedPnl === undefined ? '—' :
+          '<span class="' + (Number(r.realizedPnl) < 0 ? 'danger' : 'ok') + '">' + r.realizedPnl + '</span>',
+      ];
+      break;
+    case 'funding':
+      head = ['时间', '轮次', '费率', '方向', '金额'];
+      cells = (r) => [
+        time(r.at), '#' + r.index,
+        (Number(r.rate) / 1e16).toFixed(4) + '%',
+        r.direction === 'paid'
+          ? '<span class="danger">支付</span>' : '<span class="ok">收到</span>',
+        fmt(r.amount),
+      ];
+      break;
+    case 'liquidations':
+      head = ['时间', '数量', '标记价', '权益', '费用', '状态'];
+      cells = (r) => [
+        time(r.at), fmt(r.size), fmt(r.mark),
+        r.equity === undefined ? '—' : r.equity,
+        r.fee === undefined ? '—' : fmt(r.fee),
+        r.partial ? '<span class="danger">部分</span>' : '<span class="ok">全部</span>',
+      ];
+      break;
+    case 'adl':
+      head = ['时间', '数量', '标记价'];
+      cells = (r) => [time(r.at), fmt(r.qty), fmt(r.mark)];
+      break;
+  }
+
+  let html = '<table><thead><tr>' + head.map((h) => '<th>' + h + '</th>').join('') +
+    '</tr></thead><tbody>';
+  for (const r of rows) {
+    html += '<tr>' + cells(r).map((c) => '<td>' + c + '</td>').join('') + '</tr>';
+  }
+  html += '</tbody></table>';
+  box.innerHTML = html;
+}
+
 // --- margin estimate -------------------------------------------------------
 // Mirrors the kernel: required = ceil(notional(qty, price) / leverage), with
 // notional = floor(qty * price / 10^baseDecimals). Uses BigInt because qty is a
@@ -678,6 +769,15 @@ $('market').addEventListener('change', () => {
   recalcMargin();
 });
 
+document.querySelectorAll('.hist-tab').forEach((b) => {
+  b.addEventListener('click', () => {
+    document.querySelectorAll('.hist-tab').forEach((x) => x.classList.remove('active'));
+    b.classList.add('active');
+    state.historyKind = b.dataset.kind;
+    refreshHistory();
+  });
+});
+
 document.querySelectorAll('.tf').forEach((b) => {
   b.addEventListener('click', () => {
     document.querySelectorAll('.tf').forEach((x) => x.classList.remove('active'));
@@ -687,8 +787,17 @@ document.querySelectorAll('.tf').forEach((b) => {
   });
 });
 
-if (window.ethereum) {
-  window.ethereum.request({ method: 'eth_accounts' }).then((accs) => {
+// Read-only mode: ?account=0x… shows that account's positions and history without
+// a wallet. Useful for support ("send me your address") and for auditing, and it
+// cannot trade because every order path is gated on a signature.
+const urlAccount = new URLSearchParams(location.search).get('account');
+if (urlAccount && /^0x[0-9a-fA-F]{40}$/.test(urlAccount)) {
+  state.account = urlAccount.toLowerCase();
+  $('submit').textContent = '只读模式（无钱包）';
+  $('submit').disabled = true;
+}
+
+if (window.ethereum) {  window.ethereum.request({ method: 'eth_accounts' }).then((accs) => {
     if (accs && accs.length) {
       state.account = accs[0].toLowerCase();
       $('submit').disabled = false;
@@ -704,10 +813,13 @@ if (window.ethereum) {
     state.account = accs && accs.length ? accs[0].toLowerCase() : null;
     location.reload();
   });
-} else {
+} else if (!state.account) {
+  // No wallet and no read-only account: the page is market-data only.
   $('submit').textContent = '未检测到钱包';
   $('submit').disabled = true;
   notice('未检测到钱包扩展。页面只读可用：行情、深度和历史仓位仍会从 API 加载。');
+} else {
+  notice('只读模式：显示 ' + state.account + ' 的仓位与历史，无法下单。');
 }
 
 (async function init() {
@@ -717,13 +829,20 @@ if (window.ethereum) {
   await refreshCandles();
   recalcMargin();
   connectWS();
+  // A read-only account (?account=0x…) still gets positions and history.
+  if (state.account) {
+    await refreshPositions();
+    await refreshHistory();
+  }
   setInterval(refreshDepth, 5000);
   setInterval(refreshMark, 5000);
   setInterval(refreshCandles, 10000);
   setInterval(refreshPositions, 3000);
+  setInterval(refreshHistory, 5000);
 })();
 
 </script>
 </body>
 </html>
+
 
