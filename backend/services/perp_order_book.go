@@ -116,6 +116,8 @@ type PerpOrderBookService struct {
 	candles *CandleStore
 	// monitor is the registered health reporter, if any.
 	monitor *PerpMonitor
+	// history records per-account trade, funding, liquidation and ADL history.
+	history *PerpHistory
 
 	mu       sync.Mutex
 	fatalErr error
@@ -154,10 +156,12 @@ func NewPerpOrderBookService(markets []perp.Market, l *ledger.Ledger, holds *led
 		liquidationOpts: LiquidationOptions{Interval: time.Second},
 
 		candles: NewCandleStore(),
+		history: NewPerpHistory(),
 	}
-	// Feed candles from the same trade stream clients subscribe to, so a chart is
-	// always derived from the exact trades the WebSocket served.
+	// Feed candles and history from the same trade stream clients subscribe to, so
+	// a chart or history row always matches a frame the WebSocket served.
 	s.candles.Subscribe(bus)
+	s.history.Subscribe(bus)
 	if err := s.recover(); err != nil {
 		return nil, err
 	}
@@ -279,6 +283,13 @@ func (s *PerpOrderBookService) tick(now time.Time) {
 type PriceOptions struct {
 	MaxPriceAge     time.Duration
 	MaxMarkStaleAge time.Duration
+}
+
+// History returns the per-account history store.
+func (s *PerpOrderBookService) History() *PerpHistory {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.history
 }
 
 // Candles returns the OHLCV store for chart endpoints.
@@ -448,6 +459,14 @@ func (s *PerpOrderBookService) place(req perp.PlaceRequest) (perp.Result, error)
 		return perp.Result{}, err
 	}
 
+	// Record the fills in history BEFORE settling money. The history rows must exist
+	// for settleFees/settlePnL to attach what was actually charged and realized, and
+	// the trade event that would otherwise create them is only published after this
+	// lock is released.
+	for _, t := range res.Trades {
+		s.history.RecordTrade(t, time.Now())
+	}
+
 	// Realize PnL strictly before releasing margin (spec §5.2 order).
 	if err := s.settlePnL(res.PnL); err != nil {
 		return perp.Result{}, s.degrade(err)
@@ -521,6 +540,7 @@ func (s *PerpOrderBookService) settlePnL(pnls []perp.PnLSettlement) error {
 			if err := s.ledger.Apply(ledger.DepositOp{Account: p.Account, Asset: quote, Amount: amt, Ref: ref}); err != nil {
 				return err
 			}
+			s.history.AttachSettlement(p.TradeID, p.Account, nil, pnlToSigned(p.Profit))
 			continue
 		}
 		if err := s.ledger.Apply(ledger.WithdrawOp{Account: p.Account, Asset: quote, Amount: amt, Ref: ref}); err != nil {
@@ -539,6 +559,7 @@ func (s *PerpOrderBookService) settlePnL(pnls []perp.PnLSettlement) error {
 			}
 			return err
 		}
+		s.history.AttachSettlement(p.TradeID, p.Account, nil, pnlToSigned(p.Profit))
 	}
 	return nil
 }
@@ -578,11 +599,15 @@ func (s *PerpOrderBookService) settleFees(fees []perp.FeeSettlement) error {
 			}
 			return err
 		}
+		// Record what was actually charged, not what was quoted: the cap above can
+		// make them differ.
+		s.history.AttachSettlement(f.TradeID, f.Account, amount, nil)
 	}
 	return nil
 }
 
-// coverShortfall debits whatever the account can pay, then draws the remainder// from the insurance fund. The book stays live: a single account's insolvency is
+// coverShortfall debits whatever the account can pay, then draws the remainder
+// from the insurance fund. The book stays live: a single account's insolvency is
 // that account's problem, never a market-wide halt.
 //
 // It returns the bad-debt event it would like published, or nil. It does NOT
@@ -980,5 +1005,6 @@ func ParsePerpMarkets(s string) ([]perp.Market, error) {
 	}
 	return out, nil
 }
+
 
 

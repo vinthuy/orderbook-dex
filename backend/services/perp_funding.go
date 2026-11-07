@@ -62,6 +62,19 @@ func fundingRef(m perp.MarketID, index uint64, payer, receiver ledger.AccountID)
 // retried next round. Unlike a failed PnL settlement, funding NEVER degrades the
 // whole book: one broke account is that account's problem, not the market's.
 func (s *PerpOrderBookService) SettleFunding(m perp.MarketID, index uint64, mark perp.Price, rateScaled *big.Int, at int64) (FundingResult, error) {
+	res, err := s.settleFunding(m, index, mark, rateScaled, at)
+	if err != nil {
+		return FundingResult{}, err
+	}
+	// Publish outside the lock: EventBus subscribers run synchronously, and the
+	// history store and any WebSocket hub need this event to see the round.
+	if len(res.Legs) > 0 || res.Rate != "" {
+		_ = s.bus.Publish(Event{Topic: TopicPerpFunding, Data: res})
+	}
+	return res, nil
+}
+
+func (s *PerpOrderBookService) settleFunding(m perp.MarketID, index uint64, mark perp.Price, rateScaled *big.Int, at int64) (FundingResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fatalErr != nil {

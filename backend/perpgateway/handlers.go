@@ -387,7 +387,7 @@ func (g *Gateway) perpMetrics(c *gin.Context) {
 // {"quoteAmount":"1800"}.
 //
 // This is the inverse of a pledge, and it is the only way a user gets a
-// non-quote margin asset back — before this the pledge was a one-way door.
+// non-quote margin asset back - before this the pledge was a one-way door.
 func (g *Gateway) redeemCollateral(c *gin.Context) {
 	var body struct {
 		QuoteAmount string `json:"quoteAmount"`
@@ -434,6 +434,105 @@ func (g *Gateway) redeemCollateral(c *gin.Context) {
 		"asset": uint32(assetID), "collateralReceived": uintString(out),
 		"quoteSpent": body.QuoteAmount,
 	})
+}
+
+// accountHistory serves one account's perpetual history. Query: kind (trades |
+// funding | liquidations | adl, default trades), market (optional), limit
+// (default 100, capped at 500).
+func (g *Gateway) accountHistory(c *gin.Context) {
+	account, err := ledger.AccountFromHex(c.Param("account"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request"})
+		return
+	}
+	limit := 100
+	if v := c.Query("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	var market *perp.MarketID
+	if v := c.Query("market"); v != "" {
+		id, err := strconv.ParseUint(v, 10, 32)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "bad_request"})
+			return
+		}
+		m := perp.MarketID(id)
+		market = &m
+	}
+
+	h := g.perp.History()
+	switch c.DefaultQuery("kind", "trades") {
+	case "trades":
+		rows := h.Trades(account, market, limit)
+		out := make([]gin.H, 0, len(rows))
+		for _, r := range rows {
+			row := gin.H{
+				"tradeId": uint64(r.TradeID), "market": uint32(r.Market),
+				"price": uint64(r.Price), "qty": uintString(r.Qty),
+				"notional": uintString(r.Notional), "side": r.Side.String(),
+				"role": r.Role.String(), "at": r.At,
+			}
+			if r.Fee != nil {
+				row["fee"] = r.Fee.Dec()
+			}
+			if r.RealizedPnL != nil {
+				row["realizedPnl"] = r.RealizedPnL.String()
+			}
+			out = append(out, row)
+		}
+		c.JSON(http.StatusOK, gin.H{"account": account.Hex(), "kind": "trades", "rows": out})
+
+	case "funding":
+		rows := h.Funding(account, limit)
+		out := make([]gin.H, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, gin.H{
+				"market": uint32(r.Market), "index": r.Index, "rate": r.Rate,
+				"mark": uint64(r.Mark), "amount": uintString(r.Amount),
+				"direction": map[int]string{1: "received", -1: "paid"}[r.Sign],
+				"at":        r.At,
+			})
+		}
+		c.JSON(http.StatusOK, gin.H{"account": account.Hex(), "kind": "funding", "rows": out})
+
+	case "liquidations":
+		rows := h.Liquidations(account, limit)
+		out := make([]gin.H, 0, len(rows))
+		for _, r := range rows {
+			row := gin.H{
+				"market": uint32(r.Market), "size": uintString(r.Size),
+				"mark": uint64(r.Mark), "partial": r.Partial, "at": r.At,
+			}
+			if r.Equity != nil {
+				row["equity"] = r.Equity.String()
+			}
+			if r.Fee != nil {
+				row["fee"] = r.Fee.Dec()
+			}
+			out = append(out, row)
+		}
+		c.JSON(http.StatusOK, gin.H{"account": account.Hex(), "kind": "liquidations", "rows": out})
+
+	case "adl":
+		rows := h.ADLs(account, limit)
+		out := make([]gin.H, 0, len(rows))
+		for _, r := range rows {
+			out = append(out, gin.H{
+				"market": uint32(r.Market), "qty": uintString(r.Qty),
+				"mark": uint64(r.Mark), "at": r.At,
+			})
+		}
+		c.JSON(http.StatusOK, gin.H{"account": account.Hex(), "kind": "adl", "rows": out})
+
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": "bad_kind",
+			"detail": "want trades, funding, liquidations or adl"})
+	}
 }
 
 // --- views ----------------------------------------------------------------
