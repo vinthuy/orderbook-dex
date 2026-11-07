@@ -91,6 +91,82 @@ func (s *PerpOrderBookService) Pledge(m perp.MarketID, account ledger.AccountID,
 	return credited, nil
 }
 
+// Redeem converts quote margin back into a collateral asset, returning the
+// collateral received.
+//
+// This closes the one-way door Pledge used to be: after pledging, the asset left
+// the account and nothing could bring it back. Redeem is the inverse conversion at
+// the CURRENT haircut and price, which is the honest semantics — a user gets the
+// asset back at today's terms, not last week's.
+//
+// Two guards matter:
+//   - the quote spent must be free (not frozen as margin on an open position or a
+//     resting order), which Holds.Available enforces;
+//   - the amount must round to a non-zero quantity of collateral, so a redemption
+//     cannot silently vaporise quote into nothing.
+func (s *PerpOrderBookService) Redeem(m perp.MarketID, account ledger.AccountID, asset ledger.AssetID, quoteAmount *uint256.Int) (*uint256.Int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.fatalErr != nil {
+		return nil, s.fatalErr
+	}
+	market, ok := s.markets[m]
+	if !ok {
+		return nil, perp.ErrUnknownMarket
+	}
+	if quoteAmount == nil || quoteAmount.IsZero() {
+		return uint256.NewInt(0), nil
+	}
+	if asset == market.Quote {
+		return nil, fmt.Errorf("%w: %d is already the margin asset", perp.ErrBadRequest, asset)
+	}
+	c, ok := market.CollateralFor(asset)
+	if !ok {
+		return nil, fmt.Errorf("%w: asset %d", ErrNoCollateral, asset)
+	}
+	if c.Price == 0 || c.HaircutE18 == nil || c.HaircutE18.IsZero() {
+		return nil, fmt.Errorf("%w: asset %d has no usable price or haircut", ErrNoCollateral, asset)
+	}
+
+	// quote = collateral * price * haircut / 1e18, so
+	// collateral = floor(quote * 1e18 / (price * haircut)).
+	denom, overflow := new(uint256.Int).MulOverflow(uint256.NewInt(uint64(c.Price)), c.HaircutE18)
+	if overflow {
+		return nil, perp.ErrAmountTooLarge
+	}
+	if denom.IsZero() {
+		return nil, fmt.Errorf("%w: asset %d values to zero per unit", ErrNoCollateral, asset)
+	}
+	num, overflow := new(uint256.Int).MulOverflow(quoteAmount, uint256.NewInt(scaleE18()))
+	if overflow {
+		return nil, perp.ErrAmountTooLarge
+	}
+	collateralOut := new(uint256.Int).Div(num, denom)
+	if collateralOut.IsZero() {
+		return nil, fmt.Errorf("%w: redemption rounds to zero collateral", perp.ErrBadRequest)
+	}
+
+	// Only free quote can be spent: margin backing a position or a resting order is
+	// already committed, and spending it would leave the account unable to cover a
+	// loss it is contractually exposed to.
+	available := s.holds.Available(account, market.Quote)
+	if available.Cmp(quoteAmount) < 0 {
+		return nil, ledger.ErrInsufficientBalance
+	}
+
+	ref := fmt.Sprintf("perp:redeem:%s:%d:%s:%d", account.Hex(), asset, quoteAmount.Dec(), m)
+	if s.ledger.WasApplied(ref) {
+		return collateralOut, nil
+	}
+	if err := s.ledger.Apply(
+		ledger.WithdrawOp{Account: account, Asset: market.Quote, Amount: quoteAmount, Ref: ref + ":out"},
+		ledger.DepositOp{Account: account, Asset: asset, Amount: collateralOut, Ref: ref + ":in"},
+	); err != nil {
+		return nil, err
+	}
+	return collateralOut, nil
+}
+
 // CollateralBalances reports an account's pledgeable collateral for a market: the
 // asset, its balance, its haircut, and the quote value it would credit.
 type CollateralBalance struct {
