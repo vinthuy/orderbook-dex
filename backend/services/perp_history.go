@@ -1,6 +1,7 @@
 package services
 
 import (
+	"log"
 	"math/big"
 	"sync"
 	"time"
@@ -89,6 +90,8 @@ type PerpHistory struct {
 	// order path and the later event-driven record for the same fill cannot both
 	// add a row.
 	seen map[perp.TradeID]struct{}
+	// store is the durable backing, nil when memory-only.
+	store *historyStore
 }
 
 // NewPerpHistory builds an empty history store.
@@ -171,6 +174,13 @@ func (h *PerpHistory) RecordTrade(t perp.Trade, at time.Time) {
 	}
 	h.trades[t.Maker] = appendCapped(h.trades[t.Maker], maker)
 	h.rowIndex[tradeKey{tradeID: t.ID, account: t.Maker}] = len(h.trades[t.Maker]) - 1
+	if h.store != nil {
+		// A history write must never block a trade: money is reconciled against the
+		// ledger and the chain, and history is a projection of those facts.
+		if err := h.store.SaveTrade(maker, t.Maker); err != nil {
+			log.Printf("perp history: save maker trade %d: %v", t.ID, err)
+		}
+	}
 
 	takerSide := perp.SideLong
 	if t.MakerSide == perp.SideLong {
@@ -183,6 +193,11 @@ func (h *PerpHistory) RecordTrade(t perp.Trade, at time.Time) {
 	}
 	h.trades[t.Taker] = appendCapped(h.trades[t.Taker], taker)
 	h.rowIndex[tradeKey{tradeID: t.ID, account: t.Taker}] = len(h.trades[t.Taker]) - 1
+	if h.store != nil {
+		if err := h.store.SaveTrade(taker, t.Taker); err != nil {
+			log.Printf("perp history: save taker trade %d: %v", t.ID, err)
+		}
+	}
 }
 
 // AttachSettlement enriches one account's row for a trade with the fee it paid and
@@ -205,6 +220,59 @@ func (h *PerpHistory) AttachSettlement(tradeID perp.TradeID, account ledger.Acco
 	if pnl != nil {
 		rows[idx].RealizedPnL = new(big.Int).Set(pnl)
 	}
+	if h.store != nil {
+		// Persist the enriched row so a restart shows the fee and PnL too, not just
+		// the bare fill.
+		if err := h.store.SaveTrade(rows[idx], account); err != nil {
+			log.Printf("perp history: save settlement for trade %d: %v", tradeID, err)
+		}
+	}
+}
+
+// Attach returns an optionally persistent history backed by store. A nil store
+// keeps it memory-only, which is what tests and a no-config deployment get.
+func (h *PerpHistory) Attach(store *historyStore) error {
+	if store == nil {
+		return nil
+	}
+	trades, funding, liqs, adls, seen, err := store.loadAll()
+	if err != nil {
+		return err
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.store = store
+	for a, rows := range trades {
+		h.trades[a] = rows
+		if seen[a] != nil {
+			for id := range seen[a] {
+				h.seen[id] = struct{}{}
+			}
+		}
+	}
+	for a, rows := range funding {
+		h.funding[a] = rows
+	}
+	for a, rows := range liqs {
+		h.liquidations[a] = rows
+	}
+	for a, rows := range adls {
+		h.adls[a] = rows
+	}
+	return nil
+}
+
+// Close releases the backing store, if any.
+func (h *PerpHistory) Close() error {
+	h.mu.Lock()
+	store := h.store
+	h.store = nil
+	h.mu.Unlock()
+	if store == nil {
+		return nil
+	}
+	return store.Close()
 }
 
 // appendCapped appends and trims to maxHistoryPerAccount.
@@ -227,15 +295,27 @@ func (h *PerpHistory) onFunding(e Event) error {
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	seq := 0
 	for _, l := range r.Legs {
-		h.funding[l.Payer] = appendCapped(h.funding[l.Payer], FundingHistoryEntry{
+		pay := FundingHistoryEntry{
 			Market: r.Market, Index: r.Index, Rate: r.Rate, Mark: r.Mark,
 			Amount: new(uint256.Int).Set(l.Amount), Sign: -1, At: at.Unix(),
-		})
-		h.funding[l.Receiver] = appendCapped(h.funding[l.Receiver], FundingHistoryEntry{
-			Market: r.Market, Index: r.Index, Rate: r.Rate, Mark: r.Mark,
-			Amount: new(uint256.Int).Set(l.Amount), Sign: 1, At: at.Unix(),
-		})
+		}
+		h.funding[l.Payer] = appendCapped(h.funding[l.Payer], pay)
+		if h.store != nil {
+			if err := h.store.SaveFunding(pay, l.Payer, seq); err != nil {
+				log.Printf("perp history: save funding payer: %v", err)
+			}
+		}
+		recv := pay
+		recv.Sign = 1
+		h.funding[l.Receiver] = appendCapped(h.funding[l.Receiver], recv)
+		if h.store != nil {
+			if err := h.store.SaveFunding(recv, l.Receiver, seq); err != nil {
+				log.Printf("perp history: save funding receiver: %v", err)
+			}
+		}
+		seq++
 	}
 	return nil
 }
@@ -255,6 +335,12 @@ func (h *PerpHistory) onLiquidation(e Event) error {
 		Market: ev.Market, Size: cloneAmt(ev.Size), Mark: ev.Mark,
 		Equity: ev.Equity, Fee: cloneAmt(ev.Fee), Partial: ev.Partial, At: at,
 	})
+	if h.store != nil {
+		rows := h.liquidations[ev.Account]
+		if err := h.store.SaveLiquidation(rows[len(rows)-1], ev.Account); err != nil {
+			log.Printf("perp history: save liquidation: %v", err)
+		}
+	}
 	return nil
 }
 
@@ -268,6 +354,12 @@ func (h *PerpHistory) onADL(e Event) error {
 	h.adls[ev.Account] = appendCapped(h.adls[ev.Account], ADLHistoryEntry{
 		Market: ev.Market, Qty: cloneAmt(ev.Qty), Mark: ev.Mark, At: time.Now().Unix(),
 	})
+	if h.store != nil {
+		rows := h.adls[ev.Account]
+		if err := h.store.SaveADL(rows[len(rows)-1], ev.Account); err != nil {
+			log.Printf("perp history: save adl: %v", err)
+		}
+	}
 	return nil
 }
 
@@ -374,4 +466,5 @@ func (h *PerpHistory) ADLs(a ledger.AccountID, limit int) []ADLHistoryEntry {
 	}
 	return out
 }
+
 
