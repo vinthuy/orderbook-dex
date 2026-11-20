@@ -411,6 +411,7 @@ The default is `isolated`, which keeps the 6a semantics exactly.
 |-----|---------|-------------|
 | `PERP_LIQUIDATION_SLIPPAGE` | `10000000000000000` | first-rung slippage, 1e18-scaled (1%). `0` = sweep only |
 | `PERP_MARGIN_MODE` | `isolated` | `isolated` or `cross`; anything else fails startup |
+| `PERP_HISTORY_DB` | (empty) | bbolt path for per-account history; empty means memory-only |
 
 ### Residual trust assumptions
 
@@ -492,9 +493,11 @@ history row cannot disagree with a frame a client received. Fills are recorded
 *before* fees and PnL settle, then enriched with what the ledger accepted — a row
 never claims money that did not move.
 
-History is in memory and bounded per account. The durable record remains the
-instruction WAL and the on-chain ledger; a second persistent copy here would be a
-second source of truth for the same facts.
+History is in memory by default and bounded per account. Set `PERP_HISTORY_DB` to a
+file path to persist it in bbolt: a restart then keeps a user's history instead of
+erasing it. Persistence is a **projection**, not a source of truth — money is
+reconciled against the ledger and the chain, so a failed history write is logged and
+skipped rather than blocking a trade.
 
 **Read-only view:** `frontend/perp.html?account=0x…` shows that account's positions
 and history without a wallet. It cannot trade — every order path requires a

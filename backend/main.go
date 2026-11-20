@@ -207,6 +207,21 @@ func main() {
 			log.Printf("perp mark price + funding enabled (interval %s)", fc.FundingInterval())
 		}
 
+		// Per-account history persistence. Unset means memory-only, which keeps an
+		// existing deployment's behaviour unchanged; set means a restart no longer
+		// erases a user's trade and funding history.
+		if rc.HistoryDBPath != "" {
+			hstore, err := services.OpenHistoryStore(rc.HistoryDBPath)
+			if err != nil {
+				log.Fatalf("Failed to open PERP_HISTORY_DB: %v", err)
+			}
+			if err := perpsvc.History().Attach(hstore); err != nil {
+				log.Fatalf("Failed to load perp history: %v", err)
+			}
+			deferredClosers = append(deferredClosers, perpsvc.History().Close)
+			log.Printf("perp history persisted at %s", rc.HistoryDBPath)
+		}
+
 		// Subproject 6c: forced liquidation. This runs regardless of whether a
 		// price source is configured -- without one the scan is a no-op (it never
 		// liquidates on an absent price), but the shortfall path is always live.

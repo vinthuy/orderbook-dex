@@ -272,6 +272,9 @@ type PerpRiskConfig struct {
     // MarginMode is "isolated" (default) or "cross". Cross pools an account's
     // positions that share a quote asset when judging liquidation.
     MarginMode string
+    // HistoryDBPath persists per-account trade/funding/liquidation/ADL history.
+    // Empty keeps history memory-only, which is the pre-existing behaviour.
+    HistoryDBPath string
 }
 
 // LoadPerpRiskConfig reads 6c settings from the environment.
@@ -302,6 +305,9 @@ func LoadPerpRiskConfig() PerpRiskConfig {
     }
     if v := os.Getenv("PERP_MARGIN_MODE"); v != "" {
         cfg.MarginMode = v
+    }
+    if v := os.Getenv("PERP_HISTORY_DB"); v != "" {
+        cfg.HistoryDBPath = v
     }
     return cfg
 }
