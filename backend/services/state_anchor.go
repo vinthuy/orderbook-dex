@@ -1,6 +1,7 @@
 package services
 
 import (
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -30,6 +31,9 @@ type StateAnchorService struct {
 	history *ledger.RootHistory
 
 	mu      sync.Mutex
+	// anchorMu serialises AnchorOnce so two concurrent anchors cannot commit roots
+	// in an order unrelated to the versions they snapshot.
+	anchorMu sync.Mutex
 	records []RootRecord
 	byVer   map[uint64]uint64 // version -> rootIndex
 
@@ -79,28 +83,40 @@ func (s *StateAnchorService) Stop() error {
 // StateRootCommitted event), so a commit whose view still lags — or that
 // reverted — can never be recorded as if it had landed.
 func (s *StateAnchorService) AnchorOnce() (*RootRecord, error) {
-	// Root and version are read under ONE lock: separate Root()/Version()
-	// calls could interleave with a concurrent Apply and record a
-	// (root, version) pair that never existed together.
-	root, version := s.ledger.RootAndVersion()
+	// AnchorOnce must not run concurrently with itself: two anchors interleaving
+	// would commit roots in an order unrelated to the versions they snapshot, and
+	// byVer would then map a version to the wrong on-chain index.
+	s.anchorMu.Lock()
+	defer s.anchorMu.Unlock()
+
+	// Build the snapshot and take the root from the SAME read. Reading the root
+	// first and snapshotting later would let an Apply in between (a fill, a funding
+	// round, a deposit) advance the version, so the record would describe a
+	// different state than the root that gets committed — leaving the anchored
+	// version provable-only-in-theory.
+	rec, version, root := s.history.RecordWithin(s.ledger, time.Now().Unix())
 
 	_, rootIndex, err := s.settlement.CommitRoot(root)
 	if err != nil {
+		// Nothing was committed, so no record is stored: a record for an unanchored
+		// version would be a proof the contract cannot verify.
 		return nil, err
 	}
 
-	rec := RootRecord{Root: root, Version: version, RootIndex: rootIndex}
-	// Capture the leaf set under the SAME version the root was taken from. The
-	// snapshot is rebuilt from the current leaves, so this must happen while the
-	// ledger is still at that version; Record is idempotent for a version, which
-	// keeps a retry safe.
-	s.history.Record(s.ledger, time.Now().Unix())
-
+	// The committed root and the snapshot root are the same value by construction;
+	// assert rather than assume, because a mismatch here means a proof would fail
+	// on-chain and the caller has no way to discover that.
+	if rec.Root != root {
+		return nil, fmt.Errorf("state anchor: snapshot root %x != committed root %x", rec.Root, root)
+	}
+	rec.RootIndex = rootIndex
+	s.history.Add(rec)
+	out := RootRecord{Root: root, Version: version, RootIndex: rootIndex}
 	s.mu.Lock()
-	s.records = append(s.records, rec)
+	s.records = append(s.records, out)
 	s.byVer[version] = rootIndex
 	s.mu.Unlock()
-	return &rec, nil
+	return &out, nil
 }
 
 // RootIndexForVersion returns the on-chain root index committed for a ledger
@@ -121,24 +137,27 @@ func (s *StateAnchorService) RootIndexForVersion(version uint64) (uint64, bool) 
 // Without a retained root the exit path silently depended on the operator
 // anchoring again before the user asked.
 func (s *StateAnchorService) ProofAt(a ledger.AccountID, asset ledger.AssetID, version uint64) (*WithdrawalProof, error) {
+	// Walk back from the requested version until a record exists that was ALSO
+	// committed. A snapshot alone is not enough: a proof against a root the contract
+	// does not know verifies locally and reverts on-chain, wasting the user's gas.
 	rec, ok := s.history.LatestAtOrBefore(version)
-	if !ok {
-		return nil, ledger.ErrNoRootAtVersion
+	for ok {
+		if rootIndex, anchored := s.RootIndexForVersion(rec.Version); anchored {
+			bal, proof, err := rec.Proof(a, asset)
+			if err != nil {
+				return nil, err
+			}
+			return &WithdrawalProof{
+				Account: a, Asset: asset, Balance: bal, RootIndex: rootIndex,
+				Root: rec.Root, Version: rec.Version, Proof: proof,
+			}, nil
+		}
+		if rec.Version == 0 {
+			break
+		}
+		rec, ok = s.history.LatestAtOrBefore(rec.Version - 1)
 	}
-	rootIndex, ok := s.RootIndexForVersion(rec.Version)
-	if !ok {
-		// The snapshot exists but was never committed: a proof against it would
-		// verify against a root the contract does not know.
-		return nil, ledger.ErrNoRootAtVersion
-	}
-	bal, proof, err := rec.Proof(a, asset)
-	if err != nil {
-		return nil, err
-	}
-	return &WithdrawalProof{
-		Account: a, Asset: asset, Balance: bal, RootIndex: rootIndex,
-		Root: rec.Root, Version: rec.Version, Proof: proof,
-	}, nil
+	return nil, ledger.ErrNoRootAtVersion
 }
 
 // AnchoredVersions lists the retained anchored versions, newest first.
@@ -162,3 +181,4 @@ type WithdrawalProof struct {
 	Version   uint64
 	Proof     [][32]byte
 }
+

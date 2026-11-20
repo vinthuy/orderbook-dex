@@ -245,6 +245,12 @@ func (h *PerpHistory) Attach(store *historyStore) error {
 	h.store = store
 	for a, rows := range trades {
 		h.trades[a] = rows
+		// Rebuild rowIndex alongside the rows. Without this a settlement arriving
+		// after a restart cannot find its row and is silently dropped, so a fill
+		// persisted before its fee would keep a blank fee forever.
+		for i := range rows {
+			h.rowIndex[tradeKey{tradeID: rows[i].TradeID, account: a}] = i
+		}
 		if seen[a] != nil {
 			for id := range seen[a] {
 				h.seen[id] = struct{}{}
@@ -466,5 +472,6 @@ func (h *PerpHistory) ADLs(a ledger.AccountID, limit int) []ADLHistoryEntry {
 	}
 	return out
 }
+
 
 

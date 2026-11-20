@@ -22,6 +22,10 @@ var ErrNoRootAtVersion = errors.New("ledger: no anchored root at or before that 
 type RootRecord struct {
 	Root    [32]byte
 	Version uint64
+	// RootIndex is the on-chain index this root was committed as. Zero means the
+	// record is a snapshot that has not been anchored, which ProofAt refuses to
+	// serve.
+	RootIndex uint64
 	// Leaves is the ordered leaf set for this state. Kept as hashes rather than
 	// entries: a proof only needs sibling hashes.
 	Leaves [][32]byte
@@ -63,9 +67,18 @@ func NewRootHistory(maxRoots int) *RootHistory {
 	return &RootHistory{max: maxRoots}
 }
 
-// Record captures the ledger's current state under its current version. It is
-// idempotent for a version already recorded.
-func (h *RootHistory) Record(l *Ledger, at int64) RootRecord {
+// RecordWithin builds a root record from the CURRENT ledger state and returns it
+// together with the root and version it represents, all under one lock.
+//
+// This exists because anchoring is a two-step operation in time: read the state,
+// then commit the root on-chain (seconds to minutes), then store the snapshot. If
+// the snapshot is taken by a separate later read, any Apply in between advances the
+// version and the snapshot no longer matches what was committed — leaving the
+// anchored version permanently unprovable, which is exactly the failure the
+// history was added to remove.
+//
+// The caller commits rec.Root and must store the returned record unchanged.
+func (h *RootHistory) RecordWithin(l *Ledger, at int64) (RootRecord, uint64, [32]byte) {
 	l.mu.Lock()
 	entries := l.leafEntries()
 	version := l.version
@@ -80,19 +93,34 @@ func (h *RootHistory) Record(l *Ledger, at int64) RootRecord {
 		index[k] = i
 		balances[k] = new(uint256.Int).Set(e.balance)
 	}
-	rec := RootRecord{Root: merkleRoot(leaves), Version: version, Leaves: leaves, Index: index, balances: balances, At: at}
+	root := merkleRoot(leaves)
+	rec := RootRecord{Root: root, Version: version, Leaves: leaves, Index: index, balances: balances, At: at}
+	return rec, version, root
+}
 
+// Add stores an externally built record, replacing any existing record for the same
+// version. It is how AnchorOnce stores the snapshot it committed, so the stored
+// record is by construction the one that was anchored.
+func (h *RootHistory) Add(rec RootRecord) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for i := range h.records {
-		if h.records[i].Version == version {
-			return h.records[i]
+		if h.records[i].Version == rec.Version {
+			h.records[i] = rec
+			return
 		}
 	}
 	h.records = append(h.records, rec)
 	if len(h.records) > h.max {
 		h.records = h.records[len(h.records)-h.max:]
 	}
+}
+
+// Record captures the ledger's current state under its current version. It is
+// idempotent for a version already recorded.
+func (h *RootHistory) Record(l *Ledger, at int64) RootRecord {
+	rec, _, _ := h.RecordWithin(l, at)
+	h.Add(rec)
 	return rec
 }
 

@@ -554,7 +554,16 @@ state.
 
 A proof is only produced for a version that was **both** snapshotted and
 committed: a proof against a root the contract does not know would verify locally
-and revert on-chain, wasting the user's gas.
+and revert on-chain, wasting the user's gas. `ProofAt` walks back from the requested
+version until it finds a record that satisfies both, so asking for a version that was
+never anchored falls back to the newest one that was.
+
+The snapshot and the root are taken from **one** ledger read. Anchoring is a
+two-step operation in time — read the state, then wait for the on-chain commit — and
+taking the snapshot with a separate later read would let a fill or funding round
+advance the version in between, leaving the anchored version describing a state the
+contract never accepted. `RecordWithin` returns the record and the root together so
+the stored snapshot is by construction the one that was committed.
 
 ### What this does and does not fix
 
